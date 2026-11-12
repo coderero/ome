@@ -1,12 +1,20 @@
-use crate::gateway::{Outbox, SessionId, log};
+pub mod auth;
+
 use ome_protocol::framing::read_frame;
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, sync_channel};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub type SessionId = u64;
 
 const OUTBOUND_QUEUE: usize = 16_384;
+
+pub trait Outbox: Send {
+    fn send(&self, frame: Arc<[u8]>) -> bool;
+}
 
 pub enum Inbound {
     Connected(SessionId, ChannelOutbox),
@@ -25,7 +33,7 @@ impl Outbox for ChannelOutbox {
     }
 }
 
-pub fn listen(listener: TcpListener, inbound: Sender<Inbound>) {
+pub fn listen<T: From<Inbound> + Send + 'static>(listener: TcpListener, inbound: Sender<T>) {
     thread::spawn(move || {
         let mut next_id: SessionId = 0;
         for stream in listener.incoming() {
@@ -42,7 +50,11 @@ pub fn listen(listener: TcpListener, inbound: Sender<Inbound>) {
     });
 }
 
-fn serve(id: SessionId, stream: TcpStream, inbound: Sender<Inbound>) -> std::io::Result<()> {
+fn serve<T: From<Inbound> + Send + 'static>(
+    id: SessionId,
+    stream: TcpStream,
+    inbound: Sender<T>,
+) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let peer = stream
         .peer_addr()
@@ -51,7 +63,7 @@ fn serve(id: SessionId, stream: TcpStream, inbound: Sender<Inbound>) -> std::io:
     let writer_stream = stream.try_clone()?;
     let (tx, rx) = sync_channel::<Arc<[u8]>>(OUTBOUND_QUEUE);
     if inbound
-        .send(Inbound::Connected(id, ChannelOutbox(tx)))
+        .send(Inbound::Connected(id, ChannelOutbox(tx)).into())
         .is_err()
     {
         return Ok(());
@@ -62,11 +74,11 @@ fn serve(id: SessionId, stream: TcpStream, inbound: Sender<Inbound>) -> std::io:
     thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         while let Ok(Some(frame)) = read_frame(&mut reader) {
-            if inbound.send(Inbound::Frame(id, frame)).is_err() {
+            if inbound.send(Inbound::Frame(id, frame).into()).is_err() {
                 break;
             }
         }
-        let _ = inbound.send(Inbound::Disconnected(id));
+        let _ = inbound.send(Inbound::Disconnected(id).into());
     });
     Ok(())
 }
@@ -88,4 +100,21 @@ fn write_loop(stream: TcpStream, rx: Receiver<Arc<[u8]>>) {
     }
     drop(writer);
     let _ = stream.shutdown(Shutdown::Both);
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn log(message: &str) {
+    let s = (now_ms() / 1_000) % 86_400;
+    eprintln!(
+        "{:02}:{:02}:{:02} {message}",
+        s / 3600,
+        s % 3600 / 60,
+        s % 60
+    );
 }

@@ -2,7 +2,7 @@ use ome_core::symbol::{SYMBOL_LEN, Symbol};
 use std::fmt;
 
 pub const SCHEMA_ID: u16 = 7;
-pub const SCHEMA_VERSION: u16 = 1;
+pub const SCHEMA_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

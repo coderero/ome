@@ -1,7 +1,7 @@
-use crate::auth::SecretHash;
 use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, Balance, Qty};
+use ome_net::auth::SecretHash;
 use ome_protocol::Role;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -16,7 +16,6 @@ pub struct Account {
 }
 
 impl Account {
-    #[cfg(test)]
     pub fn position(&self, symbol: Symbol) -> Balance {
         self.positions.get(&symbol).copied().unwrap_or_default()
     }
@@ -291,7 +290,7 @@ mod tests {
         let mut ledger = Ledger::default();
         ledger.open("a", Role::Retail, [0; 32], 0).unwrap();
         assert!(matches!(
-            ledger.open("a", Role::Bot, [0; 32], 0),
+            ledger.open("a", Role::Hft, [0; 32], 0),
             Err(LedgerError::DuplicateUsername(_))
         ));
         assert_eq!(ledger.find("a").unwrap().id, 1);

@@ -1,48 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-export OME_DATA="${OME_DATA:-data}"
-export OME_ADDR="${OME_ADDR:-127.0.0.1:7000}"
-export OME_ADMIN_SECRET="${OME_ADMIN_SECRET:-admin}"
+source scripts/env.sh
 
 if [[ "${1:-}" == "--fresh" ]]; then
   scripts/stop.sh || true
-  rm -f "$OME_DATA/ome.journal" "$OME_DATA/bots.conf"
+  rm -f "$OME_DATA"/*.journal "$OME_DATA/bots.conf"
 fi
 
 cargo build --release --workspace --quiet
 mkdir -p "$OME_DATA"
 fresh=0
-[[ -s "$OME_DATA/ome.journal" ]] || fresh=1
+[[ -s "$OME_DATA/exchange.journal" ]] || fresh=1
 
-if [[ -f "$OME_DATA/server.pid" ]] && kill -0 "$(cat "$OME_DATA/server.pid")" 2>/dev/null; then
-  echo "server already running (pid $(cat "$OME_DATA/server.pid"))"
-else
-  ./target/release/ome-server --listen "$OME_ADDR" --journal "$OME_DATA/ome.journal" \
-    --admin-secret "$OME_ADMIN_SECRET" >>"$OME_DATA/server.log" 2>&1 &
-  echo $! >"$OME_DATA/server.pid"
-  echo "server started on $OME_ADDR (pid $!), log: $OME_DATA/server.log"
-fi
+start_bg exchange "$BIN/ome-exchange" --listen "$OME_EXCHANGE" --journal "$OME_DATA/exchange.journal" --admin-secret "$OME_EXCHANGE_SECRET"
+wait_for exchange_cmd instruments
+(( fresh )) && scripts/seed.sh members
 
-for _ in $(seq 50); do
-  ./target/release/ome --user admin --secret "$OME_ADMIN_SECRET" instruments >/dev/null 2>&1 && break
-  sleep 0.1
+for p in "${providers[@]}"; do
+  read -r name kind member port <<<"$p"
+  start_bg "$name" "$BIN/ome-broker" --profile "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
+    --member "$name" --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/$name.journal" --admin-secret "$OME_BROKER_SECRET"
+done
+for p in "${providers[@]}"; do
+  read -r name _ _ _ <<<"$p"
+  wait_for broker_admin "$name" accounts
 done
 
-if (( fresh )); then
-  scripts/seed.sh
-fi
+(( fresh )) && scripts/seed.sh market
 scripts/bots.sh
 
 cat <<MSG
 
-market is live. open a terminal UI:
-  scripts/tui.sh admin $OME_ADMIN_SECRET     # admin console: IPOs, halts, balances
-  scripts/tui.sh alice alice-pw              # retail trader
-  scripts/tui.sh fund fund-pw                # institutional trader
-command line:
-  ./target/release/ome --user alice --secret alice-pw balance
-stop everything:
-  scripts/stop.sh
+market is live:
+  exchange    $OME_EXCHANGE           ./target/release/ome exchange members | instruments | halt ACME news
+  retail      $(provider_addr retail-co)   alice / alice-pw, bob / bob-pw
+  prime       $(provider_addr prime-co)   fund / fund-pw (quant), issuers
+  dma         $(provider_addr dma-co)   HFT desks
+  lp          $(provider_addr lp-co)   market-making desks
+examples:
+  ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw balance
+  ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw buy ACME mkt 5
+stop everything:  scripts/stop.sh
 MSG

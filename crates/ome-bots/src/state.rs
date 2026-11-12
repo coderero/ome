@@ -158,8 +158,10 @@ pub mod tests {
 
     fn report(order_id: OrderId, status: OrderStatus, leaves: Qty) -> ServerMessage {
         ServerMessage::Execution(ExecutionReport {
+            seq: 0,
             order_id,
             client_order_id: 9,
+            account: 1,
             symbol: Symbol::parse("ACME").unwrap(),
             side: Side::Buy,
             status,
@@ -169,6 +171,7 @@ pub mod tests {
             leaves,
             last_price: 0,
             last_qty: 0,
+            fees: 0,
             timestamp: 5,
             reason: String::new(),
         })

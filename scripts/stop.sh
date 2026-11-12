@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source scripts/env.sh
 
-DATA="${OME_DATA:-data}"
-for name in bots server; do
-  pidfile="$DATA/$name.pid"
+for name in bots retail-co prime-co dma-co lp-co exchange; do
+  pidfile="$OME_DATA/$name.pid"
   if [[ -f "$pidfile" ]]; then
     pid="$(cat "$pidfile")"
-    if kill "$pid" 2>/dev/null; then
-      echo "stopped $name (pid $pid)"
-    fi
+    kill "$pid" 2>/dev/null && echo "stopped $name (pid $pid)"
     rm -f "$pidfile"
   fi
 done

@@ -49,7 +49,7 @@ impl fmt::Display for Rejection {
     }
 }
 
-pub trait RiskCheck {
+pub trait RiskCheck: Send {
     fn check(&self, request: &OrderRequest, ctx: &RiskContext) -> Result<(), Rejection>;
 }
 

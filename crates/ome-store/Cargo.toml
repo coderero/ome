@@ -1,0 +1,11 @@
+[package]
+name = "ome-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ome-protocol.workspace = true
+
+[lints]
+workspace = true

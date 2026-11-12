@@ -1,7 +1,7 @@
 mod state;
 mod strategy;
 
-use ome_client::{Client, ClientError, DEFAULT_ADDR};
+use ome_client::{Client, ClientError, DEFAULT_BROKER_ADDR};
 use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
 use ome_protocol::ClientMessage;
@@ -15,7 +15,7 @@ use strategy::{Action, Strategy};
 
 const USAGE: &str = "usage: ome-bots [--addr HOST:PORT] [--file BOTS_FILE] [SPEC...]
 
-SPEC is strategy:SYMBOL:username:secret, one per bot; a bots file holds one SPEC per line (# comments)
+SPEC is strategy:SYMBOL:username:secret[@BROKER_HOST:PORT], one per bot; bots only ever connect to brokers; a bots file holds one SPEC per line (# comments)
 strategies: mm (market maker), momentum, meanrev (mean reversion), noise (retail flow)";
 
 const STATUS_EVERY: Duration = Duration::from_secs(30);
@@ -25,13 +25,18 @@ struct BotSpec {
     symbol: Symbol,
     username: String,
     secret: String,
+    broker: Option<String>,
 }
 
 fn parse_spec(text: &str) -> Result<BotSpec, String> {
-    let parts: Vec<&str> = text.trim().split(':').collect();
+    let (spec, broker) = match text.trim().split_once('@') {
+        Some((spec, broker)) => (spec, Some(broker.to_string())),
+        None => (text.trim(), None),
+    };
+    let parts: Vec<&str> = spec.split(':').collect();
     let [strategy, symbol, username, secret] = parts.as_slice() else {
         return Err(format!(
-            "bad bot spec '{text}', expected strategy:SYMBOL:username:secret"
+            "bad bot spec '{text}', expected strategy:SYMBOL:username:secret[@broker]"
         ));
     };
     if strategy::create(strategy).is_none() {
@@ -42,11 +47,12 @@ fn parse_spec(text: &str) -> Result<BotSpec, String> {
         symbol: Symbol::parse(symbol).ok_or(format!("bad symbol '{symbol}'"))?,
         username: username.to_string(),
         secret: secret.to_string(),
+        broker,
     })
 }
 
 fn parse_args() -> Result<(String, Vec<BotSpec>), String> {
-    let mut addr = std::env::var("OME_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.into());
+    let mut addr = std::env::var("OME_BROKER").unwrap_or_else(|_| DEFAULT_BROKER_ADDR.into());
     let mut specs = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -82,11 +88,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    eprintln!("starting {} bots against {addr}", specs.len());
+    eprintln!("starting {} bots (default broker {addr})", specs.len());
     let handles: Vec<_> = specs
         .into_iter()
         .map(|spec| {
-            let addr = addr.clone();
+            let addr = spec.broker.clone().unwrap_or_else(|| addr.clone());
             thread::spawn(move || supervise(&addr, spec))
         })
         .collect();

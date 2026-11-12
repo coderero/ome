@@ -1,15 +1,20 @@
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, OrderKind, Qty, Side};
-use ome_protocol::framing::{read_frame, write_frame};
-use ome_protocol::{ClientMessage, Role, ServerMessage};
+use ome_protocol::framing::{frame, read_frame};
+use ome_protocol::{ClientMessage, MemberId, MemberKind, MemberMessage, Role, ServerMessage};
 use std::fmt;
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::TcpStream;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
+use std::net::{Shutdown, TcpStream};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
+    sync_channel,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_ADDR: &str = "127.0.0.1:7000";
+pub const DEFAULT_EXCHANGE_ADDR: &str = "127.0.0.1:7000";
+pub const DEFAULT_BROKER_ADDR: &str = "127.0.0.1:7101";
+const LINK_QUEUE: usize = 65_536;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -45,35 +50,101 @@ pub struct Session {
     pub server_time: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberSession {
+    pub member_id: MemberId,
+    pub kind: MemberKind,
+    pub server_time: u64,
+}
+
+pub enum LinkEvent {
+    Message(ServerMessage),
+    Closed,
+}
+
+pub struct Link {
+    tx: SyncSender<Vec<u8>>,
+}
+
+impl Link {
+    pub fn connect<T: Send + 'static>(
+        addr: &str,
+        events: Sender<T>,
+        wrap: impl Fn(LinkEvent) -> T + Send + 'static,
+    ) -> io::Result<Self> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        let reader_stream = stream.try_clone()?;
+        let (tx, rx) = sync_channel::<Vec<u8>>(LINK_QUEUE);
+
+        thread::spawn(move || {
+            let mut writer = BufWriter::new(&stream);
+            'outer: while let Ok(payload) = rx.recv() {
+                if writer.write_all(&frame(&payload)).is_err() {
+                    break;
+                }
+                while let Ok(payload) = rx.try_recv() {
+                    if writer.write_all(&frame(&payload)).is_err() {
+                        break 'outer;
+                    }
+                }
+                if writer.flush().is_err() {
+                    break;
+                }
+            }
+            drop(writer);
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader_stream);
+            while let Ok(Some(payload)) = read_frame(&mut reader) {
+                if let Ok(message) = ServerMessage::decode(&payload)
+                    && events.send(wrap(LinkEvent::Message(message))).is_err()
+                {
+                    return;
+                }
+            }
+            let _ = events.send(wrap(LinkEvent::Closed));
+        });
+        Ok(Self { tx })
+    }
+
+    pub fn send(&self, payload: Vec<u8>) -> bool {
+        match self.tx.try_send(payload) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
+
 pub struct Client {
-    writer: BufWriter<TcpStream>,
+    link: Link,
     inbox: Receiver<ServerMessage>,
     next_client_order_id: u64,
 }
 
+fn into_message(event: LinkEvent) -> Option<ServerMessage> {
+    match event {
+        LinkEvent::Message(message) => Some(message),
+        LinkEvent::Closed => None,
+    }
+}
+
 impl Client {
     pub fn connect(addr: &str) -> Result<Self, ClientError> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        let reader_stream = stream.try_clone()?;
-        let (tx, inbox) = channel();
+        let (tx, rx) = channel::<Option<ServerMessage>>();
+        let link = Link::connect(addr, tx, into_message)?;
+        let (inbox_tx, inbox) = channel();
         thread::spawn(move || {
-            let mut reader = BufReader::new(reader_stream);
-            while let Ok(Some(payload)) = read_frame(&mut reader) {
-                let Ok(message) = ServerMessage::decode(&payload) else {
-                    continue;
-                };
-                if tx.send(message).is_err() {
+            while let Ok(Some(message)) = rx.recv() {
+                if inbox_tx.send(message).is_err() {
                     break;
                 }
             }
         });
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(1);
+        let seed = ome_net_time();
         Ok(Self {
-            writer: BufWriter::new(stream),
+            link,
             inbox,
             next_client_order_id: seed << 16,
         })
@@ -86,6 +157,16 @@ impl Client {
     ) -> Result<(Self, Session), ClientError> {
         let mut client = Self::connect(addr)?;
         let session = client.logon(username, secret)?;
+        Ok((client, session))
+    }
+
+    pub fn connect_member(
+        addr: &str,
+        name: &str,
+        secret: &str,
+    ) -> Result<(Self, MemberSession), ClientError> {
+        let mut client = Self::connect(addr)?;
+        let session = client.logon_member(name, secret, u64::MAX)?;
         Ok((client, session))
     }
 
@@ -114,10 +195,51 @@ impl Client {
         }
     }
 
+    pub fn logon_member(
+        &mut self,
+        name: &str,
+        secret: &str,
+        last_seq: u64,
+    ) -> Result<MemberSession, ClientError> {
+        self.send_member(&MemberMessage::Logon {
+            name: name.into(),
+            secret: secret.into(),
+            last_seq,
+        })?;
+        match self.wait_for(Duration::from_secs(5), |m| {
+            matches!(
+                m,
+                ServerMessage::MemberLogonAck { .. } | ServerMessage::Reject { .. }
+            )
+        })? {
+            ServerMessage::MemberLogonAck {
+                member_id,
+                kind,
+                server_time,
+            } => Ok(MemberSession {
+                member_id,
+                kind,
+                server_time,
+            }),
+            ServerMessage::Reject { reason, .. } => Err(ClientError::Rejected(reason)),
+            _ => unreachable!(),
+        }
+    }
+
     pub fn send(&mut self, message: &ClientMessage) -> Result<(), ClientError> {
-        write_frame(&mut self.writer, &message.encode())?;
-        self.writer.flush()?;
-        Ok(())
+        self.send_bytes(message.encode())
+    }
+
+    pub fn send_member(&mut self, message: &MemberMessage) -> Result<(), ClientError> {
+        self.send_bytes(message.encode())
+    }
+
+    fn send_bytes(&mut self, payload: Vec<u8>) -> Result<(), ClientError> {
+        if self.link.send(payload) {
+            Ok(())
+        } else {
+            Err(ClientError::Disconnected)
+        }
     }
 
     pub fn send_order(
@@ -176,6 +298,16 @@ impl Client {
     pub fn request(&mut self, message: &ClientMessage) -> Result<String, ClientError> {
         let template = message.template_id();
         self.send(message)?;
+        self.await_ack(template)
+    }
+
+    pub fn request_member(&mut self, message: &MemberMessage) -> Result<String, ClientError> {
+        let template = message.template_id();
+        self.send_member(message)?;
+        self.await_ack(template)
+    }
+
+    fn await_ack(&self, template: u16) -> Result<String, ClientError> {
         match self.wait_for(Duration::from_secs(5), |m| match m {
             ServerMessage::Ack { ref_template, .. }
             | ServerMessage::Reject { ref_template, .. } => *ref_template == template,
@@ -186,4 +318,11 @@ impl Client {
             _ => unreachable!(),
         }
     }
+}
+
+fn ome_net_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1)
 }

@@ -66,7 +66,7 @@ impl Instrument {
         self.tape.push(trade.clone());
     }
 
-    pub fn info(&self, circuit_bps: u64) -> InstrumentInfo {
+    pub fn info(&self, band_bps: u64, circuit_bps: u64) -> InstrumentInfo {
         let (low_limit, high_limit) = self.circuit_limits(circuit_bps);
         InstrumentInfo {
             symbol: self.symbol,
@@ -79,6 +79,7 @@ impl Instrument {
             last_price: self.last_price,
             low_limit,
             high_limit,
+            band_bps,
             volume: self.volume,
             name: self.name.clone(),
             halt_reason: self

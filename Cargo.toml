@@ -11,8 +11,10 @@ license = "MIT"
 ome-core = { path = "crates/ome-core" }
 ome-protocol = { path = "crates/ome-protocol" }
 ome-client = { path = "crates/ome-client" }
+ome-store = { path = "crates/ome-store" }
+ome-net = { path = "crates/ome-net" }
+ome-exchange = { path = "crates/ome-exchange" }
 rand = "0.9"
-ratatui = "0.29"
 sha2 = "0.10"
 
 [workspace.lints.clippy]
