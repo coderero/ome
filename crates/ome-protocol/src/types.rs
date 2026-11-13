@@ -254,6 +254,121 @@ pub fn get_trigger(d: &mut Decoder) -> Result<Trigger, DecodeError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlgoStrategy {
+    Twap { duration_ms: u64, slices: u64 },
+    Vwap { duration_ms: u64 },
+    Pov { rate_bps: u64, duration_ms: u64 },
+    Iceberg { clip: u64 },
+}
+
+impl AlgoStrategy {
+    pub fn describe(&self) -> String {
+        match self {
+            AlgoStrategy::Twap {
+                duration_ms,
+                slices,
+            } => {
+                format!("TWAP {slices} slices over {}s", duration_ms / 1_000)
+            }
+            AlgoStrategy::Vwap { duration_ms } => format!("VWAP over {}s", duration_ms / 1_000),
+            AlgoStrategy::Pov {
+                rate_bps,
+                duration_ms,
+            } => format!(
+                "POV {}.{:02}% for up to {}s",
+                rate_bps / 100,
+                rate_bps % 100,
+                duration_ms / 1_000
+            ),
+            AlgoStrategy::Iceberg { clip } => format!("iceberg clips of {clip}"),
+        }
+    }
+}
+
+pub fn put_algo_strategy(e: &mut Encoder, strategy: &AlgoStrategy) {
+    let (code, a, b) = match *strategy {
+        AlgoStrategy::Twap {
+            duration_ms,
+            slices,
+        } => (1, duration_ms, slices),
+        AlgoStrategy::Vwap { duration_ms } => (2, duration_ms, 0),
+        AlgoStrategy::Pov {
+            rate_bps,
+            duration_ms,
+        } => (3, rate_bps, duration_ms),
+        AlgoStrategy::Iceberg { clip } => (4, clip, 0),
+    };
+    e.u8(code).u64(a).u64(b);
+}
+
+pub fn get_algo_strategy(d: &mut Decoder) -> Result<AlgoStrategy, DecodeError> {
+    let code = d.u8()?;
+    let a = d.u64()?;
+    let b = d.u64()?;
+    Ok(match code {
+        1 => AlgoStrategy::Twap {
+            duration_ms: a,
+            slices: b,
+        },
+        2 => AlgoStrategy::Vwap { duration_ms: a },
+        3 => AlgoStrategy::Pov {
+            rate_bps: a,
+            duration_ms: b,
+        },
+        4 => AlgoStrategy::Iceberg { clip: a },
+        _ => return Err(DecodeError::Invalid("algo strategy")),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlgoStatus {
+    Working = 1,
+    Done = 2,
+    Cancelled = 3,
+    Expired = 4,
+    Rejected = 5,
+}
+
+impl AlgoStatus {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => AlgoStatus::Working,
+            2 => AlgoStatus::Done,
+            3 => AlgoStatus::Cancelled,
+            4 => AlgoStatus::Expired,
+            5 => AlgoStatus::Rejected,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AlgoStatus::Working => "working",
+            AlgoStatus::Done => "done",
+            AlgoStatus::Cancelled => "cancelled",
+            AlgoStatus::Expired => "expired",
+            AlgoStatus::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlgoReport {
+    pub algo_id: u64,
+    pub client_order_id: u64,
+    pub account: AccountId,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: Qty,
+    pub filled: Qty,
+    pub avg_price: Price,
+    pub children: u64,
+    pub status: AlgoStatus,
+    pub strategy: AlgoStrategy,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConditionalStatus {
     Armed = 1,
     Triggered = 2,

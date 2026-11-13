@@ -37,6 +37,7 @@ pub struct Gateway {
     clock: Timestamp,
     last_heartbeat: Timestamp,
     guard: EntryGuard,
+    algo_steps: BTreeMap<u64, Timestamp>,
 }
 
 impl Gateway {
@@ -58,6 +59,7 @@ impl Gateway {
             clock,
             last_heartbeat: clock,
             guard: EntryGuard::default(),
+            algo_steps: BTreeMap::new(),
         }
     }
 
@@ -124,6 +126,7 @@ impl Gateway {
         }
         self.market.roll(now);
         self.release_after_market_orders(now);
+        self.step_algos(now);
         if now >= self.last_heartbeat + HEARTBEAT_MS {
             self.last_heartbeat = now;
             let heartbeat = encode(&ServerMessage::Heartbeat { server_time: now });
@@ -141,6 +144,28 @@ impl Gateway {
         }
         for cond_id in self.broker.waiting_for_open() {
             if let Some(fact) = self.broker.decide_trigger(cond_id, 0, &self.market, now) {
+                let _ = self.record(fact, now);
+            }
+        }
+    }
+
+    fn step_algos(&mut self, now: Timestamp) {
+        if !self.exchange.is_ready() {
+            return;
+        }
+        let working = self.broker.working_algos();
+        self.algo_steps
+            .retain(|id, _| working.iter().any(|(w, _)| w == id));
+        for (algo_id, interval) in working {
+            let last = self.algo_steps.get(&algo_id).copied();
+            if last.is_some_and(|at| now < at + interval) {
+                continue;
+            }
+            self.algo_steps.insert(algo_id, now);
+            if let Some(fact) = self.broker.decide_algo_step(algo_id, &self.market, now) {
+                if let Fact::AlgoFinished { status, reason, .. } = &fact {
+                    log(&format!("algo #{algo_id} {}: {reason}", status.label()));
+                }
                 let _ = self.record(fact, now);
             }
         }
@@ -413,6 +438,9 @@ impl Gateway {
             for report in self.broker.conditional_reports(account_id) {
                 self.reply(id, ServerMessage::ConditionalUpdate(report));
             }
+            for report in self.broker.algo_reports(account_id) {
+                self.reply(id, ServerMessage::AlgoUpdate(report));
+            }
         } else {
             self.reply(id, ServerMessage::AccountList(self.broker.account_list()));
         }
@@ -439,6 +467,8 @@ impl Gateway {
                 | ClientMessage::Oco { .. }
                 | ClientMessage::Bracket { .. }
                 | ClientMessage::CancelConditional { .. }
+                | ClientMessage::AlgoOrder { .. }
+                | ClientMessage::CancelAlgo { .. }
         );
         if entry
             && !admin
@@ -634,6 +664,42 @@ impl Gateway {
                         self.send_to_account(account, &ServerMessage::Execution(*report))
                     }
                 }
+            }
+            ClientMessage::AlgoOrder {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                limit,
+                strategy,
+            } if !admin => {
+                let decision = self.broker.decide_algo(
+                    account,
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    limit,
+                    strategy,
+                    &self.market,
+                    now,
+                );
+                if decision.is_ok() {
+                    log(&format!(
+                        "account {account} started {} to {} {qty} {symbol}",
+                        strategy.describe(),
+                        if side == ome_core::types::Side::Buy {
+                            "buy"
+                        } else {
+                            "sell"
+                        }
+                    ));
+                }
+                self.record_or_reject(id, ref_template, decision, now);
+            }
+            ClientMessage::CancelAlgo { algo_id } if !admin => {
+                let decision = self.broker.decide_cancel_algo(account, algo_id);
+                self.record_or_reject(id, ref_template, decision, now);
             }
             ClientMessage::CancelConditional { cond_id } if !admin => {
                 let decision = self.broker.decide_cancel_conditional(account, cond_id);

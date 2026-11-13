@@ -104,9 +104,9 @@ SBE (schema 7, version 2) with SOFH framing on every connection. All integers ar
 
 | Family | Direction | Messages |
 |---|---|---|
-| client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Quote, SetMmp, Conditional, Oco, Bracket, CancelConditional, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, SetAccountStatus, SetRestricted, SetLossLimit, QueryAccounts |
+| client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Quote, SetMmp, Conditional, Oco, Bracket, CancelConditional, AlgoOrder, CancelAlgo, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, SetAccountStatus, SetRestricted, SetLossLimit, QueryAccounts |
 | member | provider → exchange | Logon (with `last_seq`), NewOrder (account ref + time in force), Cancel, CancelAll, Subscribe; ops: CreateMember, ListInstrument, Halt, Resume, QueryMembers |
-| server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, ConditionalUpdate, ContractNote, Ack, Reject, Heartbeat |
+| server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, ConditionalUpdate, AlgoUpdate, ContractNote, Ack, Reject, Heartbeat |
 
 Client and member templates never overlap; sending one family's message to the other service fails to decode (tested).
 
@@ -185,6 +185,27 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw bracket ACME buy
 # entry #695 filled buy filled 5/5
 # cond #5 armed sell 5 ACME when last >= 27.00 (bracket exit armed)
 # cond #6 armed sell 5 ACME when last <= 23.50 (bracket exit armed)
+```
+
+## Algorithmic Orders
+
+Quant and prop accounts at a prime broker can hand the broker a large **parent order** and let its algo engine work it through child orders. Children are ordinary orders with every broker check (funds, shares, band, risk controls) and only one is live at a time. The parent itself reserves nothing and is never visible to the exchange. Each child is journaled together with its link to the parent, so after a crash the parent resumes where it stopped.
+
+| Command | Strategy | Children |
+|---|---|---|
+| `twap <SYM> <side> <qty> <seconds> <slices> [limit]` | time-weighted: equal slices, one per interval | IOC at the limit, or protected market |
+| `vwap <SYM> <side> <qty> <seconds> [limit]` | volume-weighted: 20 slices along a U-shaped intraday volume curve (heavier at the open and close) | IOC |
+| `pov <SYM> <side> <qty> <percent> <seconds> [limit]` | percentage of volume: keeps its fills at `percent` of other participants' traded volume, checked every second | IOC, minimum clip 1% of the parent |
+| `slice <SYM> <side> <qty> <clip> <limit>` | broker-side iceberg: rests one clip at the limit, the next after it completes | resting GTC limit |
+| `algos` / `cancel-algo <id>` | progress (filled, average price, children); cancelling pulls a resting child | |
+
+Add `follow` to stream progress until the algo finishes. A parent ends **done** when filled, **expired** when its time is up, **rejected** if a child fails a broker check, or **cancelled** by the client or an account suspension. Algos pause while the market is not in continuous trading or the symbol is halted.
+
+```bash
+ome broker --addr 127.0.0.1:7102 --user fund --secret fund-pw twap ACME buy 200 10 5 follow
+# algo #1 working buy ACME 40/200 filled avg 25.00 in 1 child order(s) [TWAP 5 slices over 10s]
+# ...
+# algo #1 done buy ACME 200/200 filled avg 25.00 in 5 child order(s) [TWAP 5 slices over 10s] (fully filled)
 ```
 
 ## Broker Risk Controls
@@ -291,14 +312,14 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 162 tests
+cargo test --workspace     # 169 tests
 ```
 
-Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, and a retail stop-loss fires on a real exchange trade and sells into the bid. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
+Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1f** ~~broker-held orders (stop, trailing stop, GTT, AMO, OCO, bracket)~~ and ~~broker risk controls~~ done; institutional algorithms (TWAP, VWAP, POV)
+- **1f** ~~broker-held orders, broker risk controls, algorithmic orders (TWAP, VWAP, POV, iceberg slicer)~~ done
 - **1g** off-exchange execution: broker internalization, wholesaler with payment for order flow, dark pool
 - **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane

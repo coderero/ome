@@ -65,6 +65,17 @@ pub enum ClientMessage {
     CancelConditional {
         cond_id: u64,
     },
+    AlgoOrder {
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        limit: Option<Price>,
+        strategy: AlgoStrategy,
+    },
+    CancelAlgo {
+        algo_id: u64,
+    },
     Subscribe {
         symbol: Symbol,
     },
@@ -114,6 +125,8 @@ impl ClientMessage {
             ClientMessage::Oco { .. } => OCO,
             ClientMessage::Bracket { .. } => BRACKET,
             ClientMessage::CancelConditional { .. } => CANCEL_CONDITIONAL,
+            ClientMessage::AlgoOrder { .. } => ALGO_ORDER,
+            ClientMessage::CancelAlgo { .. } => CANCEL_ALGO,
             ClientMessage::Subscribe { .. } => SUBSCRIBE,
             ClientMessage::Unsubscribe { .. } => UNSUBSCRIBE,
             ClientMessage::QueryAccount => QUERY_ACCOUNT,
@@ -223,6 +236,25 @@ impl ClientMessage {
             }
             ClientMessage::CancelConditional { cond_id } => {
                 e.u64(*cond_id).end_block();
+            }
+            ClientMessage::AlgoOrder {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                limit,
+                strategy,
+            } => {
+                e.u64(*client_order_id)
+                    .symbol(Some(*symbol))
+                    .u8(side_to_u8(*side))
+                    .u64(*qty)
+                    .u64(limit.unwrap_or(0));
+                put_algo_strategy(&mut e, strategy);
+                e.end_block();
+            }
+            ClientMessage::CancelAlgo { algo_id } => {
+                e.u64(*algo_id).end_block();
             }
             ClientMessage::SetMmp { window_ms, max_qty } => {
                 e.u64(*window_ms).u64(*max_qty).end_block();
@@ -411,6 +443,28 @@ impl ClientMessage {
                     stop_loss,
                 }
             }
+            ALGO_ORDER => {
+                let client_order_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let limit = Some(d.u64()?).filter(|&p| p > 0);
+                let strategy = get_algo_strategy(&mut d)?;
+                d.end_block()?;
+                ClientMessage::AlgoOrder {
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    limit,
+                    strategy,
+                }
+            }
+            CANCEL_ALGO => {
+                let algo_id = d.u64()?;
+                d.end_block()?;
+                ClientMessage::CancelAlgo { algo_id }
+            }
             CANCEL_CONDITIONAL => {
                 let cond_id = d.u64()?;
                 d.end_block()?;
@@ -538,6 +592,29 @@ pub mod tests {
                 stop_loss: 2_400,
             },
             ClientMessage::CancelConditional { cond_id: 5 },
+            ClientMessage::AlgoOrder {
+                client_order_id: 30,
+                symbol: sym("ACME"),
+                side: Side::Buy,
+                qty: 10_000,
+                limit: Some(2_550),
+                strategy: AlgoStrategy::Pov {
+                    rate_bps: 1_000,
+                    duration_ms: 60_000,
+                },
+            },
+            ClientMessage::AlgoOrder {
+                client_order_id: 31,
+                symbol: sym("ACME"),
+                side: Side::Sell,
+                qty: 500,
+                limit: None,
+                strategy: AlgoStrategy::Twap {
+                    duration_ms: 30_000,
+                    slices: 10,
+                },
+            },
+            ClientMessage::CancelAlgo { algo_id: 2 },
             ClientMessage::CancelAll {
                 symbol: Some(sym("NOVA")),
             },

@@ -1,3 +1,4 @@
+pub mod algo;
 pub mod broker;
 pub mod fees;
 pub mod gateway;

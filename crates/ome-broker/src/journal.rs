@@ -1,11 +1,12 @@
+use crate::algo::Algo;
 use crate::broker::{Fact, QuoteLeg};
 use crate::oms::Conditional;
 use ome_core::types::Timestamp;
 use ome_protocol::Asset;
 use ome_protocol::{
-    DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_charges, get_order_kind,
-    get_order_options, get_trigger, put_charges, put_order_kind, put_order_options, put_trigger,
-    role_from, side_from_u8, side_to_u8,
+    AlgoStatus, DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_algo_strategy,
+    get_charges, get_order_kind, get_order_options, get_trigger, put_algo_strategy, put_charges,
+    put_order_kind, put_order_options, put_trigger, role_from, side_from_u8, side_to_u8,
 };
 use ome_store::Entry;
 
@@ -27,6 +28,9 @@ mod template {
     pub const RESTRICTION_SET: u16 = 314;
     pub const LOSS_LIMIT_SET: u16 = 315;
     pub const TRADING_DAY_STARTED: u16 = 316;
+    pub const ALGO_STARTED: u16 = 317;
+    pub const ALGO_CHILD: u16 = 318;
+    pub const ALGO_FINISHED: u16 = 319;
     pub const CONDITIONAL: u16 = 399;
 }
 
@@ -102,6 +106,9 @@ impl Entry for Record {
             Fact::RestrictionSet { .. } => template::RESTRICTION_SET,
             Fact::LossLimitSet { .. } => template::LOSS_LIMIT_SET,
             Fact::TradingDayStarted { .. } => template::TRADING_DAY_STARTED,
+            Fact::AlgoStarted(_) => template::ALGO_STARTED,
+            Fact::AlgoChild { .. } => template::ALGO_CHILD,
+            Fact::AlgoFinished { .. } => template::ALGO_FINISHED,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -234,6 +241,27 @@ impl Entry for Record {
             }
             Fact::LossLimitSet { account, amount } => {
                 e.u64(*account).u64(*amount).end_block();
+            }
+            Fact::AlgoStarted(a) => {
+                e.u64(a.algo_id)
+                    .u64(a.account)
+                    .u64(a.client_order_id)
+                    .symbol(Some(a.symbol))
+                    .u8(side_to_u8(a.side))
+                    .u64(a.qty)
+                    .u64(a.limit.unwrap_or(0));
+                put_algo_strategy(&mut e, &a.strategy);
+                e.u64(a.started_at).u64(a.volume_base).end_block();
+            }
+            Fact::AlgoChild { algo_id, order } => {
+                e.u64(*algo_id).end_block().var_bytes(&encode_inner(order));
+            }
+            Fact::AlgoFinished {
+                algo_id,
+                status,
+                reason,
+            } => {
+                e.u64(*algo_id).u8(*status as u8).end_block().var(reason);
             }
             Fact::TradingDayStarted { day, marks } => {
                 e.u64(*day).end_block();
@@ -419,6 +447,45 @@ impl Entry for Record {
                 let amount = d.u64()?;
                 d.end_block()?;
                 Fact::LossLimitSet { account, amount }
+            }
+            template::ALGO_STARTED => {
+                let algo = Algo {
+                    algo_id: d.u64()?,
+                    account: d.u64()?,
+                    client_order_id: d.u64()?,
+                    symbol: d.symbol()?,
+                    side: side_from_u8(d.u8()?)?,
+                    qty: d.u64()?,
+                    limit: Some(d.u64()?).filter(|&p| p > 0),
+                    strategy: get_algo_strategy(&mut d)?,
+                    started_at: d.u64()?,
+                    volume_base: d.u64()?,
+                    filled: 0,
+                    notional: 0,
+                    children: 0,
+                    child: None,
+                };
+                d.end_block()?;
+                Fact::AlgoStarted(algo)
+            }
+            template::ALGO_CHILD => {
+                let algo_id = d.u64()?;
+                d.end_block()?;
+                Fact::AlgoChild {
+                    algo_id,
+                    order: decode_inner(d.var_bytes()?)?,
+                }
+            }
+            template::ALGO_FINISHED => {
+                let algo_id = d.u64()?;
+                let status =
+                    AlgoStatus::from_u8(d.u8()?).ok_or(DecodeError::Invalid("algo status"))?;
+                d.end_block()?;
+                Fact::AlgoFinished {
+                    algo_id,
+                    status,
+                    reason: d.var()?,
+                }
             }
             template::TRADING_DAY_STARTED => {
                 let day = d.u64()?;
@@ -621,6 +688,45 @@ mod tests {
                 day: 3,
                 marks: vec![(sym(), 25_10)],
             },
+            Fact::AlgoStarted(Algo {
+                algo_id: 1,
+                account: 2,
+                client_order_id: 8,
+                symbol: sym(),
+                side: Side::Buy,
+                qty: 600,
+                limit: Some(26_00),
+                strategy: ome_protocol::AlgoStrategy::Twap {
+                    duration_ms: 60_000,
+                    slices: 6,
+                },
+                started_at: 1_000,
+                volume_base: 40,
+                filled: 0,
+                notional: 0,
+                children: 0,
+                child: None,
+            }),
+            Fact::AlgoChild {
+                algo_id: 1,
+                order: Box::new(Fact::OrderAccepted {
+                    order_ref: 20,
+                    account: 2,
+                    client_order_id: 8,
+                    symbol: sym(),
+                    side: Side::Buy,
+                    price: 26_00,
+                    options: ome_core::types::OrderOptions::tif(TimeInForce::Ioc),
+                    qty: 100,
+                    reserved: 2_600_00,
+                    fee_reserve: 1_00,
+                }),
+            },
+            Fact::AlgoFinished {
+                algo_id: 1,
+                status: AlgoStatus::Cancelled,
+                reason: "cancelled by the client".into(),
+            },
             Fact::AccountStatusSet {
                 account: 2,
                 suspended: true,
@@ -653,6 +759,9 @@ mod tests {
         assert_eq!(live.conditional_reports(2), replayed.conditional_reports(2));
         assert_eq!(live.last_seq(), 3);
         let fund = live.account_snapshot(2).unwrap();
-        assert_eq!(fund.cash.reserved, 25_00 * 6 + 6 + 124_50 + 1);
+        assert_eq!(
+            fund.cash.reserved,
+            25_00 * 6 + 6 + 124_50 + 1 + 2_600_00 + 1_00
+        );
     }
 }

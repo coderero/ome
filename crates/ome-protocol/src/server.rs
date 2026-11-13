@@ -38,6 +38,7 @@ pub enum ServerMessage {
     FeeSummary(FeeSummary),
     ClearedTrade(ClearedTrade),
     ConditionalUpdate(ConditionalReport),
+    AlgoUpdate(AlgoReport),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -67,6 +68,7 @@ impl ServerMessage {
             ServerMessage::FeeSummary(_) => FEE_SUMMARY,
             ServerMessage::ClearedTrade(_) => CLEARED_TRADE,
             ServerMessage::ConditionalUpdate(_) => CONDITIONAL_UPDATE,
+            ServerMessage::AlgoUpdate(_) => ALGO_UPDATE,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -170,6 +172,20 @@ impl ServerMessage {
                     .u64(n.price);
                 put_charges(&mut e, &n.charges);
                 e.i64(n.net_amount).u64(n.timestamp).end_block();
+            }
+            ServerMessage::AlgoUpdate(a) => {
+                e.u64(a.algo_id)
+                    .u64(a.client_order_id)
+                    .u64(a.account)
+                    .symbol(Some(a.symbol))
+                    .u8(side_to_u8(a.side))
+                    .u64(a.qty)
+                    .u64(a.filled)
+                    .u64(a.avg_price)
+                    .u64(a.children)
+                    .u8(a.status as u8);
+                put_algo_strategy(&mut e, &a.strategy);
+                e.end_block().var(&a.reason);
             }
             ServerMessage::ConditionalUpdate(c) => {
                 e.u64(c.cond_id)
@@ -472,6 +488,35 @@ impl ServerMessage {
                     symbol,
                     account,
                     shares,
+                })
+            }
+            ALGO_UPDATE => {
+                let algo_id = d.u64()?;
+                let client_order_id = d.u64()?;
+                let account = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let filled = d.u64()?;
+                let avg_price = d.u64()?;
+                let children = d.u64()?;
+                let status =
+                    AlgoStatus::from_u8(d.u8()?).ok_or(DecodeError::Invalid("algo status"))?;
+                let strategy = get_algo_strategy(&mut d)?;
+                d.end_block()?;
+                ServerMessage::AlgoUpdate(AlgoReport {
+                    algo_id,
+                    client_order_id,
+                    account,
+                    symbol,
+                    side,
+                    qty,
+                    filled,
+                    avg_price,
+                    children,
+                    status,
+                    strategy,
+                    reason: d.var()?,
                 })
             }
             CONDITIONAL_UPDATE => {
@@ -848,6 +893,22 @@ mod tests {
             },
             ServerMessage::ReplayComplete { next_seq: 51 },
             ServerMessage::Heartbeat { server_time: 5 },
+            ServerMessage::AlgoUpdate(AlgoReport {
+                algo_id: 4,
+                client_order_id: 30,
+                account: 2,
+                symbol: sym("ACME"),
+                side: Side::Buy,
+                qty: 10_000,
+                filled: 2_500,
+                avg_price: 2_512,
+                children: 9,
+                status: AlgoStatus::Working,
+                strategy: AlgoStrategy::Vwap {
+                    duration_ms: 120_000,
+                },
+                reason: String::new(),
+            }),
             ServerMessage::ConditionalUpdate(ConditionalReport {
                 cond_id: 3,
                 client_order_id: 9,

@@ -1,3 +1,4 @@
+use crate::algo::Algo;
 use crate::fees::FeeEngine;
 use crate::ledger::Ledger;
 use crate::market::MarketCache;
@@ -12,9 +13,10 @@ use ome_core::types::{
 };
 use ome_net::auth::SecretHash;
 use ome_protocol::{
-    AccountInfo, AccountSnapshot, Allocation, Asset, Charges, ConditionalReport, ConditionalStatus,
-    ContractNote, ExecutionReport, FeeSummary, MarketPhase, MemberMessage, OrderStatus, Position,
-    QuoteSide, Role, ServerMessage, SettlementReport, Trigger,
+    AccountInfo, AccountSnapshot, AlgoReport, AlgoStatus, AlgoStrategy, Allocation, Asset, Charges,
+    ConditionalReport, ConditionalStatus, ContractNote, ExecutionReport, FeeSummary, MarketPhase,
+    MemberMessage, OrderStatus, Position, QuoteSide, Role, ServerMessage, SettlementReport,
+    Trigger,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -96,6 +98,16 @@ pub enum Fact {
         day: u64,
         marks: Vec<(Symbol, Price)>,
     },
+    AlgoStarted(Algo),
+    AlgoChild {
+        algo_id: u64,
+        order: Box<Fact>,
+    },
+    AlgoFinished {
+        algo_id: u64,
+        status: AlgoStatus,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +166,9 @@ pub struct Broker {
     brackets: BTreeMap<u64, BracketPlan>,
     risk: AccountRisk,
     marks: BTreeMap<Symbol, Price>,
+    algos: BTreeMap<u64, Algo>,
+    algo_children: BTreeMap<u64, u64>,
+    next_algo_id: u64,
 }
 
 impl Broker {
@@ -174,6 +189,9 @@ impl Broker {
             brackets: BTreeMap::new(),
             risk: AccountRisk::default(),
             marks: BTreeMap::new(),
+            algos: BTreeMap::new(),
+            algo_children: BTreeMap::new(),
+            next_algo_id: 1,
         }
     }
 
@@ -774,6 +792,218 @@ impl Broker {
         effects
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_algo(
+        &self,
+        account: AccountId,
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        limit: Option<Price>,
+        strategy: AlgoStrategy,
+        market: &MarketCache,
+        now: Timestamp,
+    ) -> Result<Fact, String> {
+        let holder = self
+            .ledger
+            .get(account)
+            .ok_or_else(|| format!("unknown account {account}"))?;
+        if !matches!(holder.role, Role::Quant | Role::Prop) {
+            return Err(format!(
+                "{} accounts may not use algorithmic orders",
+                holder.role.label()
+            ));
+        }
+        self.risk
+            .check(account, symbol, side, |s| mark_of(market, s))?;
+        let quote = market
+            .get(symbol)
+            .ok_or_else(|| format!("unknown symbol {symbol}"))?;
+        if qty == 0 {
+            return Err("quantity must be positive".into());
+        }
+        match strategy {
+            AlgoStrategy::Twap {
+                duration_ms,
+                slices,
+            } if duration_ms < 1_000 || slices == 0 || slices > 1_000 => {
+                return Err("TWAP needs at least 1 second and 1 - 1000 slices".into());
+            }
+            AlgoStrategy::Vwap { duration_ms } if duration_ms < 1_000 => {
+                return Err("VWAP needs at least 1 second".into());
+            }
+            AlgoStrategy::Pov {
+                rate_bps,
+                duration_ms,
+            } if rate_bps == 0 || rate_bps > 5_000 || duration_ms < 1_000 => {
+                return Err("POV needs a rate of 0.01% - 50% and at least 1 second".into());
+            }
+            AlgoStrategy::Iceberg { clip } if clip == 0 || limit.is_none() => {
+                return Err("an iceberg slicer needs a clip size and a limit price".into());
+            }
+            _ => {}
+        }
+        if let (Some(limit), Some((low, high))) = (limit, market.band(symbol))
+            && (limit < low || limit > high)
+        {
+            return Err(format!(
+                "limit {} outside band {} - {}",
+                ome_core::price::format_price(limit),
+                ome_core::price::format_price(low),
+                ome_core::price::format_price(high)
+            ));
+        }
+        let held = holder.position(symbol).total();
+        if side == Side::Sell && held < qty {
+            return Err(format!(
+                "insufficient {symbol} shares: need {qty}, holding {held}"
+            ));
+        }
+        Ok(Fact::AlgoStarted(Algo {
+            algo_id: self.next_algo_id,
+            account,
+            client_order_id,
+            symbol,
+            side,
+            qty,
+            limit,
+            strategy,
+            started_at: now,
+            volume_base: quote.info.volume,
+            filled: 0,
+            notional: 0,
+            children: 0,
+            child: None,
+        }))
+    }
+
+    pub fn decide_cancel_algo(&self, account: AccountId, algo_id: u64) -> Result<Fact, String> {
+        let algo = self
+            .algos
+            .get(&algo_id)
+            .ok_or_else(|| format!("algo #{algo_id} is not working"))?;
+        if algo.account != account {
+            return Err(format!("algo #{algo_id} is not yours"));
+        }
+        Ok(Fact::AlgoFinished {
+            algo_id,
+            status: AlgoStatus::Cancelled,
+            reason: "cancelled by the client".into(),
+        })
+    }
+
+    pub fn working_algos(&self) -> Vec<(u64, Timestamp)> {
+        self.algos
+            .values()
+            .map(|a| (a.algo_id, a.check_interval()))
+            .collect()
+    }
+
+    pub fn decide_algo_step(
+        &self,
+        algo_id: u64,
+        market: &MarketCache,
+        now: Timestamp,
+    ) -> Option<Fact> {
+        let algo = self.algos.get(&algo_id)?;
+        if algo.child.is_none() && algo.expired(now) {
+            return Some(Fact::AlgoFinished {
+                algo_id,
+                status: AlgoStatus::Expired,
+                reason: format!("time is up with {} of {} filled", algo.filled, algo.qty),
+            });
+        }
+        if market.phase() != MarketPhase::Open || !market.is_trading(algo.symbol) {
+            return None;
+        }
+        let volume = market.get(algo.symbol)?.info.volume;
+        let (kind, options, qty) = algo.next_child(now, volume)?;
+        let role = self.ledger.get(algo.account)?.role;
+        let qty = qty.min(Profile::limits(role).max_qty);
+        Some(
+            match self.decide_order(
+                algo.account,
+                algo.client_order_id,
+                algo.symbol,
+                algo.side,
+                kind,
+                options,
+                qty,
+                market,
+                now,
+            ) {
+                Ok(order) => Fact::AlgoChild {
+                    algo_id,
+                    order: Box::new(order),
+                },
+                Err(report) => Fact::AlgoFinished {
+                    algo_id,
+                    status: AlgoStatus::Rejected,
+                    reason: format!("child order rejected: {}", report.reason),
+                },
+            },
+        )
+    }
+
+    pub fn algo_reports(&self, account: AccountId) -> Vec<AlgoReport> {
+        self.algos
+            .values()
+            .filter(|a| a.account == account)
+            .map(|a| a.report(AlgoStatus::Working, ""))
+            .collect()
+    }
+
+    fn finish_algo(&mut self, algo_id: u64, status: AlgoStatus, reason: &str) -> Vec<Effect> {
+        let Some(algo) = self.algos.remove(&algo_id) else {
+            return vec![];
+        };
+        let mut effects = Vec::new();
+        if let Some(id) = algo
+            .child
+            .and_then(|r| self.orders.get(&r))
+            .and_then(|m| m.exchange_id)
+        {
+            effects.push(Effect::ToExchange(MemberMessage::Cancel { order_id: id }));
+        }
+        effects.push(algo_update(&algo, status, reason));
+        effects
+    }
+
+    fn algo_fill(&mut self, order_ref: u64, fill: Option<(Price, Qty)>, done: bool) -> Vec<Effect> {
+        let Some(&algo_id) = self.algo_children.get(&order_ref) else {
+            return vec![];
+        };
+        if done {
+            self.algo_children.remove(&order_ref);
+        }
+        let Some(algo) = self.algos.get_mut(&algo_id) else {
+            let orphan = self
+                .orders
+                .get(&order_ref)
+                .and_then(|m| m.exchange_id)
+                .filter(|_| !done);
+            return orphan
+                .map(|order_id| vec![Effect::ToExchange(MemberMessage::Cancel { order_id })])
+                .unwrap_or_default();
+        };
+        if done && algo.child == Some(order_ref) {
+            algo.child = None;
+        }
+        let Some((price, qty)) = fill else {
+            return vec![];
+        };
+        algo.filled += qty;
+        algo.notional += price as u128 * qty as u128;
+        if algo.filled >= algo.qty {
+            let mut effects = self.finish_algo(algo_id, AlgoStatus::Done, "fully filled");
+            effects.retain(|e| !matches!(e, Effect::ToExchange(_)));
+            effects
+        } else {
+            vec![algo_update(algo, AlgoStatus::Working, "")]
+        }
+    }
+
     pub fn decide_quote(
         &self,
         account: AccountId,
@@ -1153,11 +1383,44 @@ impl Broker {
                 }
                 effects
             }
+            Fact::AlgoStarted(algo) => {
+                self.next_algo_id = self.next_algo_id.max(algo.algo_id + 1);
+                self.algos.insert(algo.algo_id, algo.clone());
+                vec![algo_update(algo, AlgoStatus::Working, "started")]
+            }
+            Fact::AlgoChild { algo_id, order } => {
+                let effects = self.apply(order);
+                if let Fact::OrderAccepted { order_ref, .. } = order.as_ref()
+                    && self.orders.contains_key(order_ref)
+                    && let Some(algo) = self.algos.get_mut(algo_id)
+                {
+                    algo.child = Some(*order_ref);
+                    algo.children += 1;
+                    self.algo_children.insert(*order_ref, *algo_id);
+                }
+                effects
+            }
+            Fact::AlgoFinished {
+                algo_id,
+                status,
+                reason,
+            } => self.finish_algo(*algo_id, *status, reason),
             Fact::AccountStatusSet { account, suspended } => {
                 self.risk.set_suspended(*account, *suspended);
                 if !*suspended {
                     return vec![Effect::AccountChanged(*account)];
                 }
+                let algos: Vec<u64> = self
+                    .algos
+                    .values()
+                    .filter(|a| a.account == *account)
+                    .map(|a| a.algo_id)
+                    .collect();
+                let mut stopped: Vec<Effect> = algos
+                    .into_iter()
+                    .flat_map(|id| self.finish_algo(id, AlgoStatus::Cancelled, "account suspended"))
+                    .filter(|e| !matches!(e, Effect::ToExchange(_)))
+                    .collect();
                 let ids: Vec<u64> = self
                     .conditionals
                     .for_account(*account)
@@ -1175,6 +1438,7 @@ impl Broker {
                     symbol: None,
                 }));
                 effects.push(Effect::AccountChanged(*account));
+                effects.append(&mut stopped);
                 effects
             }
             Fact::RestrictionSet { symbol, restricted } => {
@@ -1191,6 +1455,7 @@ impl Broker {
             }
             Fact::OrderAbandoned { order_ref } => {
                 self.brackets.remove(order_ref);
+                let mut algo_effects = self.algo_fill(*order_ref, None, true);
                 let Some(meta) = self.orders.remove(order_ref) else {
                     return vec![];
                 };
@@ -1203,13 +1468,15 @@ impl Broker {
                     0,
                     "order lost while the exchange link was down",
                 );
-                vec![
+                let mut effects = vec![
                     Effect::AccountChanged(meta.account),
                     Effect::ToAccount {
                         account: meta.account,
                         message: ServerMessage::Execution(report),
                     },
-                ]
+                ];
+                effects.append(&mut algo_effects);
+                effects
             }
         }
     }
@@ -1377,6 +1644,11 @@ impl Broker {
         let bracket = fill
             .map(|f| self.bracket_fill(order_ref, f))
             .unwrap_or_default();
+        let algo = self.algo_fill(
+            order_ref,
+            fill.map(|f| (report.last_price, f.4)),
+            !report.status.is_open(),
+        );
         if !report.status.is_open() {
             self.brackets.remove(&order_ref);
         }
@@ -1394,6 +1666,7 @@ impl Broker {
             message: ServerMessage::Execution(client),
         });
         effects.extend(bracket);
+        effects.extend(algo);
         effects
     }
 
@@ -1464,6 +1737,13 @@ impl Broker {
                     .map(|id| client_report(id, m, status, (0, 0, 0), now, ""))
             })
             .collect()
+    }
+}
+
+fn algo_update(algo: &Algo, status: AlgoStatus, reason: &str) -> Effect {
+    Effect::ToAccount {
+        account: algo.account,
+        message: ServerMessage::AlgoUpdate(algo.report(status, reason)),
     }
 }
 
@@ -2702,5 +2982,175 @@ pub mod tests {
         broker.apply(&broker.decide_trading_day(1, &lower).unwrap());
         assert_eq!(broker.day_pnl(alice), 0);
         assert!(broker.decide_trading_day(1, &lower).is_none());
+    }
+
+    fn algo_statuses(effects: &[Effect]) -> Vec<(AlgoStatus, Qty)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::ToAccount {
+                    message: ServerMessage::AlgoUpdate(a),
+                    ..
+                } => Some((a.status, a.filled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn twap_parent_sends_children_on_schedule_and_completes_on_fills() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Prime));
+        let fund = open(&mut broker, "fund", Role::Quant, 1_000_000_00);
+        let twap = AlgoStrategy::Twap {
+            duration_ms: 10_000,
+            slices: 2,
+        };
+        let fact = broker
+            .decide_algo(
+                fund,
+                5,
+                sym(),
+                Side::Buy,
+                100,
+                Some(26_00),
+                twap,
+                &market(),
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(
+            algo_statuses(&broker.apply(&fact)),
+            vec![(AlgoStatus::Working, 0)]
+        );
+
+        let step = broker.decide_algo_step(1, &market(), 1_000).unwrap();
+        let effects = broker.apply(&step);
+        assert_eq!(
+            routed(&effects),
+            vec![(Side::Buy, OrderKind::Limit(26_00), 50)]
+        );
+        assert!(
+            broker.decide_algo_step(1, &market(), 1_100).is_none(),
+            "one child at a time"
+        );
+        let effects = deliver(
+            &mut broker,
+            exchange_report(
+                10,
+                1,
+                fund,
+                Side::Buy,
+                OrderStatus::Filled,
+                (25_50, 50),
+                50,
+                50,
+                1,
+            ),
+        );
+        assert_eq!(algo_statuses(&effects), vec![(AlgoStatus::Working, 50)]);
+        assert!(
+            broker.decide_algo_step(1, &market(), 3_000).is_none(),
+            "next slice not due"
+        );
+
+        let effects = broker.apply(&broker.decide_algo_step(1, &market(), 6_000).unwrap());
+        assert_eq!(
+            routed(&effects),
+            vec![(Side::Buy, OrderKind::Limit(26_00), 50)]
+        );
+        let effects = deliver(
+            &mut broker,
+            exchange_report(
+                11,
+                2,
+                fund,
+                Side::Buy,
+                OrderStatus::Filled,
+                (25_70, 50),
+                50,
+                50,
+                2,
+            ),
+        );
+        let done = algo_statuses(&effects);
+        assert_eq!(done, vec![(AlgoStatus::Done, 100)]);
+        assert!(broker.algo_reports(fund).is_empty());
+        let report = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::ToAccount {
+                    message: ServerMessage::AlgoUpdate(a),
+                    ..
+                } => Some(a.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((report.avg_price, report.children), (25_60, 2));
+    }
+
+    #[test]
+    fn cancelling_an_iceberg_slicer_pulls_its_resting_child_and_algos_are_role_gated() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Prime));
+        let desk = open(&mut broker, "desk", Role::Prop, 1_000_000_00);
+        let fact = broker
+            .decide_algo(
+                desk,
+                1,
+                sym(),
+                Side::Buy,
+                1_000,
+                Some(24_00),
+                AlgoStrategy::Iceberg { clip: 200 },
+                &market(),
+                0,
+            )
+            .unwrap();
+        broker.apply(&fact);
+        let effects = broker.apply(&broker.decide_algo_step(1, &market(), 0).unwrap());
+        assert_eq!(
+            routed(&effects),
+            vec![(Side::Buy, OrderKind::Limit(24_00), 200)]
+        );
+        deliver(
+            &mut broker,
+            exchange_report(42, 1, desk, Side::Buy, OrderStatus::New, (0, 0), 0, 200, 1),
+        );
+        let effects = broker.apply(&broker.decide_cancel_algo(desk, 1).unwrap());
+        assert!(effects.contains(&Effect::ToExchange(MemberMessage::Cancel { order_id: 42 })));
+        assert_eq!(algo_statuses(&effects), vec![(AlgoStatus::Cancelled, 0)]);
+
+        let expired = AlgoStrategy::Vwap { duration_ms: 5_000 };
+        broker.apply(
+            &broker
+                .decide_algo(desk, 2, sym(), Side::Buy, 10, None, expired, &market(), 0)
+                .unwrap(),
+        );
+        let mut closed = market();
+        closed.apply(&ServerMessage::MarketStatus(ome_protocol::MarketStatus {
+            phase: MarketPhase::Closed,
+            day: 1,
+            since: 0,
+            next_change_at: 0,
+        }));
+        assert!(broker.decide_algo_step(2, &closed, 1_000).is_none());
+        let effects = broker.apply(&broker.decide_algo_step(2, &closed, 5_000).unwrap());
+        assert_eq!(algo_statuses(&effects), vec![(AlgoStatus::Expired, 0)]);
+
+        let mut retail = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = open(&mut retail, "alice", Role::Retail, 10_000_00);
+        let refused = retail.decide_algo(
+            alice,
+            1,
+            sym(),
+            Side::Buy,
+            10,
+            None,
+            AlgoStrategy::Vwap {
+                duration_ms: 60_000,
+            },
+            &market(),
+            0,
+        );
+        assert!(refused.unwrap_err().contains("algorithmic"));
     }
 }

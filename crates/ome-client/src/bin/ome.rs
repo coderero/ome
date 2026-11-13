@@ -3,8 +3,9 @@ use ome_core::price::{format_price, parse_amount, parse_price};
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, OrderKind, OrderOptions, Side, StpMode, TimeInForce};
 use ome_protocol::{
-    AccountInfo, Asset, ClientMessage, InstrumentInfo, MarketPhase, MemberId, MemberInfo,
-    MemberKind, MemberMessage, OrderStatus, QuoteSide, Role, ServerMessage, Trigger,
+    AccountInfo, AlgoStatus, AlgoStrategy, Asset, ClientMessage, InstrumentInfo, MarketPhase,
+    MemberId, MemberInfo, MemberKind, MemberMessage, OrderStatus, QuoteSide, Role, ServerMessage,
+    Trigger,
 };
 use std::time::Duration;
 
@@ -48,6 +49,12 @@ const USAGE: &str = "usage:
       bracket <SYMBOL> <buy|sell> <qty> <price|mkt> <target> <stop>
                                                           entry order whose fills arm an OCO exit
       conditionals  |  cancel-cond <id>                   armed broker-held orders
+      twap <SYMBOL> <side> <qty> <seconds> <slices> [limit] [follow]
+      vwap <SYMBOL> <side> <qty> <seconds> [limit] [follow]
+      pov <SYMBOL> <side> <qty> <percent> <seconds> [limit] [follow]
+      slice <SYMBOL> <side> <qty> <clip> <limit> [follow]   broker-side iceberg slicer
+                                                          algorithmic parent orders (quant and prop accounts)
+      algos  |  cancel-algo <id>                          working algos with progress
       instruments  |  watch <SYMBOL>
 
   ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
@@ -664,6 +671,121 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 }
             }
         }
+        [
+            name @ ("twap" | "vwap" | "pov" | "slice"),
+            sym,
+            side,
+            qty,
+            rest @ ..,
+        ] => {
+            let (rest, follow) = match rest.split_last() {
+                Some((&"follow", head)) => (head, true),
+                _ => (rest, false),
+            };
+            let seconds =
+                |text: &str| -> std::result::Result<u64, String> { Ok(number(text)? * 1_000) };
+            let limit = |text: Option<&&str>| text.map(|p| price(p)).transpose();
+            let (strategy, limit) = match (*name, rest) {
+                ("twap", [secs, slices, more @ ..]) if more.len() <= 1 => (
+                    AlgoStrategy::Twap {
+                        duration_ms: seconds(secs)?,
+                        slices: number(slices)?,
+                    },
+                    limit(more.first())?,
+                ),
+                ("vwap", [secs, more @ ..]) if more.len() <= 1 => (
+                    AlgoStrategy::Vwap {
+                        duration_ms: seconds(secs)?,
+                    },
+                    limit(more.first())?,
+                ),
+                ("pov", [pct, secs, more @ ..]) if more.len() <= 1 => (
+                    AlgoStrategy::Pov {
+                        rate_bps: price(pct)?,
+                        duration_ms: seconds(secs)?,
+                    },
+                    limit(more.first())?,
+                ),
+                ("slice", [clip, px]) => (
+                    AlgoStrategy::Iceberg {
+                        clip: number(clip)?,
+                    },
+                    Some(price(px)?),
+                ),
+                _ => return usage(),
+            };
+            let client_order_id = client.next_order_id();
+            client.send(&ClientMessage::AlgoOrder {
+                client_order_id,
+                symbol: symbol(sym)?,
+                side: side_of(side)?,
+                qty: number(qty)?,
+                limit,
+                strategy,
+            })?;
+            loop {
+                let wait = if follow {
+                    Duration::from_secs(600)
+                } else {
+                    Duration::from_secs(5)
+                };
+                match client.wait_for(wait, |m| match m {
+                    ServerMessage::AlgoUpdate(a) => a.client_order_id == client_order_id,
+                    ServerMessage::Reject { .. } => true,
+                    _ => false,
+                })? {
+                    ServerMessage::Reject { reason, .. } => {
+                        return Err(ClientError::Rejected(reason).into());
+                    }
+                    ServerMessage::AlgoUpdate(a) => {
+                        print_algo(&a);
+                        if !follow || a.status != AlgoStatus::Working {
+                            break;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        ["algos"] => {
+            client.send(&ClientMessage::QueryAccount)?;
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut working = std::collections::BTreeMap::new();
+            while let Some(message) = client
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?
+            {
+                if let ServerMessage::AlgoUpdate(a) = message {
+                    if a.status == AlgoStatus::Working {
+                        working.insert(a.algo_id, a);
+                    } else {
+                        working.remove(&a.algo_id);
+                    }
+                }
+            }
+            if working.is_empty() {
+                println!("no working algos");
+            }
+            for a in working.values() {
+                print_algo(a);
+            }
+        }
+        ["cancel-algo", id] => {
+            let algo_id = number(id)?;
+            client.send(&ClientMessage::CancelAlgo { algo_id })?;
+            match client.wait_for(Duration::from_secs(5), |m| match m {
+                ServerMessage::AlgoUpdate(a) => {
+                    a.algo_id == algo_id && a.status != AlgoStatus::Working
+                }
+                ServerMessage::Reject { .. } => true,
+                _ => false,
+            })? {
+                ServerMessage::Reject { reason, .. } => {
+                    return Err(ClientError::Rejected(reason).into());
+                }
+                ServerMessage::AlgoUpdate(a) => print_algo(&a),
+                _ => unreachable!(),
+            }
+        }
         ["conditionals"] => {
             client.send(&ClientMessage::QueryAccount)?;
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -796,6 +918,26 @@ fn print_conditional_replies(client: &mut Client, client_order_id: u64, legs: us
         }
     }
     Ok(())
+}
+
+fn print_algo(a: &ome_protocol::AlgoReport) {
+    println!(
+        "algo #{} {} {} {} {}/{} filled avg {} in {} child order(s) [{}]{}",
+        a.algo_id,
+        a.status.label(),
+        a.side.label(),
+        a.symbol,
+        a.filled,
+        a.qty,
+        format_price(a.avg_price),
+        a.children,
+        a.strategy.describe(),
+        if a.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", a.reason)
+        }
+    );
 }
 
 fn print_conditional(c: &ome_protocol::ConditionalReport) {
