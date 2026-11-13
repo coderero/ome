@@ -530,6 +530,38 @@ pub struct FeeSummary {
     pub dark_shares: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketStats {
+    pub symbol: Symbol,
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub last: Price,
+    pub vwap: Price,
+    pub trades: u64,
+    pub turnover: u64,
+    pub exchange_volume: Qty,
+    pub internal_volume: Qty,
+    pub wholesaler_volume: Qty,
+    pub ats_volume: Qty,
+}
+
+impl MarketStats {
+    pub fn volume(&self) -> Qty {
+        self.exchange_volume + self.internal_volume + self.wholesaler_volume + self.ats_volume
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObligationInfo {
+    pub symbol: Symbol,
+    pub member_id: MemberId,
+    pub samples: u64,
+    pub compliant: u64,
+    pub quoting: bool,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VenueMemberInfo {
     pub member_id: MemberId,

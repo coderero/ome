@@ -62,6 +62,7 @@ seed_market() {
     issuer="$(broker_admin prime-co create-account "${lower}_ir" "${lower}-ir-pw" issuer 0 | account_id)"
     exchange_cmd ipo "$symbol" "$price" "$shares" prime-co "$issuer" "$name"
     wait_for listed_everywhere "$symbol"
+    exchange_cmd dmm "$symbol" lp-co
 
     for n in 1 2; do
       broker_admin lp-co create-account "${lower}_mm$n" bot-pw lp 250000

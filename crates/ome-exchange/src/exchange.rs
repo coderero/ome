@@ -54,6 +54,10 @@ impl Default for ExchangeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    SetDmm {
+        symbol: Symbol,
+        member: MemberId,
+    },
     TradeReport {
         member: MemberId,
         report_id: u64,
@@ -239,6 +243,7 @@ pub struct Exchange {
     next_order_id: OrderId,
     next_trade_id: u64,
     off_exchange: BTreeMap<(Symbol, Venue), Qty>,
+    dmm: BTreeMap<Symbol, MemberId>,
     next_allocation_id: u64,
 }
 
@@ -278,6 +283,7 @@ impl Exchange {
             next_order_id: 1,
             next_trade_id: 1,
             off_exchange: BTreeMap::new(),
+            dmm: BTreeMap::new(),
             next_allocation_id: 1,
         }
     }
@@ -300,6 +306,18 @@ impl Exchange {
         now: Timestamp,
     ) -> Result<Vec<Event>, ExchangeError> {
         match command {
+            Command::SetDmm { symbol, member } => {
+                if !self.instruments.contains_key(symbol) {
+                    return Err(ExchangeError::UnknownSymbol(*symbol));
+                }
+                if *member == 0 {
+                    self.dmm.remove(symbol);
+                } else {
+                    self.trading_member(*member)?;
+                    self.dmm.insert(*symbol, *member);
+                }
+                Ok(vec![])
+            }
             Command::TradeReport {
                 member,
                 symbol,
@@ -512,6 +530,7 @@ impl Exchange {
             for instrument in self.instruments.values_mut() {
                 instrument.reference_price =
                     instrument.last_price.unwrap_or(instrument.reference_price);
+                instrument.day = Default::default();
                 events.push(Event::InstrumentChanged(instrument.symbol));
             }
         }
@@ -1360,6 +1379,35 @@ impl Exchange {
         Ok(events)
     }
 
+    pub fn dmms(&self) -> Vec<(Symbol, MemberId)> {
+        self.dmm.iter().map(|(s, m)| (*s, *m)).collect()
+    }
+
+    pub fn dmm_quoting(&self, symbol: Symbol, member: MemberId, min_qty: Qty) -> bool {
+        let mut bids: BTreeMap<Price, Qty> = BTreeMap::new();
+        let mut asks: BTreeMap<Price, Qty> = BTreeMap::new();
+        for meta in self.orders.values() {
+            if meta.symbol != symbol || meta.member != member {
+                continue;
+            }
+            let side = match meta.side {
+                Side::Buy => &mut bids,
+                Side::Sell => &mut asks,
+            };
+            *side.entry(meta.price).or_default() += meta.qty - meta.filled;
+        }
+        let Some(reference) = self.instruments.get(&symbol).map(|i| i.reference_price) else {
+            return false;
+        };
+        let max_spread = (reference * 200 / 10_000).max(2);
+        match (bids.iter().next_back(), asks.iter().next()) {
+            (Some((bid, bid_qty)), Some((ask, ask_qty))) => {
+                ask > bid && ask - bid <= max_spread && *bid_qty >= min_qty && *ask_qty >= min_qty
+            }
+            _ => false,
+        }
+    }
+
     pub fn off_exchange_volume(&self, symbol: Symbol, venue: Venue) -> Qty {
         self.off_exchange
             .get(&(symbol, venue))
@@ -1403,7 +1451,11 @@ impl Exchange {
                 .members
                 .get(member)
                 .map_or(MemberKind::Broker, |m| m.kind);
-            let fee = self.config.fees.fee(kind, maker, trade.qty);
+            let fee = if self.dmm.get(&symbol) == Some(&member) {
+                self.config.fees.designated_fee(maker, trade.qty)
+            } else {
+                self.config.fees.fee(kind, maker, trade.qty)
+            };
             *self.member_fees.entry(member).or_default() += fee;
             self.record_quote_fill(order_id, trade.qty, now);
             legs.push((side, member, account, fee));
@@ -2439,6 +2491,53 @@ mod tests {
                     sell_member: 0,
                 },
                 6,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn designated_market_makers_earn_a_better_rebate_and_are_checked_for_quotes() {
+        let mut m = market();
+        let (lp, broker) = (m.lp, m.broker);
+        m.ex.execute(
+            &Command::SetDmm {
+                symbol: sym("ACME"),
+                member: lp,
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(m.ex.dmms(), vec![(sym("ACME"), lp)]);
+        order(&mut m, lp, 4, Side::Buy, 24_90, 200);
+        assert!(!m.ex.dmm_quoting(sym("ACME"), lp, 100), "one-sided");
+        order(&mut m, lp, 4, Side::Sell, 25_20, 200);
+        assert!(m.ex.dmm_quoting(sym("ACME"), lp, 100));
+        assert!(!m.ex.dmm_quoting(sym("ACME"), lp, 500), "too small");
+        let events = order(&mut m, broker, 7, Side::Sell, 24_90, 100);
+        let maker = reports_for(&events, lp)
+            .into_iter()
+            .find(|r| r.last_qty == 100)
+            .unwrap();
+        assert_eq!(maker.fees, -35);
+        let stats = m.ex.instrument(sym("ACME")).unwrap().stats();
+        assert_eq!(
+            (
+                stats.open,
+                stats.last,
+                stats.trades,
+                stats.exchange_volume,
+                stats.vwap
+            ),
+            (24_90, 24_90, 1, 100, 24_90)
+        );
+        assert!(
+            m.ex.execute(
+                &Command::SetDmm {
+                    symbol: sym("NOPE"),
+                    member: lp
+                },
+                0
             )
             .is_err()
         );

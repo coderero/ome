@@ -51,6 +51,8 @@ pub const SET_SCHEDULE: u16 = 86;
 pub const SET_MEMBER_STATUS: u16 = 87;
 pub const SET_CANCEL_ON_DISCONNECT: u16 = 88;
 pub const QUERY_VENUE: u16 = 89;
+pub const SET_DMM: u16 = 90;
+pub const QUERY_OBLIGATIONS: u16 = 91;
 
 pub const LOGON_ACK: u16 = 100;
 pub const SERVER_HEARTBEAT: u16 = 101;
@@ -66,6 +68,8 @@ pub const CLEARED_TRADE: u16 = 114;
 pub const CONDITIONAL_UPDATE: u16 = 116;
 pub const ALGO_UPDATE: u16 = 117;
 pub const VENUE_STATUS: u16 = 118;
+pub const MARKET_STATS: u16 = 119;
+pub const OBLIGATIONS: u16 = 134;
 pub const SETTLEMENT_REPORT: u16 = 115;
 pub const INSTRUMENT_LIST: u16 = 120;
 pub const INSTRUMENT: u16 = 121;

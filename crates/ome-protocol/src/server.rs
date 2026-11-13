@@ -40,6 +40,8 @@ pub enum ServerMessage {
     ConditionalUpdate(ConditionalReport),
     AlgoUpdate(AlgoReport),
     VenueStatus(VenueStatus),
+    MarketStats(MarketStats),
+    Obligations(Vec<ObligationInfo>),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -71,6 +73,8 @@ impl ServerMessage {
             ServerMessage::ConditionalUpdate(_) => CONDITIONAL_UPDATE,
             ServerMessage::AlgoUpdate(_) => ALGO_UPDATE,
             ServerMessage::VenueStatus(_) => VENUE_STATUS,
+            ServerMessage::MarketStats(_) => MARKET_STATS,
+            ServerMessage::Obligations(_) => OBLIGATIONS,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -232,6 +236,35 @@ impl ServerMessage {
                         .i64(p.holding)
                         .u8(p.failed as u8);
                     e.end_entry_block(&mut g);
+                }
+            }
+            ServerMessage::MarketStats(m) => {
+                e.symbol(Some(m.symbol))
+                    .u64(m.open)
+                    .u64(m.high)
+                    .u64(m.low)
+                    .u64(m.last)
+                    .u64(m.vwap)
+                    .u64(m.trades)
+                    .u64(m.turnover)
+                    .u64(m.exchange_volume)
+                    .u64(m.internal_volume)
+                    .u64(m.wholesaler_volume)
+                    .u64(m.ats_volume)
+                    .end_block();
+            }
+            ServerMessage::Obligations(list) => {
+                e.end_block();
+                let mut g = e.begin_group(list.len());
+                for o in list {
+                    e.begin_entry(&mut g);
+                    e.symbol(Some(o.symbol))
+                        .u64(o.member_id)
+                        .u64(o.samples)
+                        .u64(o.compliant)
+                        .u8(o.quoting as u8);
+                    e.end_entry_block(&mut g);
+                    e.var(&o.name);
                 }
             }
             ServerMessage::VenueStatus(v) => {
@@ -627,6 +660,47 @@ impl ServerMessage {
                     margin_required,
                     positions,
                 })
+            }
+            MARKET_STATS => {
+                let stats = MarketStats {
+                    symbol: d.symbol()?,
+                    open: d.u64()?,
+                    high: d.u64()?,
+                    low: d.u64()?,
+                    last: d.u64()?,
+                    vwap: d.u64()?,
+                    trades: d.u64()?,
+                    turnover: d.u64()?,
+                    exchange_volume: d.u64()?,
+                    internal_volume: d.u64()?,
+                    wholesaler_volume: d.u64()?,
+                    ats_volume: d.u64()?,
+                };
+                d.end_block()?;
+                ServerMessage::MarketStats(stats)
+            }
+            OBLIGATIONS => {
+                d.end_block()?;
+                let g = d.group()?;
+                let mut list = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let symbol = d.symbol()?;
+                    let member_id = d.u64()?;
+                    let samples = d.u64()?;
+                    let compliant = d.u64()?;
+                    let quoting = d.u8()? != 0;
+                    d.end_entry_block(start, &g)?;
+                    list.push(ObligationInfo {
+                        symbol,
+                        member_id,
+                        samples,
+                        compliant,
+                        quoting,
+                        name: d.var()?,
+                    });
+                }
+                ServerMessage::Obligations(list)
             }
             VENUE_STATUS => {
                 let venue = Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
@@ -1151,6 +1225,28 @@ mod tests {
                 pfof_earned: 12,
                 dark_shares: 300,
             }),
+            ServerMessage::MarketStats(MarketStats {
+                symbol: sym("ACME"),
+                open: 2_500,
+                high: 2_610,
+                low: 2_480,
+                last: 2_590,
+                vwap: 2_544,
+                trades: 120,
+                turnover: 3_000_000,
+                exchange_volume: 900,
+                internal_volume: 100,
+                wholesaler_volume: 150,
+                ats_volume: 30,
+            }),
+            ServerMessage::Obligations(vec![ObligationInfo {
+                symbol: sym("ACME"),
+                member_id: 5,
+                samples: 60,
+                compliant: 57,
+                quoting: true,
+                name: "lp-co".into(),
+            }]),
             ServerMessage::VenueStatus(VenueStatus {
                 venue: Venue::Wholesaler,
                 fills: 10,

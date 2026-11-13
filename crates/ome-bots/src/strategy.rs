@@ -79,7 +79,7 @@ impl Default for MarketMaker {
     fn default() -> Self {
         Self {
             half_spread_bps: 12.0,
-            quote_size: 25,
+            quote_size: 100,
             max_inventory_skew: 400,
             requote_bps: 4.0,
             target_inventory: None,

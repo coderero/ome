@@ -68,6 +68,11 @@ pub enum MemberMessage {
         min_qty: Qty,
     },
     QueryVenue,
+    SetDmm {
+        symbol: Symbol,
+        member: MemberId,
+    },
+    QueryObligations,
     SetMemberStatus {
         member: MemberId,
         enabled: bool,
@@ -139,6 +144,8 @@ impl MemberMessage {
             MemberMessage::TradeReport { .. } => MEMBER_TRADE_REPORT,
             MemberMessage::DarkOrder { .. } => MEMBER_DARK_ORDER,
             MemberMessage::QueryVenue => QUERY_VENUE,
+            MemberMessage::SetDmm { .. } => SET_DMM,
+            MemberMessage::QueryObligations => QUERY_OBLIGATIONS,
             MemberMessage::SetMemberStatus { .. } => SET_MEMBER_STATUS,
             MemberMessage::SetCancelOnDisconnect { .. } => SET_CANCEL_ON_DISCONNECT,
             MemberMessage::CreateMember { .. } => CREATE_MEMBER,
@@ -170,8 +177,12 @@ impl MemberMessage {
             | MemberMessage::QueryInstruments
             | MemberMessage::QueryMembers
             | MemberMessage::QueryClearing
-            | MemberMessage::QueryVenue => {
+            | MemberMessage::QueryVenue
+            | MemberMessage::QueryObligations => {
                 e.end_block();
+            }
+            MemberMessage::SetDmm { symbol, member } => {
+                e.symbol(Some(*symbol)).u64(*member).end_block();
             }
             MemberMessage::NewOrder {
                 member_order_id,
@@ -455,6 +466,16 @@ impl MemberMessage {
                 d.end_block()?;
                 MemberMessage::QueryVenue
             }
+            SET_DMM => {
+                let symbol = d.symbol()?;
+                let member = d.u64()?;
+                d.end_block()?;
+                MemberMessage::SetDmm { symbol, member }
+            }
+            QUERY_OBLIGATIONS => {
+                d.end_block()?;
+                MemberMessage::QueryObligations
+            }
             MEMBER_SET_MMP => {
                 let account = d.u64()?;
                 let window_ms = d.u64()?;
@@ -659,6 +680,11 @@ pub mod tests {
                 min_qty: 500,
             },
             MemberMessage::QueryVenue,
+            MemberMessage::SetDmm {
+                symbol: sym("ACME"),
+                member: 5,
+            },
+            MemberMessage::QueryObligations,
             MemberMessage::SetMemberStatus {
                 member: 3,
                 enabled: false,

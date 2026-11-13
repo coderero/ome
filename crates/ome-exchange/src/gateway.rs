@@ -20,6 +20,8 @@ use std::sync::Arc;
 const HEARTBEAT_MS: Timestamp = 1_000;
 const CANDLE_BACKFILL: usize = 300;
 const TRADE_BACKFILL: usize = 60;
+const OBLIGATION_SAMPLE_MS: Timestamp = 1_000;
+const DMM_MIN_QTY: u64 = 100;
 const THROTTLE_PER_SECOND: f64 = 5_000.0;
 const THROTTLE_BURST: f64 = 10_000.0;
 
@@ -35,6 +37,9 @@ pub struct Gateway {
     journal: Option<Journal<Record>>,
     sessions: BTreeMap<SessionId, Session>,
     dirty_books: BTreeSet<Symbol>,
+    dirty_stats: BTreeSet<Symbol>,
+    obligations: BTreeMap<(Symbol, MemberId), (u64, u64, bool)>,
+    last_sample: Timestamp,
     dropped: BTreeSet<SessionId>,
     clock: Timestamp,
     last_heartbeat: Timestamp,
@@ -47,6 +52,9 @@ impl Gateway {
             journal,
             sessions: BTreeMap::new(),
             dirty_books: BTreeSet::new(),
+            dirty_stats: BTreeSet::new(),
+            obligations: BTreeMap::new(),
+            last_sample: clock,
             dropped: BTreeSet::new(),
             clock,
             last_heartbeat: clock,
@@ -180,6 +188,25 @@ impl Gateway {
         }
         self.exchange.roll_candles(now);
 
+        for symbol in std::mem::take(&mut self.dirty_stats) {
+            if let Some(instrument) = self.exchange.instrument(symbol) {
+                let stats = instrument.stats();
+                self.send_to_subscribers(symbol, &ServerMessage::MarketStats(stats));
+            }
+        }
+        if now >= self.last_sample + OBLIGATION_SAMPLE_MS {
+            self.last_sample = now;
+            let open = self.exchange.market_status().phase == ome_protocol::MarketPhase::Open;
+            for (symbol, member) in self.exchange.dmms() {
+                let quoting = self.exchange.dmm_quoting(symbol, member, DMM_MIN_QTY);
+                let entry = self.obligations.entry((symbol, member)).or_default();
+                entry.2 = quoting;
+                if open {
+                    entry.0 += 1;
+                    entry.1 += quoting as u64;
+                }
+            }
+        }
         for symbol in std::mem::take(&mut self.dirty_books) {
             if let Some(book) = self.book_snapshot(symbol, now) {
                 self.send_to_subscribers(symbol, &ServerMessage::Book(book));
@@ -304,6 +331,34 @@ impl Gateway {
                     id,
                     ServerMessage::InstrumentList(self.exchange.instrument_list()),
                 );
+            }
+            MemberMessage::QueryObligations => {
+                let names: BTreeMap<MemberId, String> = self
+                    .member_list()
+                    .into_iter()
+                    .map(|m| (m.member_id, m.name))
+                    .collect();
+                let list = self
+                    .exchange
+                    .dmms()
+                    .into_iter()
+                    .map(|(symbol, member)| {
+                        let (samples, compliant, quoting) = self
+                            .obligations
+                            .get(&(symbol, member))
+                            .copied()
+                            .unwrap_or_default();
+                        ome_protocol::ObligationInfo {
+                            symbol,
+                            member_id: member,
+                            samples,
+                            compliant,
+                            quoting,
+                            name: names.get(&member).cloned().unwrap_or_default(),
+                        }
+                    })
+                    .collect();
+                return self.reply(id, ServerMessage::Obligations(list));
             }
             MemberMessage::QueryMembers if admin || clearing => {
                 return self.reply(id, ServerMessage::MemberList(self.member_list()));
@@ -432,6 +487,7 @@ impl Gateway {
             },
             MemberMessage::Halt { symbol, reason } if admin => Command::Halt { symbol, reason },
             MemberMessage::Resume { symbol } if admin => Command::Resume { symbol },
+            MemberMessage::SetDmm { symbol, member } if admin => Command::SetDmm { symbol, member },
             MemberMessage::SetSession { phase } if admin => Command::SetPhase { phase },
             MemberMessage::SetSchedule {
                 pre_open_ms,
@@ -501,6 +557,7 @@ impl Gateway {
             match event {
                 Event::ToMember { member, message } => self.send_to_member(member, &message),
                 Event::Trade(trade) => {
+                    self.dirty_stats.insert(trade.symbol);
                     self.send_to_subscribers(trade.symbol, &ServerMessage::Trade(trade))
                 }
                 Event::BookChanged(symbol) => {
@@ -574,6 +631,10 @@ impl Gateway {
         }
         if let Some(book) = self.book_snapshot(symbol, now) {
             self.reply(id, ServerMessage::Book(book));
+        }
+        if let Some(instrument) = self.exchange.instrument(symbol) {
+            let stats = instrument.stats();
+            self.reply(id, ServerMessage::MarketStats(stats));
         }
     }
 
@@ -723,6 +784,10 @@ fn describe_admin_action(command: &Command, events: &[Event]) -> Option<String> 
         ),
         Command::OpenCycle { cycle } => format!("clearing opened trade cycle {cycle}"),
         Command::Settled { cycle } => format!("clearing settled cycle {cycle}"),
+        Command::SetDmm { symbol, member: 0 } => format!("{symbol} has no designated market maker"),
+        Command::SetDmm { symbol, member } => {
+            format!("member {member} is the designated market maker for {symbol}")
+        }
         Command::SetCreditLimit { member, limit } => {
             if *limit == u64::MAX {
                 format!("member {member} credit limit removed")

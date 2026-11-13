@@ -13,6 +13,7 @@ pub struct Rate {
 pub struct FeeSchedule {
     pub broker: Rate,
     pub liquidity_provider: Rate,
+    pub designated_maker: Rate,
 }
 
 impl Default for FeeSchedule {
@@ -26,6 +27,10 @@ impl Default for FeeSchedule {
                 maker_per_share: -25,
                 taker_per_share: 30,
             },
+            designated_maker: Rate {
+                maker_per_share: -35,
+                taker_per_share: 30,
+            },
         }
     }
 }
@@ -36,6 +41,14 @@ impl FeeSchedule {
             MemberKind::LiquidityProvider => self.liquidity_provider,
             MemberKind::Broker | MemberKind::Admin | MemberKind::Clearing => self.broker,
         };
+        Self::charge(rate, maker, qty)
+    }
+
+    pub fn designated_fee(&self, maker: bool, qty: Qty) -> i64 {
+        Self::charge(self.designated_maker, maker, qty)
+    }
+
+    fn charge(rate: Rate, maker: bool, qty: Qty) -> i64 {
         let per_share = if maker {
             rate.maker_per_share
         } else {

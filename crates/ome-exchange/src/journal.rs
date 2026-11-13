@@ -27,6 +27,7 @@ mod template {
     pub const QUOTE: u16 = 215;
     pub const SET_MMP: u16 = 216;
     pub const TRADE_REPORT: u16 = 217;
+    pub const SET_DMM: u16 = 218;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,7 @@ impl Entry for Record {
             Command::Quote { .. } => template::QUOTE,
             Command::SetMmp { .. } => template::SET_MMP,
             Command::TradeReport { .. } => template::TRADE_REPORT,
+            Command::SetDmm { .. } => template::SET_DMM,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -147,6 +149,9 @@ impl Entry for Record {
                 e.u64(*ask_ref);
                 put_quote_side(&mut e, ask);
                 e.end_block();
+            }
+            Command::SetDmm { symbol, member } => {
+                e.symbol(Some(*symbol)).u64(*member).end_block();
             }
             Command::TradeReport {
                 member,
@@ -327,6 +332,12 @@ impl Entry for Record {
                     ask,
                 }
             }
+            template::SET_DMM => {
+                let symbol = d.symbol()?;
+                let member = d.u64()?;
+                d.end_block()?;
+                Command::SetDmm { symbol, member }
+            }
             template::TRADE_REPORT => {
                 let member = d.u64()?;
                 let report_id = d.u64()?;
@@ -491,6 +502,10 @@ mod tests {
         });
         commands.push(Command::SetSchedule { schedule: None });
         commands.push(Command::ExpireGtd { at: 2_000_000 });
+        commands.push(Command::SetDmm {
+            symbol: sym("ACME"),
+            member: 3,
+        });
         commands.push(Command::TradeReport {
             member: 3,
             report_id: 4,

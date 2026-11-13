@@ -214,6 +214,21 @@ order routing (606):
 
 Under `--regime india` brokers start without venue links and refuse dark orders.
 
+### Market statistics and designated market makers
+
+The exchange publishes `MarketStats` for every symbol a member subscribes to, refreshed whenever it trades: open, high, low, last, VWAP, trade count, turnover and **volume by venue** (exchange, internal crosses, wholesaler, dark pool). Off-exchange prints count, so consolidated volume and VWAP describe the whole market. Brokers forward the stats to their clients. Stats reset with the trading day.
+
+```bash
+ome exchange stats ACME            # or: ome broker ... stats ACME
+# ACME open 25.00 high 25.00 low 24.98 last 25.00 vwap 24.99
+# volume 6350 in 70 trades, turnover 158746.36
+#   exchange          5600   88.2%
+#   internal            63    1.0%
+#   wholesaler         687   10.8%
+```
+
+Exchange ops can name a **designated market maker** per symbol (`ome exchange dmm ACME lp-co`, `none` to clear). The DMM earns a better maker rebate in that symbol (0.35 tick per share instead of 0.25). In return it carries a quoting obligation: once a second during continuous trading, the exchange checks that the member shows a bid and an ask, at least 100 shares each summed over its accounts, no more than 2% apart. `ome exchange obligations` shows each DMM's current state and compliance rate. The demo designates `lp-co` for every listing.
+
 ## Algorithmic Orders
 
 Quant and prop accounts at a prime broker can hand the broker a large **parent order** and let its algo engine work it through child orders. Children are ordinary orders with every broker check (funds, shares, band, risk controls) and only one is live at a time. The parent itself reserves nothing and is never visible to the exchange. Each child is journaled together with its link to the parent, so after a crash the parent resumes where it stopped.
@@ -339,7 +354,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 179 tests
+cargo test --workspace     # 180 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -347,7 +362,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 ## Roadmap
 
 - **1f** ~~broker-held orders, broker risk controls, algorithmic orders (TWAP, VWAP, POV, iceberg slicer)~~ done
-- **1g** off-exchange execution: ~~internalization, tape reporting, wholesaler with PFOF, dark pool~~ done; market stats, designated market makers
+- **1g** ~~off-exchange execution: internalization, tape reporting, wholesaler with PFOF, dark pool, market stats, designated market makers~~ done
 - **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane
 - **3** local-LLM newsroom: company reports, IPO prospectuses, news and macro events

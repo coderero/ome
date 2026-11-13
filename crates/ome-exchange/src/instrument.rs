@@ -5,7 +5,34 @@ use ome_core::risk::PriceBand;
 use ome_core::symbol::Symbol;
 use ome_core::tape::TradeTape;
 use ome_core::types::{Timestamp, Trade};
-use ome_protocol::{InstrumentInfo, InstrumentStatus};
+use ome_protocol::{InstrumentInfo, InstrumentStatus, MarketStats, Venue};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DayStats {
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub last: Price,
+    pub trades: u64,
+    pub turnover: u64,
+    pub volume: [u64; 4],
+}
+
+impl DayStats {
+    fn record(&mut self, price: Price, qty: u64, venue: u8) {
+        if self.trades == 0 {
+            self.open = price;
+            self.high = price;
+            self.low = price;
+        }
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.last = price;
+        self.trades += 1;
+        self.turnover += price * qty;
+        self.volume[(venue as usize).min(3)] += qty;
+    }
+}
 
 pub struct Halt {
     pub reason: String,
@@ -22,6 +49,7 @@ pub struct Instrument {
     pub last_price: Option<Price>,
     pub volume: u64,
     pub halt: Option<Halt>,
+    pub day: DayStats,
 }
 
 impl Instrument {
@@ -43,6 +71,7 @@ impl Instrument {
             last_price: None,
             volume: 0,
             halt: None,
+            day: DayStats::default(),
         }
     }
 
@@ -64,6 +93,26 @@ impl Instrument {
         self.volume += trade.qty;
         self.candles.record(trade.price, trade.qty, trade.timestamp);
         self.tape.push(trade.clone());
+        self.day.record(trade.price, trade.qty, trade.venue);
+    }
+
+    pub fn stats(&self) -> MarketStats {
+        let d = &self.day;
+        let volume: u64 = d.volume.iter().sum();
+        MarketStats {
+            symbol: self.symbol,
+            open: d.open,
+            high: d.high,
+            low: d.low,
+            last: d.last,
+            vwap: d.turnover.checked_div(volume).unwrap_or(0),
+            trades: d.trades,
+            turnover: d.turnover,
+            exchange_volume: d.volume[Venue::Exchange as usize],
+            internal_volume: d.volume[Venue::Internal as usize],
+            wholesaler_volume: d.volume[Venue::Wholesaler as usize],
+            ats_volume: d.volume[Venue::Ats as usize],
+        }
     }
 
     pub fn info(&self, band_bps: u64, circuit_bps: u64) -> InstrumentInfo {

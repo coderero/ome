@@ -378,6 +378,10 @@ impl Gateway {
                 self.broadcast(&message);
             }
             ServerMessage::AuctionInfo(info) => self.send_to_subscribers(info.symbol, &message),
+            ServerMessage::MarketStats(stats) => {
+                self.market.apply(&message);
+                self.send_to_subscribers(stats.symbol, &message);
+            }
             _ => {}
         }
         self.drop_slow_sessions();

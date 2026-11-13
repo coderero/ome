@@ -21,6 +21,9 @@ const USAGE: &str = "usage:
       cod <member> on|off                                 cancel-on-disconnect for a member
       session <preopen|open|auction|close>                change the market phase now
       schedule <preopen> <open> <closing> <closed>        repeating trading day in seconds; `schedule off`
+      dmm <SYMBOL> <member|none>                          designate a market maker (better maker rebate, quoting obligation)
+      obligations                                         designated market makers: quoting now and compliance
+      stats <SYMBOL>                                      open, high, low, VWAP and volume by venue
       instruments  |  watch <SYMBOL>
 
   ome broker [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
@@ -56,6 +59,7 @@ const USAGE: &str = "usage:
                                                           algorithmic parent orders (quant and prop accounts)
       algos  |  cancel-algo <id>                          working algos with progress
       dark <SYMBOL> <side> <qty> [limit] [min:<qty>]      midpoint order in the dark pool (quant and prop)
+      stats <SYMBOL>                                      market statistics with volume by venue
       instruments  |  watch <SYMBOL>
 
   ome venue [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>   (wholesaler 7301, dark pool 7302)
@@ -194,6 +198,53 @@ fn usage() -> Result<()> {
 
 fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
     match args {
+        ["dmm", sym, member] => {
+            let member = if *member == "none" {
+                0
+            } else {
+                member_id(client, member)?
+            };
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::SetDmm {
+                    symbol: symbol(sym)?,
+                    member
+                })?
+            );
+        }
+        ["obligations"] => {
+            client.send_member(&MemberMessage::QueryObligations)?;
+            let ServerMessage::Obligations(list) = client
+                .wait_for(Duration::from_secs(5), |m| {
+                    matches!(m, ServerMessage::Obligations(_))
+                })?
+            else {
+                unreachable!()
+            };
+            if list.is_empty() {
+                println!("no designated market makers");
+            }
+            for o in list {
+                let pct = if o.samples == 0 {
+                    0.0
+                } else {
+                    o.compliant as f64 * 100.0 / o.samples as f64
+                };
+                println!(
+                    "{:<8} {:<16} quoting now {:<3}  compliant {:>5.1}% of {} samples",
+                    o.symbol,
+                    o.name,
+                    if o.quoting { "yes" } else { "no" },
+                    pct,
+                    o.samples
+                );
+            }
+        }
+        ["stats", sym] => {
+            let symbol = symbol(sym)?;
+            client.send_member(&MemberMessage::Subscribe { symbol })?;
+            print_stats(client, symbol)?;
+        }
         ["members"] => {
             for m in members(client)? {
                 println!(
@@ -815,6 +866,11 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 _ => unreachable!(),
             }
         }
+        ["stats", sym] => {
+            let symbol = symbol(sym)?;
+            client.send(&ClientMessage::Subscribe { symbol })?;
+            print_stats(client, symbol)?;
+        }
         ["dark", sym, side, qty, rest @ ..] if rest.len() <= 2 => {
             let mut limit = None;
             let mut min_qty = 0;
@@ -983,6 +1039,44 @@ fn print_conditional_replies(client: &mut Client, client_order_id: u64, legs: us
             ServerMessage::ConditionalUpdate(c) => print_conditional(&c),
             _ => unreachable!(),
         }
+    }
+    Ok(())
+}
+
+fn print_stats(client: &mut Client, symbol: Symbol) -> Result<()> {
+    let ServerMessage::MarketStats(s) = client.wait_for(
+        Duration::from_secs(5),
+        |m| matches!(m, ServerMessage::MarketStats(s) if s.symbol == symbol),
+    )?
+    else {
+        unreachable!()
+    };
+    println!(
+        "{} open {} high {} low {} last {} vwap {}",
+        s.symbol,
+        format_price(s.open),
+        format_price(s.high),
+        format_price(s.low),
+        format_price(s.last),
+        format_price(s.vwap)
+    );
+    let total = s.volume().max(1);
+    println!(
+        "volume {} in {} trades, turnover {}",
+        s.volume(),
+        s.trades,
+        format_price(s.turnover)
+    );
+    for (venue, qty) in [
+        ("exchange", s.exchange_volume),
+        ("internal", s.internal_volume),
+        ("wholesaler", s.wholesaler_volume),
+        ("dark pool", s.ats_volume),
+    ] {
+        println!(
+            "  {venue:<11} {qty:>10}  {:>5.1}%",
+            qty as f64 * 100.0 / total as f64
+        );
     }
     Ok(())
 }
