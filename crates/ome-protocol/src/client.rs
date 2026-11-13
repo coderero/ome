@@ -1,6 +1,7 @@
 use crate::codec::{DecodeError, Decoder, Encoder};
 use crate::template::*;
 use crate::types::*;
+use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, OrderId, OrderKind, OrderOptions, Qty, Side};
 
@@ -33,6 +34,36 @@ pub enum ClientMessage {
     SetMmp {
         window_ms: u64,
         max_qty: Qty,
+    },
+    Conditional {
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        trigger: Trigger,
+        kind: OrderKind,
+        options: OrderOptions,
+    },
+    Oco {
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        take_profit: Price,
+        stop: Price,
+        stop_limit: Option<Price>,
+    },
+    Bracket {
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        entry: OrderKind,
+        take_profit: Price,
+        stop_loss: Price,
+    },
+    CancelConditional {
+        cond_id: u64,
     },
     Subscribe {
         symbol: Symbol,
@@ -67,6 +98,10 @@ impl ClientMessage {
             ClientMessage::CancelAll { .. } => CANCEL_ALL,
             ClientMessage::Quote { .. } => QUOTE,
             ClientMessage::SetMmp { .. } => SET_MMP,
+            ClientMessage::Conditional { .. } => CONDITIONAL,
+            ClientMessage::Oco { .. } => OCO,
+            ClientMessage::Bracket { .. } => BRACKET,
+            ClientMessage::CancelConditional { .. } => CANCEL_CONDITIONAL,
             ClientMessage::Subscribe { .. } => SUBSCRIBE,
             ClientMessage::Unsubscribe { .. } => UNSUBSCRIBE,
             ClientMessage::QueryAccount => QUERY_ACCOUNT,
@@ -118,6 +153,61 @@ impl ClientMessage {
                 put_quote_side(&mut e, bid);
                 put_quote_side(&mut e, ask);
                 e.end_block();
+            }
+            ClientMessage::Conditional {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                trigger,
+                kind,
+                options,
+            } => {
+                e.u64(*client_order_id)
+                    .symbol(Some(*symbol))
+                    .u8(side_to_u8(*side))
+                    .u64(*qty);
+                put_trigger(&mut e, trigger);
+                put_order_kind(&mut e, *kind);
+                put_order_options(&mut e, options);
+                e.end_block();
+            }
+            ClientMessage::Oco {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                take_profit,
+                stop,
+                stop_limit,
+            } => {
+                e.u64(*client_order_id)
+                    .symbol(Some(*symbol))
+                    .u8(side_to_u8(*side))
+                    .u64(*qty)
+                    .u64(*take_profit)
+                    .u64(*stop)
+                    .u64(stop_limit.unwrap_or(0))
+                    .end_block();
+            }
+            ClientMessage::Bracket {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                entry,
+                take_profit,
+                stop_loss,
+            } => {
+                e.u64(*client_order_id)
+                    .symbol(Some(*symbol))
+                    .u8(side_to_u8(*side))
+                    .u64(*qty);
+                put_order_kind(&mut e, *entry);
+                e.u64(*take_profit).u64(*stop_loss).end_block();
+            }
+            ClientMessage::CancelConditional { cond_id } => {
+                e.u64(*cond_id).end_block();
             }
             ClientMessage::SetMmp { window_ms, max_qty } => {
                 e.u64(*window_ms).u64(*max_qty).end_block();
@@ -216,6 +306,68 @@ impl ClientMessage {
                 d.end_block()?;
                 ClientMessage::SetMmp { window_ms, max_qty }
             }
+            CONDITIONAL => {
+                let client_order_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let trigger = get_trigger(&mut d)?;
+                let kind = get_order_kind(&mut d)?;
+                let options = get_order_options(&mut d)?;
+                d.end_block()?;
+                ClientMessage::Conditional {
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    trigger,
+                    kind,
+                    options,
+                }
+            }
+            OCO => {
+                let client_order_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let take_profit = d.u64()?;
+                let stop = d.u64()?;
+                let stop_limit = Some(d.u64()?).filter(|&p| p > 0);
+                d.end_block()?;
+                ClientMessage::Oco {
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    take_profit,
+                    stop,
+                    stop_limit,
+                }
+            }
+            BRACKET => {
+                let client_order_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let entry = get_order_kind(&mut d)?;
+                let take_profit = d.u64()?;
+                let stop_loss = d.u64()?;
+                d.end_block()?;
+                ClientMessage::Bracket {
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    entry,
+                    take_profit,
+                    stop_loss,
+                }
+            }
+            CANCEL_CONDITIONAL => {
+                let cond_id = d.u64()?;
+                d.end_block()?;
+                ClientMessage::CancelConditional { cond_id }
+            }
             CANCEL_ALL => {
                 let symbol = d.optional_symbol()?;
                 d.end_block()?;
@@ -310,6 +462,34 @@ pub mod tests {
                 window_ms: 1_000,
                 max_qty: 500,
             },
+            ClientMessage::Conditional {
+                client_order_id: 21,
+                symbol: sym("ACME"),
+                side: Side::Sell,
+                qty: 10,
+                trigger: Trigger::TrailingBelow(50),
+                kind: OrderKind::Market,
+                options: OrderOptions::tif(TimeInForce::Ioc),
+            },
+            ClientMessage::Oco {
+                client_order_id: 22,
+                symbol: sym("ACME"),
+                side: Side::Sell,
+                qty: 10,
+                take_profit: 2_700,
+                stop: 2_300,
+                stop_limit: Some(2_290),
+            },
+            ClientMessage::Bracket {
+                client_order_id: 23,
+                symbol: sym("ACME"),
+                side: Side::Buy,
+                qty: 10,
+                entry: OrderKind::Limit(2_500),
+                take_profit: 2_700,
+                stop_loss: 2_400,
+            },
+            ClientMessage::CancelConditional { cond_id: 5 },
             ClientMessage::CancelAll {
                 symbol: Some(sym("NOVA")),
             },

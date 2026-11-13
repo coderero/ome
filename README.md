@@ -104,9 +104,9 @@ SBE (schema 7, version 2) with SOFH framing on every connection. All integers ar
 
 | Family | Direction | Messages |
 |---|---|---|
-| client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, QueryAccounts |
+| client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Quote, SetMmp, Conditional, Oco, Bracket, CancelConditional, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, QueryAccounts |
 | member | provider → exchange | Logon (with `last_seq`), NewOrder (account ref + time in force), Cancel, CancelAll, Subscribe; ops: CreateMember, ListInstrument, Halt, Resume, QueryMembers |
-| server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, Ack, Reject, Heartbeat |
+| server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, ConditionalUpdate, ContractNote, Ack, Reject, Heartbeat |
 
 Client and member templates never overlap; sending one family's message to the other service fails to decode (tested).
 
@@ -164,6 +164,27 @@ All order types below are matched natively by the exchange; brokers decide which
 ome broker --addr 127.0.0.1:7102 --user fund --secret fund-pw buy ACME 24.00 2000 show:50
 ome broker --addr 127.0.0.1:7102 --user fund --secret fund-pw buy ACME 26.50 5 post
 # rejected: post-only order would take liquidity
+```
+
+## Broker-Held Orders
+
+Stops, trailing stops, GTT, after-market, OCO and bracket orders live at the broker and are never visible to the exchange until they fire. They trigger on the exchange's last trade price, only during continuous trading and never while a symbol is halted. When one fires, the broker runs its usual checks (funds, shares, band, session) and sends a normal order; the trigger and the released order are journaled as one fact, so a crash cannot lose one without the other. Armed orders lock no funds or shares, so a stop and a target can cover the same shares; a released order that no longer has the shares is rejected and reported.
+
+| Command | What it is | Who |
+|---|---|---|
+| `stop <SYM> <side> <qty> <trigger> [limit]` | stop-loss (market) or stop-limit; sells fire at or below the trigger, buys at or above | everyone except issuers |
+| `trail <SYM> <side> <qty> <distance>` | trailing stop that follows the best price seen since arming | retail, prop |
+| `gtt <SYM> <side> <qty> <above\|below> <trigger> <limit>` | good-till-triggered limit order; survives across trading days | retail, prop |
+| `amo <SYM> <side> <qty> <price\|mkt>` | after-market order, accepted while the market is closed and released when it opens | retail, prop |
+| `oco <SYM> <side> <qty> <target> <stop> [stop-limit]` | one-cancels-other exit: whichever leg fires cancels the other | retail, prop |
+| `bracket <SYM> <side> <qty> <price\|mkt> <target> <stop>` | entry order whose fills arm an OCO exit for the filled quantity; later fills grow the exit | retail, prop |
+| `conditionals` / `cancel-cond <id>` | list armed orders; cancelling one leg of an OCO cancels both | |
+
+```bash
+ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw bracket ACME buy 5 mkt 27.00 23.50
+# entry #695 filled buy filled 5/5
+# cond #5 armed sell 5 ACME when last >= 27.00 (bracket exit armed)
+# cond #6 armed sell 5 ACME when last <= 23.50 (bracket exit armed)
 ```
 
 ## Member Controls and Market Making
@@ -256,14 +277,14 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 146 tests
+cargo test --workspace     # 156 tests
 ```
 
-Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
+Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, and a retail stop-loss fires on a real exchange trade and sells into the bid. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1f** broker-held orders (stop, trailing stop, OCO, bracket, GTT) and institutional algorithms (TWAP, VWAP, POV)
+- **1f** ~~broker-held orders (stop, trailing stop, GTT, AMO, OCO, bracket)~~ done; broker risk controls (account kill switch, rate limits, daily loss limit) and institutional algorithms (TWAP, VWAP, POV)
 - **1g** off-exchange execution: broker internalization, wholesaler with payment for order flow, dark pool
 - **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane

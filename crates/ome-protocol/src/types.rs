@@ -207,6 +207,95 @@ pub fn phase_from(v: u8) -> Result<MarketPhase, DecodeError> {
     MarketPhase::from_u8(v).ok_or(DecodeError::Invalid("market phase"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    Above(Price),
+    Below(Price),
+    TrailingAbove(Price),
+    TrailingBelow(Price),
+    MarketOpens,
+}
+
+impl Trigger {
+    pub fn describe(&self) -> String {
+        use ome_core::price::format_price;
+        match self {
+            Trigger::Above(p) => format!("last >= {}", format_price(*p)),
+            Trigger::Below(p) => format!("last <= {}", format_price(*p)),
+            Trigger::TrailingAbove(d) => format!("trailing {} above the low", format_price(*d)),
+            Trigger::TrailingBelow(d) => format!("trailing {} below the high", format_price(*d)),
+            Trigger::MarketOpens => "market opens".to_string(),
+        }
+    }
+}
+
+pub fn put_trigger(e: &mut Encoder, trigger: &Trigger) {
+    let (code, value) = match trigger {
+        Trigger::Above(p) => (1, *p),
+        Trigger::Below(p) => (2, *p),
+        Trigger::TrailingAbove(d) => (3, *d),
+        Trigger::TrailingBelow(d) => (4, *d),
+        Trigger::MarketOpens => (5, 0),
+    };
+    e.u8(code).u64(value);
+}
+
+pub fn get_trigger(d: &mut Decoder) -> Result<Trigger, DecodeError> {
+    let code = d.u8()?;
+    let value = d.u64()?;
+    Ok(match code {
+        1 => Trigger::Above(value),
+        2 => Trigger::Below(value),
+        3 => Trigger::TrailingAbove(value),
+        4 => Trigger::TrailingBelow(value),
+        5 => Trigger::MarketOpens,
+        _ => return Err(DecodeError::Invalid("trigger")),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalStatus {
+    Armed = 1,
+    Triggered = 2,
+    Cancelled = 3,
+    Rejected = 4,
+}
+
+impl ConditionalStatus {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => ConditionalStatus::Armed,
+            2 => ConditionalStatus::Triggered,
+            3 => ConditionalStatus::Cancelled,
+            4 => ConditionalStatus::Rejected,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ConditionalStatus::Armed => "armed",
+            ConditionalStatus::Triggered => "triggered",
+            ConditionalStatus::Cancelled => "cancelled",
+            ConditionalStatus::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalReport {
+    pub cond_id: u64,
+    pub client_order_id: u64,
+    pub account: AccountId,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: Qty,
+    pub status: ConditionalStatus,
+    pub trigger: Trigger,
+    pub level: Price,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuoteSide {
     pub price: Price,

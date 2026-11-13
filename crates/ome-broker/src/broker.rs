@@ -1,7 +1,8 @@
 use crate::fees::FeeEngine;
 use crate::ledger::Ledger;
 use crate::market::MarketCache;
-use crate::profile::Profile;
+use crate::oms::{BracketPlan, Conditional, Conditionals, exit_legs};
+use crate::profile::{Profile, Shape};
 use ome_core::price::Price;
 use ome_core::risk::RiskContext;
 use ome_core::symbol::Symbol;
@@ -10,9 +11,9 @@ use ome_core::types::{
 };
 use ome_net::auth::SecretHash;
 use ome_protocol::{
-    AccountInfo, AccountSnapshot, Allocation, Asset, Charges, ContractNote, ExecutionReport,
-    FeeSummary, MarketPhase, MemberMessage, OrderStatus, Position, QuoteSide, Role, ServerMessage,
-    SettlementReport,
+    AccountInfo, AccountSnapshot, Allocation, Asset, Charges, ConditionalReport, ConditionalStatus,
+    ContractNote, ExecutionReport, FeeSummary, MarketPhase, MemberMessage, OrderStatus, Position,
+    QuoteSide, Role, ServerMessage, SettlementReport, Trigger,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -57,6 +58,26 @@ pub enum Fact {
         symbol: Symbol,
         bid: Option<QuoteLeg>,
         ask: Option<QuoteLeg>,
+    },
+    ConditionalArmed(Vec<Conditional>),
+    TrailMoved {
+        cond_id: u64,
+        extreme: Price,
+    },
+    ConditionalTriggered {
+        cond_id: u64,
+        price: Price,
+        order: Option<Box<Fact>>,
+        reason: String,
+    },
+    ConditionalCancelled {
+        cond_id: u64,
+        reason: String,
+    },
+    BracketAccepted {
+        order: Box<Fact>,
+        take_profit: Price,
+        stop_loss: Price,
     },
 }
 
@@ -112,6 +133,8 @@ pub struct Broker {
     last_seq: u64,
     pending: BTreeMap<(u64, AccountId), Pending>,
     last_settlement_seq: u64,
+    conditionals: Conditionals,
+    brackets: BTreeMap<u64, BracketPlan>,
 }
 
 impl Broker {
@@ -128,6 +151,8 @@ impl Broker {
             last_seq: 0,
             pending: BTreeMap::new(),
             last_settlement_seq: 0,
+            conditionals: Conditionals::default(),
+            brackets: BTreeMap::new(),
         }
     }
 
@@ -231,28 +256,16 @@ impl Broker {
         now: Timestamp,
     ) -> Result<Fact, Box<ExecutionReport>> {
         let reject = |reason: String| {
-            Box::new(ExecutionReport {
-                seq: 0,
-                order_id: 0,
-                client_order_id,
+            rejection(
                 account,
+                client_order_id,
                 symbol,
                 side,
-                status: OrderStatus::Rejected,
-                price: match kind {
-                    OrderKind::Limit(p) => p,
-                    OrderKind::Market => 0,
-                },
+                kind,
                 qty,
-                filled: 0,
-                leaves: 0,
-                last_price: 0,
-                last_qty: 0,
-                fees: 0,
-                cycle: 0,
-                timestamp: now,
+                now,
                 reason,
-            })
+            )
         };
         let Some(holder) = self.ledger.get(account) else {
             return Err(reject(format!("unknown account {account}")));
@@ -343,6 +356,338 @@ impl Broker {
             reserved,
             fee_reserve,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arm_checks(
+        &self,
+        account: AccountId,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        trigger: &Trigger,
+        shape: Shape,
+        market: &MarketCache,
+    ) -> Result<(Role, Price), String> {
+        let holder = self
+            .ledger
+            .get(account)
+            .ok_or_else(|| format!("unknown account {account}"))?;
+        Profile::permits_conditional(holder.role, trigger, shape)?;
+        let quote = market
+            .get(symbol)
+            .ok_or_else(|| format!("unknown symbol {symbol}"))?;
+        let limits = Profile::limits(holder.role);
+        if qty == 0 || qty > limits.max_qty {
+            return Err(format!("quantity must be 1 - {}", limits.max_qty));
+        }
+        let level = match trigger {
+            Trigger::Above(p)
+            | Trigger::Below(p)
+            | Trigger::TrailingAbove(p)
+            | Trigger::TrailingBelow(p) => *p,
+            Trigger::MarketOpens => 1,
+        };
+        if level == 0 {
+            return Err("trigger price must be positive".into());
+        }
+        if *trigger == Trigger::MarketOpens && market.phase() != MarketPhase::Closed {
+            return Err("the market is open; send a regular order".into());
+        }
+        let held = holder.position(symbol).total();
+        if side == Side::Sell && held < qty {
+            return Err(format!(
+                "insufficient {symbol} shares: need {qty}, holding {held}"
+            ));
+        }
+        Ok((
+            holder.role,
+            quote.info.last_price.unwrap_or(quote.info.reference_price),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_conditional(
+        &self,
+        account: AccountId,
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        trigger: Trigger,
+        kind: OrderKind,
+        options: OrderOptions,
+        market: &MarketCache,
+    ) -> Result<Fact, String> {
+        let (role, last) =
+            self.arm_checks(account, symbol, side, qty, &trigger, Shape::Single, market)?;
+        Profile::permits(role, kind, &options)?;
+        Ok(Fact::ConditionalArmed(vec![Conditional {
+            cond_id: self.conditionals.next_id(),
+            account,
+            client_order_id,
+            symbol,
+            side,
+            qty,
+            trigger,
+            kind,
+            options,
+            group: 0,
+            extreme: last,
+        }]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_oco(
+        &self,
+        account: AccountId,
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        take_profit: Price,
+        stop: Price,
+        stop_limit: Option<Price>,
+        market: &MarketCache,
+    ) -> Result<Fact, String> {
+        let ordered = match side {
+            Side::Sell => take_profit > stop,
+            Side::Buy => take_profit < stop,
+        };
+        if !ordered {
+            return Err(format!(
+                "a {} OCO needs its take-profit {} the stop",
+                side_label(side),
+                if side == Side::Sell { "above" } else { "below" }
+            ));
+        }
+        let legs = exit_legs(side, take_profit, stop, stop_limit);
+        let (_, last) =
+            self.arm_checks(account, symbol, side, qty, &legs[1].0, Shape::Oco, market)?;
+        let group = self.conditionals.next_id();
+        Ok(Fact::ConditionalArmed(
+            legs.into_iter()
+                .enumerate()
+                .map(|(i, (trigger, kind))| Conditional {
+                    cond_id: group + i as u64,
+                    account,
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    trigger,
+                    kind,
+                    options: OrderOptions::default(),
+                    group,
+                    extreme: last,
+                })
+                .collect(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_bracket(
+        &self,
+        account: AccountId,
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        entry: OrderKind,
+        take_profit: Price,
+        stop_loss: Price,
+        market: &MarketCache,
+        now: Timestamp,
+    ) -> Result<Fact, Box<ExecutionReport>> {
+        let order = self.decide_order(
+            account,
+            client_order_id,
+            symbol,
+            side,
+            entry,
+            OrderOptions::default(),
+            qty,
+            market,
+            now,
+        )?;
+        let reject = |reason: String| {
+            rejection(
+                account,
+                client_order_id,
+                symbol,
+                side,
+                entry,
+                qty,
+                now,
+                reason,
+            )
+        };
+        let role = self.ledger.get(account).map(|a| a.role);
+        if let Some(role) = role
+            && let Err(reason) =
+                Profile::permits_conditional(role, &Trigger::Below(stop_loss), Shape::Bracket)
+        {
+            return Err(reject(reason));
+        }
+        let (low, high) = match side {
+            Side::Buy => (stop_loss, take_profit),
+            Side::Sell => (take_profit, stop_loss),
+        };
+        let inside = match entry {
+            OrderKind::Limit(p) => low < p && p < high,
+            OrderKind::Market => low < high,
+        };
+        if stop_loss == 0 || take_profit == 0 || !inside {
+            return Err(reject(format!(
+                "a {} bracket needs stop-loss {} entry {} take-profit",
+                side_label(side),
+                if side == Side::Buy { "<" } else { ">" },
+                if side == Side::Buy { "<" } else { ">" }
+            )));
+        }
+        Ok(Fact::BracketAccepted {
+            order: Box::new(order),
+            take_profit,
+            stop_loss,
+        })
+    }
+
+    pub fn decide_cancel_conditional(
+        &self,
+        account: AccountId,
+        cond_id: u64,
+    ) -> Result<Fact, String> {
+        let conditional = self
+            .conditionals
+            .get(cond_id)
+            .ok_or_else(|| format!("conditional #{cond_id} is not armed"))?;
+        if conditional.account != account {
+            return Err(format!("conditional #{cond_id} is not yours"));
+        }
+        Ok(Fact::ConditionalCancelled {
+            cond_id,
+            reason: "cancelled by the client".into(),
+        })
+    }
+
+    pub fn scan_conditionals(&self, symbol: Symbol, last: Price) -> (Vec<Fact>, Vec<u64>) {
+        let (trails, due) = self.conditionals.scan(symbol, last);
+        (
+            trails
+                .into_iter()
+                .map(|(cond_id, extreme)| Fact::TrailMoved { cond_id, extreme })
+                .collect(),
+            due,
+        )
+    }
+
+    pub fn waiting_for_open(&self) -> Vec<u64> {
+        self.conditionals.waiting_for_open()
+    }
+
+    pub fn decide_trigger(
+        &self,
+        cond_id: u64,
+        price: Price,
+        market: &MarketCache,
+        now: Timestamp,
+    ) -> Option<Fact> {
+        let c = self.conditionals.get(cond_id)?;
+        let (order, reason) = match self.decide_order(
+            c.account,
+            c.client_order_id,
+            c.symbol,
+            c.side,
+            c.kind,
+            c.options,
+            c.qty,
+            market,
+            now,
+        ) {
+            Ok(fact) => (Some(Box::new(fact)), String::new()),
+            Err(report) => (None, report.reason),
+        };
+        Some(Fact::ConditionalTriggered {
+            cond_id,
+            price,
+            order,
+            reason,
+        })
+    }
+
+    pub fn conditional_reports(&self, account: AccountId) -> Vec<ConditionalReport> {
+        self.conditionals
+            .for_account(account)
+            .map(|c| c.report(ConditionalStatus::Armed, ""))
+            .collect()
+    }
+
+    pub fn armed_conditionals(&self) -> usize {
+        self.conditionals.len()
+    }
+
+    fn cancel_group(&mut self, group: u64, reason: &str) -> Vec<Effect> {
+        self.conditionals
+            .group(group)
+            .into_iter()
+            .filter_map(|id| self.conditionals.remove(id))
+            .map(|c| conditional_update(&c, ConditionalStatus::Cancelled, reason))
+            .collect()
+    }
+
+    fn bracket_fill(
+        &mut self,
+        order_ref: u64,
+        (account, client_order_id, symbol, side, qty): (AccountId, u64, Symbol, Side, Qty),
+    ) -> Vec<Effect> {
+        let Some(plan) = self.brackets.get(&order_ref).copied() else {
+            return vec![];
+        };
+        if let Some(group) = plan.group {
+            let grown: Vec<Effect> = self
+                .conditionals
+                .grow(group, qty)
+                .into_iter()
+                .map(|c| conditional_update(c, ConditionalStatus::Armed, "bracket exit grew"))
+                .collect();
+            if !grown.is_empty() {
+                return grown;
+            }
+        }
+        let exit = match side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        let group = self.conditionals.next_id();
+        let mut effects = Vec::new();
+        for (i, (trigger, kind)) in exit_legs(exit, plan.take_profit, plan.stop_loss, None)
+            .into_iter()
+            .enumerate()
+        {
+            let c = Conditional {
+                cond_id: group + i as u64,
+                account,
+                client_order_id,
+                symbol,
+                side: exit,
+                qty,
+                trigger,
+                kind,
+                options: OrderOptions::default(),
+                group,
+                extreme: 0,
+            };
+            effects.push(conditional_update(
+                &c,
+                ConditionalStatus::Armed,
+                "bracket exit armed",
+            ));
+            self.conditionals.insert(c);
+        }
+        if let Some(plan) = self.brackets.get_mut(&order_ref) {
+            plan.group = Some(group);
+        }
+        effects
     }
 
     pub fn decide_quote(
@@ -647,7 +992,78 @@ impl Broker {
                 }
                 accounts.into_iter().map(Effect::AccountChanged).collect()
             }
+            Fact::ConditionalArmed(legs) => legs
+                .iter()
+                .map(|c| {
+                    self.conditionals.insert(c.clone());
+                    conditional_update(c, ConditionalStatus::Armed, "")
+                })
+                .collect(),
+            Fact::TrailMoved { cond_id, extreme } => self
+                .conditionals
+                .set_extreme(*cond_id, *extreme)
+                .map(|c| {
+                    vec![conditional_update(
+                        c,
+                        ConditionalStatus::Armed,
+                        "trail moved",
+                    )]
+                })
+                .unwrap_or_default(),
+            Fact::ConditionalTriggered {
+                cond_id,
+                price,
+                order,
+                reason,
+            } => {
+                let Some(c) = self.conditionals.remove(*cond_id) else {
+                    return vec![];
+                };
+                let mut effects = self.cancel_group(c.group, "the other leg triggered");
+                let note = format!("triggered at {}", ome_core::price::format_price(*price));
+                match order {
+                    Some(order) => {
+                        effects.push(conditional_update(&c, ConditionalStatus::Triggered, &note));
+                        effects.extend(self.apply(order));
+                    }
+                    None => effects.push(conditional_update(
+                        &c,
+                        ConditionalStatus::Rejected,
+                        &format!("{note}, order rejected: {reason}"),
+                    )),
+                }
+                effects
+            }
+            Fact::ConditionalCancelled { cond_id, reason } => {
+                let Some(c) = self.conditionals.remove(*cond_id) else {
+                    return vec![];
+                };
+                let mut effects = self.cancel_group(c.group, reason);
+                effects.push(conditional_update(&c, ConditionalStatus::Cancelled, reason));
+                effects
+            }
+            Fact::BracketAccepted {
+                order,
+                take_profit,
+                stop_loss,
+            } => {
+                let effects = self.apply(order);
+                if let Fact::OrderAccepted { order_ref, .. } = order.as_ref()
+                    && self.orders.contains_key(order_ref)
+                {
+                    self.brackets.insert(
+                        *order_ref,
+                        BracketPlan {
+                            take_profit: *take_profit,
+                            stop_loss: *stop_loss,
+                            group: None,
+                        },
+                    );
+                }
+                effects
+            }
             Fact::OrderAbandoned { order_ref } => {
+                self.brackets.remove(order_ref);
                 let Some(meta) = self.orders.remove(order_ref) else {
                     return vec![];
                 };
@@ -743,6 +1159,13 @@ impl Broker {
         }
 
         let mut effects = Vec::new();
+        let fill = (report.last_qty > 0).then_some((
+            meta.account,
+            meta.client_order_id,
+            meta.symbol,
+            meta.side,
+            report.last_qty,
+        ));
         if report.last_qty > 0 {
             let qty = report.last_qty;
             let cost = (report.last_price * qty) as i64;
@@ -817,6 +1240,12 @@ impl Broker {
             &report.reason,
         );
         client.cycle = report.cycle;
+        let bracket = fill
+            .map(|f| self.bracket_fill(order_ref, f))
+            .unwrap_or_default();
+        if !report.status.is_open() {
+            self.brackets.remove(&order_ref);
+        }
         if !report.status.is_open()
             && let Some(meta) = self.orders.remove(&order_ref)
         {
@@ -830,6 +1259,7 @@ impl Broker {
             account,
             message: ServerMessage::Execution(client),
         });
+        effects.extend(bracket);
         effects
     }
 
@@ -897,6 +1327,55 @@ impl Broker {
             })
             .collect()
     }
+}
+
+fn side_label(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    }
+}
+
+fn conditional_update(c: &Conditional, status: ConditionalStatus, reason: &str) -> Effect {
+    Effect::ToAccount {
+        account: c.account,
+        message: ServerMessage::ConditionalUpdate(c.report(status, reason)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rejection(
+    account: AccountId,
+    client_order_id: u64,
+    symbol: Symbol,
+    side: Side,
+    kind: OrderKind,
+    qty: Qty,
+    now: Timestamp,
+    reason: String,
+) -> Box<ExecutionReport> {
+    Box::new(ExecutionReport {
+        seq: 0,
+        order_id: 0,
+        client_order_id,
+        account,
+        symbol,
+        side,
+        status: OrderStatus::Rejected,
+        price: match kind {
+            OrderKind::Limit(p) => p,
+            OrderKind::Market => 0,
+        },
+        qty,
+        filled: 0,
+        leaves: 0,
+        last_price: 0,
+        last_qty: 0,
+        fees: 0,
+        cycle: 0,
+        timestamp: now,
+        reason,
+    })
 }
 
 fn client_report(
@@ -1683,5 +2162,300 @@ pub mod tests {
         );
         assert!(retail.decide_mmp(alice, 1_000, 10).is_err());
         assert!(broker.decide_mmp(desk, 1_000, 10).is_ok());
+    }
+
+    fn holding(broker: &mut Broker, name: &str, role: Role, shares: u64) -> AccountId {
+        let id = open(broker, name, role, 10_000_00);
+        let fact = broker
+            .decide_set_balance(id, Asset::Shares(sym()), shares)
+            .unwrap();
+        broker.apply(&fact);
+        id
+    }
+
+    fn statuses(effects: &[Effect]) -> Vec<(u64, ConditionalStatus)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::ToAccount {
+                    message: ServerMessage::ConditionalUpdate(c),
+                    ..
+                } => Some((c.cond_id, c.status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn routed(effects: &[Effect]) -> Vec<(Side, OrderKind, Qty)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::ToExchange(MemberMessage::NewOrder {
+                    side, kind, qty, ..
+                }) => Some((*side, *kind, *qty)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stop_loss_waits_for_the_trigger_then_releases_a_protected_market_sell() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = holding(&mut broker, "alice", Role::Retail, 100);
+        let fact = broker
+            .decide_conditional(
+                alice,
+                7,
+                sym(),
+                Side::Sell,
+                40,
+                Trigger::Below(24_00),
+                OrderKind::Market,
+                OrderOptions::default(),
+                &market(),
+            )
+            .unwrap();
+        assert_eq!(
+            statuses(&broker.apply(&fact)),
+            vec![(1, ConditionalStatus::Armed)]
+        );
+        assert_eq!(
+            broker
+                .ledger()
+                .get(alice)
+                .unwrap()
+                .position(sym())
+                .available,
+            100,
+            "an armed stop does not lock shares"
+        );
+
+        assert_eq!(broker.scan_conditionals(sym(), 24_50), (vec![], vec![]));
+        let (_, due) = broker.scan_conditionals(sym(), 23_90);
+        assert_eq!(due, vec![1]);
+        let fact = broker.decide_trigger(1, 23_90, &market(), 5).unwrap();
+        let effects = broker.apply(&fact);
+        assert_eq!(statuses(&effects), vec![(1, ConditionalStatus::Triggered)]);
+        assert_eq!(
+            routed(&effects),
+            vec![(Side::Sell, OrderKind::Limit(22_50), 40)]
+        );
+        assert_eq!(broker.armed_conditionals(), 0);
+        assert_eq!(
+            broker.ledger().get(alice).unwrap().position(sym()).reserved,
+            40
+        );
+    }
+
+    #[test]
+    fn oco_cancels_the_other_leg_when_one_triggers() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = holding(&mut broker, "alice", Role::Retail, 50);
+        assert!(
+            broker
+                .decide_oco(
+                    alice,
+                    3,
+                    sym(),
+                    Side::Sell,
+                    50,
+                    24_00,
+                    26_00,
+                    None,
+                    &market()
+                )
+                .is_err(),
+            "take-profit below the stop is nonsense for a sell OCO"
+        );
+        let fact = broker
+            .decide_oco(
+                alice,
+                3,
+                sym(),
+                Side::Sell,
+                50,
+                27_00,
+                24_00,
+                Some(23_90),
+                &market(),
+            )
+            .unwrap();
+        broker.apply(&fact);
+        assert_eq!(broker.armed_conditionals(), 2);
+
+        let (_, due) = broker.scan_conditionals(sym(), 27_10);
+        assert_eq!(due, vec![1]);
+        let effects = broker.apply(&broker.decide_trigger(1, 27_10, &market(), 1).unwrap());
+        assert_eq!(
+            statuses(&effects),
+            vec![
+                (2, ConditionalStatus::Cancelled),
+                (1, ConditionalStatus::Triggered)
+            ]
+        );
+        assert_eq!(
+            routed(&effects),
+            vec![(Side::Sell, OrderKind::Limit(27_00), 50)]
+        );
+        assert_eq!(broker.armed_conditionals(), 0);
+    }
+
+    #[test]
+    fn released_order_is_rejected_when_the_shares_are_gone() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = holding(&mut broker, "alice", Role::Retail, 10);
+        let fact = broker
+            .decide_conditional(
+                alice,
+                1,
+                sym(),
+                Side::Sell,
+                10,
+                Trigger::Below(24_00),
+                OrderKind::Market,
+                OrderOptions::default(),
+                &market(),
+            )
+            .unwrap();
+        broker.apply(&fact);
+        broker.apply(
+            &broker
+                .decide_set_balance(alice, Asset::Shares(sym()), 0)
+                .unwrap(),
+        );
+        let effects = broker.apply(&broker.decide_trigger(1, 23_00, &market(), 1).unwrap());
+        assert_eq!(statuses(&effects), vec![(1, ConditionalStatus::Rejected)]);
+        assert!(routed(&effects).is_empty());
+        assert_eq!(broker.armed_conditionals(), 0);
+    }
+
+    #[test]
+    fn bracket_arms_exits_as_the_entry_fills_and_grows_them() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = open(&mut broker, "alice", Role::Retail, 10_000_00);
+        assert!(
+            broker
+                .decide_bracket(
+                    alice,
+                    9,
+                    sym(),
+                    Side::Buy,
+                    10,
+                    OrderKind::Limit(25_00),
+                    24_00,
+                    26_00,
+                    &market(),
+                    0,
+                )
+                .is_err()
+        );
+        let fact = broker
+            .decide_bracket(
+                alice,
+                9,
+                sym(),
+                Side::Buy,
+                10,
+                OrderKind::Limit(25_00),
+                27_00,
+                24_00,
+                &market(),
+                0,
+            )
+            .unwrap();
+        broker.apply(&fact);
+        assert_eq!(broker.armed_conditionals(), 0);
+        let mut first = exchange_report(
+            70,
+            1,
+            alice,
+            Side::Buy,
+            OrderStatus::PartiallyFilled,
+            (25_00, 4),
+            4,
+            10,
+            1,
+        );
+        first.client_order_id = 1;
+        let effects = deliver(&mut broker, first);
+        assert_eq!(
+            statuses(&effects),
+            vec![(1, ConditionalStatus::Armed), (2, ConditionalStatus::Armed)]
+        );
+        let legs = broker.conditional_reports(alice);
+        assert_eq!(legs[0].trigger, Trigger::Above(27_00));
+        assert_eq!(legs[1].trigger, Trigger::Below(24_00));
+        assert!(legs.iter().all(|c| c.qty == 4 && c.side == Side::Sell));
+
+        deliver(
+            &mut broker,
+            exchange_report(
+                70,
+                1,
+                alice,
+                Side::Buy,
+                OrderStatus::Filled,
+                (25_00, 6),
+                10,
+                10,
+                2,
+            ),
+        );
+        assert!(
+            broker
+                .conditional_reports(alice)
+                .iter()
+                .all(|c| c.qty == 10)
+        );
+        assert!(broker.brackets.is_empty());
+    }
+
+    #[test]
+    fn after_market_orders_and_trailing_stops_follow_role_and_session_rules() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = holding(&mut broker, "alice", Role::Retail, 10);
+        let amo = |broker: &Broker, m: &MarketCache| {
+            broker.decide_conditional(
+                alice,
+                1,
+                sym(),
+                Side::Buy,
+                5,
+                Trigger::MarketOpens,
+                OrderKind::Limit(25_00),
+                OrderOptions::default(),
+                m,
+            )
+        };
+        assert!(amo(&broker, &market()).is_err());
+        let mut closed = market();
+        closed.apply(&ServerMessage::MarketStatus(ome_protocol::MarketStatus {
+            phase: MarketPhase::Closed,
+            day: 1,
+            since: 0,
+            next_change_at: 0,
+        }));
+        broker.apply(&amo(&broker, &closed).unwrap());
+        assert_eq!(broker.waiting_for_open(), vec![1]);
+        let effects = broker.apply(&broker.decide_trigger(1, 0, &market(), 1).unwrap());
+        assert_eq!(
+            routed(&effects),
+            vec![(Side::Buy, OrderKind::Limit(25_00), 5)]
+        );
+
+        let mut dma = Broker::new(Profile::new(ProfileKind::Dma));
+        let hft = holding(&mut dma, "hft", Role::Hft, 10);
+        let trailing = dma.decide_conditional(
+            hft,
+            1,
+            sym(),
+            Side::Sell,
+            5,
+            Trigger::TrailingBelow(50),
+            OrderKind::Market,
+            OrderOptions::default(),
+            &market(),
+        );
+        assert!(trailing.unwrap_err().contains("trailing"));
     }
 }

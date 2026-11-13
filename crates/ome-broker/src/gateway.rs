@@ -3,13 +3,16 @@ use crate::journal::Record;
 use crate::market::MarketCache;
 use ome_client::LinkEvent;
 use ome_client::upstream::{LinkState, Upstream, UpstreamEvent};
+use ome_core::price::Price;
 use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, Timestamp};
 use ome_net::auth::{hash_secret, valid_username, verify};
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
-use ome_protocol::{ClientMessage, Decoder, MemberMessage, Role, ServerMessage, template};
+use ome_protocol::{
+    ClientMessage, Decoder, MarketPhase, MemberMessage, Role, ServerMessage, template,
+};
 use ome_store::Journal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -117,6 +120,7 @@ impl Gateway {
             clearing.tick(now, self.broker.last_settlement_seq());
         }
         self.market.roll(now);
+        self.release_after_market_orders(now);
         if now >= self.last_heartbeat + HEARTBEAT_MS {
             self.last_heartbeat = now;
             let heartbeat = encode(&ServerMessage::Heartbeat { server_time: now });
@@ -126,6 +130,35 @@ impl Gateway {
             }
         }
         self.drop_slow_sessions();
+    }
+
+    fn release_after_market_orders(&mut self, now: Timestamp) {
+        if !self.exchange.is_ready() || self.market.phase() == MarketPhase::Closed {
+            return;
+        }
+        for cond_id in self.broker.waiting_for_open() {
+            if let Some(fact) = self.broker.decide_trigger(cond_id, 0, &self.market, now) {
+                let _ = self.record(fact, now);
+            }
+        }
+    }
+
+    fn evaluate_conditionals(&mut self, symbol: Symbol, last: Price, now: Timestamp) {
+        if !self.exchange.is_ready()
+            || self.market.phase() != MarketPhase::Open
+            || !self.market.is_trading(symbol)
+        {
+            return;
+        }
+        let (trails, due) = self.broker.scan_conditionals(symbol, last);
+        for fact in trails {
+            let _ = self.record(fact, now);
+        }
+        for cond_id in due {
+            if let Some(fact) = self.broker.decide_trigger(cond_id, last, &self.market, now) {
+                let _ = self.record(fact, now);
+            }
+        }
     }
 
     fn send_exchange(&mut self, message: &MemberMessage) -> bool {
@@ -228,6 +261,7 @@ impl Gateway {
                 self.market.apply(&message);
                 if trade.trade_id != 0 {
                     self.send_to_subscribers(trade.symbol, &message);
+                    self.evaluate_conditionals(trade.symbol, trade.price, now);
                 }
             }
             ServerMessage::Candles(_) => {
@@ -249,6 +283,23 @@ impl Gateway {
     }
 
     fn record(&mut self, fact: Fact, now: Timestamp) -> io::Result<Vec<Effect>> {
+        if let Fact::ConditionalTriggered {
+            cond_id,
+            price,
+            order,
+            reason,
+        } = &fact
+        {
+            log(&format!(
+                "conditional #{cond_id} triggered at {}{}",
+                format_price(*price),
+                if order.is_some() {
+                    String::new()
+                } else {
+                    format!(", order rejected: {reason}")
+                }
+            ));
+        }
         if let Some(journal) = &mut self.journal {
             journal.append(&Record {
                 timestamp: now,
@@ -345,6 +396,9 @@ impl Gateway {
             }
             for report in self.broker.open_order_reports(account_id, now) {
                 self.reply(id, ServerMessage::Execution(report));
+            }
+            for report in self.broker.conditional_reports(account_id) {
+                self.reply(id, ServerMessage::ConditionalUpdate(report));
             }
         } else {
             self.reply(id, ServerMessage::AccountList(self.broker.account_list()));
@@ -448,6 +502,92 @@ impl Gateway {
                         self.send_to_account(account, &ServerMessage::Execution(*report))
                     }
                 }
+            }
+            ClientMessage::Conditional {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                trigger,
+                kind,
+                options,
+            } if !admin => {
+                let decision = self.broker.decide_conditional(
+                    account,
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    trigger,
+                    kind,
+                    options,
+                    &self.market,
+                );
+                self.record_or_reject(id, ref_template, decision, now);
+            }
+            ClientMessage::Oco {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                take_profit,
+                stop,
+                stop_limit,
+            } if !admin => {
+                let decision = self.broker.decide_oco(
+                    account,
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    take_profit,
+                    stop,
+                    stop_limit,
+                    &self.market,
+                );
+                self.record_or_reject(id, ref_template, decision, now);
+            }
+            ClientMessage::Bracket {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                entry,
+                take_profit,
+                stop_loss,
+            } if !admin => {
+                if !self.exchange.is_ready() {
+                    return self.reject(
+                        id,
+                        ref_template,
+                        "exchange link is down, try again shortly",
+                    );
+                }
+                match self.broker.decide_bracket(
+                    account,
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    entry,
+                    take_profit,
+                    stop_loss,
+                    &self.market,
+                    now,
+                ) {
+                    Ok(fact) => {
+                        if self.record(fact, now).is_err() {
+                            self.reject(id, ref_template, "journal unavailable");
+                        }
+                    }
+                    Err(report) => {
+                        self.send_to_account(account, &ServerMessage::Execution(*report))
+                    }
+                }
+            }
+            ClientMessage::CancelConditional { cond_id } if !admin => {
+                let decision = self.broker.decide_cancel_conditional(account, cond_id);
+                self.record_or_reject(id, ref_template, decision, now);
             }
             ClientMessage::Cancel { order_id } if !admin => match self
                 .broker
@@ -571,6 +711,23 @@ impl Gateway {
                 ref_template,
                 &format!("not permitted for {} accounts", role.label()),
             ),
+        }
+    }
+
+    fn record_or_reject(
+        &mut self,
+        id: SessionId,
+        ref_template: u16,
+        decision: Result<Fact, String>,
+        now: Timestamp,
+    ) {
+        match decision {
+            Ok(fact) => {
+                if self.record(fact, now).is_err() {
+                    self.reject(id, ref_template, "journal unavailable");
+                }
+            }
+            Err(reason) => self.reject(id, ref_template, &reason),
         }
     }
 

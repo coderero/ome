@@ -37,6 +37,7 @@ pub enum ServerMessage {
     ContractNote(ContractNote),
     FeeSummary(FeeSummary),
     ClearedTrade(ClearedTrade),
+    ConditionalUpdate(ConditionalReport),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -65,6 +66,7 @@ impl ServerMessage {
             ServerMessage::ContractNote(_) => CONTRACT_NOTE,
             ServerMessage::FeeSummary(_) => FEE_SUMMARY,
             ServerMessage::ClearedTrade(_) => CLEARED_TRADE,
+            ServerMessage::ConditionalUpdate(_) => CONDITIONAL_UPDATE,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -168,6 +170,17 @@ impl ServerMessage {
                     .u64(n.price);
                 put_charges(&mut e, &n.charges);
                 e.i64(n.net_amount).u64(n.timestamp).end_block();
+            }
+            ServerMessage::ConditionalUpdate(c) => {
+                e.u64(c.cond_id)
+                    .u64(c.client_order_id)
+                    .u64(c.account)
+                    .symbol(Some(c.symbol))
+                    .u8(side_to_u8(c.side))
+                    .u64(c.qty)
+                    .u8(c.status as u8);
+                put_trigger(&mut e, &c.trigger);
+                e.u64(c.level).end_block().var(&c.reason);
             }
             ServerMessage::ClearedTrade(t) => {
                 e.u64(t.seq)
@@ -454,6 +467,31 @@ impl ServerMessage {
                     symbol,
                     account,
                     shares,
+                })
+            }
+            CONDITIONAL_UPDATE => {
+                let cond_id = d.u64()?;
+                let client_order_id = d.u64()?;
+                let account = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let status = ConditionalStatus::from_u8(d.u8()?)
+                    .ok_or(DecodeError::Invalid("conditional status"))?;
+                let trigger = get_trigger(&mut d)?;
+                let level = d.u64()?;
+                d.end_block()?;
+                ServerMessage::ConditionalUpdate(ConditionalReport {
+                    cond_id,
+                    client_order_id,
+                    account,
+                    symbol,
+                    side,
+                    qty,
+                    status,
+                    trigger,
+                    level,
+                    reason: d.var()?,
                 })
             }
             CLEARED_TRADE => {
@@ -799,6 +837,18 @@ mod tests {
             },
             ServerMessage::ReplayComplete { next_seq: 51 },
             ServerMessage::Heartbeat { server_time: 5 },
+            ServerMessage::ConditionalUpdate(ConditionalReport {
+                cond_id: 3,
+                client_order_id: 9,
+                account: 4,
+                symbol: sym("ACME"),
+                side: Side::Sell,
+                qty: 10,
+                status: ConditionalStatus::Triggered,
+                trigger: Trigger::Below(2_400),
+                level: 2_400,
+                reason: "stop hit".into(),
+            }),
             ServerMessage::MarketStatus(MarketStatus {
                 phase: MarketPhase::PreOpen,
                 day: 3,

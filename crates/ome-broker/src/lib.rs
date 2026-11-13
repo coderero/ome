@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod journal;
 pub mod ledger;
 pub mod market;
+pub mod oms;
 pub mod profile;
 
 use broker::Broker;

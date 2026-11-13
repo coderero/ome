@@ -1,6 +1,6 @@
 use ome_core::risk::{MaxNotional, MaxQuantity, PositiveQuantity, RiskEngine};
 use ome_core::types::{OrderKind, OrderOptions, Qty, StpMode, TimeInForce};
-use ome_protocol::Role;
+use ome_protocol::{Role, Trigger};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileKind {
@@ -29,6 +29,13 @@ impl ProfileKind {
             ProfileKind::Lp => "liquidity provider",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Single,
+    Oco,
+    Bracket,
 }
 
 pub struct Limits {
@@ -99,6 +106,28 @@ impl Profile {
         }
     }
 
+    pub fn permits_conditional(role: Role, trigger: &Trigger, shape: Shape) -> Result<(), String> {
+        let fixed = matches!(trigger, Trigger::Above(_) | Trigger::Below(_));
+        let allowed = match role {
+            Role::Retail | Role::Prop => true,
+            Role::Quant | Role::Hft | Role::LpDesk => shape == Shape::Single && fixed,
+            Role::Issuer | Role::BrokerAdmin => false,
+        };
+        if allowed {
+            return Ok(());
+        }
+        let what = match shape {
+            Shape::Oco => "OCO orders".to_string(),
+            Shape::Bracket => "bracket orders".to_string(),
+            Shape::Single => match trigger {
+                Trigger::TrailingAbove(_) | Trigger::TrailingBelow(_) => "trailing stops".into(),
+                Trigger::MarketOpens => "after-market orders".into(),
+                _ => "stop or GTT orders".into(),
+            },
+        };
+        Err(format!("{} accounts may not use {what}", role.label()))
+    }
+
     pub fn risk(role: Role) -> RiskEngine {
         let limits = Self::limits(role);
         RiskEngine::new()
@@ -120,6 +149,19 @@ mod tests {
         assert!(Profile::new(ProfileKind::Prime).allows(Role::Quant));
         assert!(Profile::new(ProfileKind::Lp).allows(Role::LpDesk));
         assert!(Profile::new(ProfileKind::Lp).allows(Role::BrokerAdmin));
+    }
+
+    #[test]
+    fn conditional_orders_follow_the_participant_matrix() {
+        let trail = Trigger::TrailingBelow(50);
+        let stop = Trigger::Below(2_000);
+        assert!(Profile::permits_conditional(Role::Retail, &trail, Shape::Single).is_ok());
+        assert!(Profile::permits_conditional(Role::Retail, &stop, Shape::Bracket).is_ok());
+        assert!(Profile::permits_conditional(Role::Prop, &stop, Shape::Oco).is_ok());
+        assert!(Profile::permits_conditional(Role::Hft, &stop, Shape::Single).is_ok());
+        assert!(Profile::permits_conditional(Role::Hft, &trail, Shape::Single).is_err());
+        assert!(Profile::permits_conditional(Role::Quant, &stop, Shape::Oco).is_err());
+        assert!(Profile::permits_conditional(Role::Issuer, &stop, Shape::Single).is_err());
     }
 
     #[test]

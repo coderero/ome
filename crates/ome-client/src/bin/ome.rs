@@ -4,7 +4,7 @@ use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, OrderKind, OrderOptions, Side, StpMode, TimeInForce};
 use ome_protocol::{
     AccountInfo, Asset, ClientMessage, InstrumentInfo, MarketPhase, MemberId, MemberInfo,
-    MemberKind, MemberMessage, OrderStatus, QuoteSide, Role, ServerMessage,
+    MemberKind, MemberMessage, OrderStatus, QuoteSide, Role, ServerMessage, Trigger,
 };
 use std::time::Duration;
 
@@ -34,6 +34,16 @@ const USAGE: &str = "usage:
       quote <SYMBOL> <bid> <bid-qty> <ask> <ask-qty>      two-sided quote (HFT and LP desks); 0 qty = no side
       mmp <window-ms> <max-qty>                           market maker protection (resets a trip)
       cancel <order_id>  |  cancel-all [SYMBOL]
+      stop <SYMBOL> <buy|sell> <qty> <trigger> [limit]    stop-loss (market) or stop-limit, held at the broker
+      trail <SYMBOL> <buy|sell> <qty> <distance>          trailing stop that follows the best price seen
+      gtt <SYMBOL> <buy|sell> <qty> <above|below> <trigger> <limit>
+                                                          good-till-triggered limit order, survives days
+      amo <SYMBOL> <buy|sell> <qty> <price|mkt>           after-market order, released when the market opens
+      oco <SYMBOL> <buy|sell> <qty> <target> <stop> [stop-limit]
+                                                          one-cancels-other exit: target limit + stop
+      bracket <SYMBOL> <buy|sell> <qty> <price|mkt> <target> <stop>
+                                                          entry order whose fills arm an OCO exit
+      conditionals  |  cancel-cond <id>                   armed broker-held orders
       instruments  |  watch <SYMBOL>
 
   ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
@@ -499,6 +509,155 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 wait = Duration::from_millis(300);
             }
         }
+        ["stop", sym, side, qty, trigger, rest @ ..] if rest.len() <= 1 => {
+            let side = side_of(side)?;
+            let level = price(trigger)?;
+            let trigger = match side {
+                Side::Buy => Trigger::Above(level),
+                Side::Sell => Trigger::Below(level),
+            };
+            let kind = match rest.first() {
+                Some(px) => OrderKind::Limit(price(px)?),
+                None => OrderKind::Market,
+            };
+            conditional(client, symbol(sym)?, side, number(qty)?, trigger, kind)?;
+        }
+        ["trail", sym, side, qty, distance] => {
+            let side = side_of(side)?;
+            let distance = price(distance)?;
+            let trigger = match side {
+                Side::Buy => Trigger::TrailingAbove(distance),
+                Side::Sell => Trigger::TrailingBelow(distance),
+            };
+            conditional(
+                client,
+                symbol(sym)?,
+                side,
+                number(qty)?,
+                trigger,
+                OrderKind::Market,
+            )?;
+        }
+        ["gtt", sym, side, qty, direction, trigger, limit] => {
+            let level = price(trigger)?;
+            let trigger = match *direction {
+                "above" => Trigger::Above(level),
+                "below" => Trigger::Below(level),
+                _ => return Err("direction must be above or below".into()),
+            };
+            conditional(
+                client,
+                symbol(sym)?,
+                side_of(side)?,
+                number(qty)?,
+                trigger,
+                OrderKind::Limit(price(limit)?),
+            )?;
+        }
+        ["amo", sym, side, qty, px] => {
+            let kind = order_kind(px)?;
+            conditional(
+                client,
+                symbol(sym)?,
+                side_of(side)?,
+                number(qty)?,
+                Trigger::MarketOpens,
+                kind,
+            )?;
+        }
+        ["oco", sym, side, qty, target, stop, rest @ ..] if rest.len() <= 1 => {
+            let client_order_id = client.next_order_id();
+            client.send(&ClientMessage::Oco {
+                client_order_id,
+                symbol: symbol(sym)?,
+                side: side_of(side)?,
+                qty: number(qty)?,
+                take_profit: price(target)?,
+                stop: price(stop)?,
+                stop_limit: rest.first().map(|p| price(p)).transpose()?,
+            })?;
+            print_conditional_replies(client, client_order_id, 2)?;
+        }
+        ["bracket", sym, side, qty, entry, target, stop] => {
+            let client_order_id = client.next_order_id();
+            client.send(&ClientMessage::Bracket {
+                client_order_id,
+                symbol: symbol(sym)?,
+                side: side_of(side)?,
+                qty: number(qty)?,
+                entry: order_kind(entry)?,
+                take_profit: price(target)?,
+                stop_loss: price(stop)?,
+            })?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while let Some(message) = client
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?
+            {
+                match message {
+                    ServerMessage::Reject { reason, .. } => {
+                        return Err(ClientError::Rejected(reason).into());
+                    }
+                    ServerMessage::Execution(r) if r.client_order_id == client_order_id => {
+                        println!(
+                            "entry #{} {} {} filled {}/{} {}",
+                            r.order_id,
+                            r.status.label(),
+                            r.side.label(),
+                            r.filled,
+                            r.qty,
+                            r.reason
+                        );
+                        if r.status == OrderStatus::Rejected {
+                            break;
+                        }
+                    }
+                    ServerMessage::ConditionalUpdate(c) if c.client_order_id == client_order_id => {
+                        print_conditional(&c)
+                    }
+                    ServerMessage::ContractNote(note) => print_note(&note),
+                    _ => {}
+                }
+            }
+        }
+        ["conditionals"] => {
+            client.send(&ClientMessage::QueryAccount)?;
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut armed = std::collections::BTreeMap::new();
+            while let Some(message) = client
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?
+            {
+                if let ServerMessage::ConditionalUpdate(c) = message {
+                    if c.status == ome_protocol::ConditionalStatus::Armed {
+                        armed.insert(c.cond_id, c);
+                    } else {
+                        armed.remove(&c.cond_id);
+                    }
+                }
+            }
+            if armed.is_empty() {
+                println!("no armed conditional orders");
+            }
+            for c in armed.values() {
+                print_conditional(c);
+            }
+        }
+        ["cancel-cond", id] => {
+            let cond_id = number(id)?;
+            client.send(&ClientMessage::CancelConditional { cond_id })?;
+            match client.wait_for(Duration::from_secs(5), |m| match m {
+                ServerMessage::ConditionalUpdate(c) => {
+                    c.cond_id == cond_id && c.status == ome_protocol::ConditionalStatus::Cancelled
+                }
+                ServerMessage::Reject { .. } => true,
+                _ => false,
+            })? {
+                ServerMessage::Reject { reason, .. } => {
+                    return Err(ClientError::Rejected(reason).into());
+                }
+                ServerMessage::ConditionalUpdate(c) => print_conditional(&c),
+                _ => unreachable!(),
+            }
+        }
         ["cancel", id] => {
             let order_id = number(id)?;
             client.send(&ClientMessage::Cancel { order_id })?;
@@ -538,6 +697,83 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
         _ => usage()?,
     }
     Ok(())
+}
+
+fn side_of(text: &str) -> std::result::Result<Side, String> {
+    match text {
+        "buy" => Ok(Side::Buy),
+        "sell" => Ok(Side::Sell),
+        _ => Err(format!("side must be buy or sell, not '{text}'")),
+    }
+}
+
+fn order_kind(text: &str) -> std::result::Result<OrderKind, String> {
+    if text.eq_ignore_ascii_case("mkt") {
+        Ok(OrderKind::Market)
+    } else {
+        Ok(OrderKind::Limit(price(text)?))
+    }
+}
+
+fn conditional(
+    client: &mut Client,
+    symbol: Symbol,
+    side: Side,
+    qty: u64,
+    trigger: Trigger,
+    kind: OrderKind,
+) -> Result<()> {
+    let client_order_id = client.next_order_id();
+    client.send(&ClientMessage::Conditional {
+        client_order_id,
+        symbol,
+        side,
+        qty,
+        trigger,
+        kind,
+        options: OrderOptions::default(),
+    })?;
+    print_conditional_replies(client, client_order_id, 1)
+}
+
+fn print_conditional_replies(client: &mut Client, client_order_id: u64, legs: usize) -> Result<()> {
+    for _ in 0..legs {
+        match client.wait_for(Duration::from_secs(5), |m| match m {
+            ServerMessage::ConditionalUpdate(c) => c.client_order_id == client_order_id,
+            ServerMessage::Reject { .. } => true,
+            _ => false,
+        })? {
+            ServerMessage::Reject { reason, .. } => {
+                return Err(ClientError::Rejected(reason).into());
+            }
+            ServerMessage::ConditionalUpdate(c) => print_conditional(&c),
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+fn print_conditional(c: &ome_protocol::ConditionalReport) {
+    let level = match c.trigger {
+        Trigger::TrailingAbove(_) | Trigger::TrailingBelow(_) => {
+            format!(", now at {}", format_price(c.level))
+        }
+        _ => String::new(),
+    };
+    println!(
+        "cond #{} {} {} {} {} when {}{level}{}",
+        c.cond_id,
+        c.status.label(),
+        c.side.label(),
+        c.qty,
+        c.symbol,
+        c.trigger.describe(),
+        if c.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", c.reason)
+        }
+    );
 }
 
 fn format_signed(amount: i64) -> String {

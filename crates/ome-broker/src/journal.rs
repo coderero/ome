@@ -1,9 +1,11 @@
 use crate::broker::{Fact, QuoteLeg};
+use crate::oms::Conditional;
 use ome_core::types::Timestamp;
 use ome_protocol::Asset;
 use ome_protocol::{
-    DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_charges, get_order_options,
-    put_charges, put_order_options, role_from, side_from_u8, side_to_u8,
+    DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_charges, get_order_kind,
+    get_order_options, get_trigger, put_charges, put_order_kind, put_order_options, put_trigger,
+    role_from, side_from_u8, side_to_u8,
 };
 use ome_store::Entry;
 
@@ -16,6 +18,58 @@ mod template {
     pub const ORDER_ABANDONED: u16 = 305;
     pub const SETTLEMENT_RECEIVED: u16 = 306;
     pub const QUOTE_ACCEPTED: u16 = 307;
+    pub const CONDITIONAL_ARMED: u16 = 308;
+    pub const TRAIL_MOVED: u16 = 309;
+    pub const CONDITIONAL_TRIGGERED: u16 = 310;
+    pub const CONDITIONAL_CANCELLED: u16 = 311;
+    pub const BRACKET_ACCEPTED: u16 = 312;
+    pub const CONDITIONAL: u16 = 399;
+}
+
+fn encode_conditional(c: &Conditional) -> Vec<u8> {
+    let mut e = Encoder::new(template::CONDITIONAL);
+    e.u64(c.cond_id)
+        .u64(c.account)
+        .u64(c.client_order_id)
+        .symbol(Some(c.symbol))
+        .u8(side_to_u8(c.side))
+        .u64(c.qty);
+    put_trigger(&mut e, &c.trigger);
+    put_order_kind(&mut e, c.kind);
+    put_order_options(&mut e, &c.options);
+    e.u64(c.group).u64(c.extreme).end_block();
+    e.finish()
+}
+
+fn decode_conditional(bytes: &[u8]) -> Result<Conditional, DecodeError> {
+    let mut d = Decoder::new(bytes)?;
+    let c = Conditional {
+        cond_id: d.u64()?,
+        account: d.u64()?,
+        client_order_id: d.u64()?,
+        symbol: d.symbol()?,
+        side: side_from_u8(d.u8()?)?,
+        qty: d.u64()?,
+        trigger: get_trigger(&mut d)?,
+        kind: get_order_kind(&mut d)?,
+        options: get_order_options(&mut d)?,
+        group: d.u64()?,
+        extreme: d.u64()?,
+    };
+    d.end_block()?;
+    Ok(c)
+}
+
+fn encode_inner(fact: &Fact) -> Vec<u8> {
+    Record {
+        timestamp: 0,
+        fact: fact.clone(),
+    }
+    .encode()
+}
+
+fn decode_inner(bytes: &[u8]) -> Result<Box<Fact>, DecodeError> {
+    Ok(Box::new(Record::decode(bytes)?.fact))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +89,11 @@ impl Entry for Record {
             Fact::OrderAbandoned { .. } => template::ORDER_ABANDONED,
             Fact::SettlementReceived(_) => template::SETTLEMENT_RECEIVED,
             Fact::QuoteAccepted { .. } => template::QUOTE_ACCEPTED,
+            Fact::ConditionalArmed(_) => template::CONDITIONAL_ARMED,
+            Fact::TrailMoved { .. } => template::TRAIL_MOVED,
+            Fact::ConditionalTriggered { .. } => template::CONDITIONAL_TRIGGERED,
+            Fact::ConditionalCancelled { .. } => template::CONDITIONAL_CANCELLED,
+            Fact::BracketAccepted { .. } => template::BRACKET_ACCEPTED,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -121,6 +180,43 @@ impl Entry for Record {
             Fact::SettlementReceived(report) => {
                 e.end_block()
                     .var_bytes(&ServerMessage::SettlementReport(report.clone()).encode());
+            }
+            Fact::ConditionalArmed(legs) => {
+                e.u8(legs.len() as u8).end_block();
+                for leg in legs {
+                    e.var_bytes(&encode_conditional(leg));
+                }
+            }
+            Fact::TrailMoved { cond_id, extreme } => {
+                e.u64(*cond_id).u64(*extreme).end_block();
+            }
+            Fact::ConditionalTriggered {
+                cond_id,
+                price,
+                order,
+                reason,
+            } => {
+                e.u64(*cond_id)
+                    .u64(*price)
+                    .u8(order.is_some() as u8)
+                    .end_block()
+                    .var(reason);
+                if let Some(order) = order {
+                    e.var_bytes(&encode_inner(order));
+                }
+            }
+            Fact::ConditionalCancelled { cond_id, reason } => {
+                e.u64(*cond_id).end_block().var(reason);
+            }
+            Fact::BracketAccepted {
+                order,
+                take_profit,
+                stop_loss,
+            } => {
+                e.u64(*take_profit)
+                    .u64(*stop_loss)
+                    .end_block()
+                    .var_bytes(&encode_inner(order));
             }
         }
         e.finish()
@@ -227,6 +323,57 @@ impl Entry for Record {
                 match ServerMessage::decode(d.var_bytes()?)? {
                     ServerMessage::SettlementReport(report) => Fact::SettlementReceived(report),
                     _ => return Err(DecodeError::Invalid("embedded settlement report")),
+                }
+            }
+            template::CONDITIONAL_ARMED => {
+                let count = d.u8()?;
+                d.end_block()?;
+                let mut legs = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    legs.push(decode_conditional(d.var_bytes()?)?);
+                }
+                Fact::ConditionalArmed(legs)
+            }
+            template::TRAIL_MOVED => {
+                let cond_id = d.u64()?;
+                let extreme = d.u64()?;
+                d.end_block()?;
+                Fact::TrailMoved { cond_id, extreme }
+            }
+            template::CONDITIONAL_TRIGGERED => {
+                let cond_id = d.u64()?;
+                let price = d.u64()?;
+                let has_order = d.u8()? != 0;
+                d.end_block()?;
+                let reason = d.var()?;
+                let order = if has_order {
+                    Some(decode_inner(d.var_bytes()?)?)
+                } else {
+                    None
+                };
+                Fact::ConditionalTriggered {
+                    cond_id,
+                    price,
+                    order,
+                    reason,
+                }
+            }
+            template::CONDITIONAL_CANCELLED => {
+                let cond_id = d.u64()?;
+                d.end_block()?;
+                Fact::ConditionalCancelled {
+                    cond_id,
+                    reason: d.var()?,
+                }
+            }
+            template::BRACKET_ACCEPTED => {
+                let take_profit = d.u64()?;
+                let stop_loss = d.u64()?;
+                d.end_block()?;
+                Fact::BracketAccepted {
+                    order: decode_inner(d.var_bytes()?)?,
+                    take_profit,
+                    stop_loss,
                 }
             }
             other => return Err(DecodeError::UnknownTemplate(other)),
@@ -346,6 +493,64 @@ mod tests {
                 margin_required: 0,
                 positions: vec![],
             }),
+            Fact::ConditionalArmed(vec![
+                Conditional {
+                    cond_id: 1,
+                    account: 2,
+                    client_order_id: 4,
+                    symbol: sym(),
+                    side: Side::Sell,
+                    qty: 3,
+                    trigger: ome_protocol::Trigger::Above(30_00),
+                    kind: ome_core::types::OrderKind::Limit(30_00),
+                    options: ome_core::types::OrderOptions::default(),
+                    group: 1,
+                    extreme: 25_00,
+                },
+                Conditional {
+                    cond_id: 2,
+                    account: 2,
+                    client_order_id: 4,
+                    symbol: sym(),
+                    side: Side::Sell,
+                    qty: 3,
+                    trigger: ome_protocol::Trigger::TrailingBelow(1_00),
+                    kind: ome_core::types::OrderKind::Market,
+                    options: ome_core::types::OrderOptions::default(),
+                    group: 1,
+                    extreme: 25_00,
+                },
+            ]),
+            Fact::TrailMoved {
+                cond_id: 2,
+                extreme: 26_00,
+            },
+            Fact::ConditionalTriggered {
+                cond_id: 2,
+                price: 25_00,
+                order: Some(Box::new(Fact::OrderAccepted {
+                    order_ref: 9,
+                    account: 2,
+                    client_order_id: 4,
+                    symbol: sym(),
+                    side: Side::Sell,
+                    price: 22_50,
+                    options: ome_core::types::OrderOptions::tif(TimeInForce::Ioc),
+                    qty: 3,
+                    reserved: 3,
+                    fee_reserve: 0,
+                })),
+                reason: String::new(),
+            },
+            Fact::ConditionalCancelled {
+                cond_id: 7,
+                reason: "cancelled by the client".into(),
+            },
+            Fact::BracketAccepted {
+                order: Box::new(Fact::OrderAbandoned { order_ref: 77 }),
+                take_profit: 27_00,
+                stop_loss: 24_00,
+            },
         ]
     }
 
@@ -371,6 +576,7 @@ mod tests {
         }
         assert_eq!(live.account_list(), replayed.account_list());
         assert_eq!(live.account_snapshot(2), replayed.account_snapshot(2));
+        assert_eq!(live.conditional_reports(2), replayed.conditional_reports(2));
         assert_eq!(live.last_seq(), 3);
         let fund = live.account_snapshot(2).unwrap();
         assert_eq!(fund.cash.reserved, 25_00 * 6 + 6 + 124_50 + 1);

@@ -258,6 +258,11 @@ impl Client {
         self.send_order_with(symbol, side, kind, OrderOptions::tif(tif), qty)
     }
 
+    pub fn next_order_id(&mut self) -> u64 {
+        self.next_client_order_id += 1;
+        self.next_client_order_id
+    }
+
     pub fn send_order_with(
         &mut self,
         symbol: Symbol,
