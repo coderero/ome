@@ -1,7 +1,7 @@
 use ome_client::{Client, ClientError, DEFAULT_BROKER_ADDR, DEFAULT_EXCHANGE_ADDR};
 use ome_core::price::{format_price, parse_amount, parse_price};
 use ome_core::symbol::Symbol;
-use ome_core::types::{AccountId, OrderKind, Side, TimeInForce};
+use ome_core::types::{AccountId, OrderKind, OrderOptions, Side, StpMode, TimeInForce};
 use ome_protocol::{
     AccountInfo, Asset, ClientMessage, InstrumentInfo, MarketPhase, MemberInfo, MemberKind,
     MemberMessage, OrderStatus, Role, ServerMessage,
@@ -25,7 +25,9 @@ const USAGE: &str = "usage:
       create-account <name> <secret> <role> <cash>        role: retail quant hft prop lp issuer admin
       set-cash <account> <amount>  |  set-shares <account> <SYMBOL> <qty>
       balance                                             (trader)
-      buy|sell <SYMBOL> <price|mkt> <qty> [gtc|day|ioc]
+      buy|sell <SYMBOL> <price|mkt> <qty> [options..]
+                                                          options: gtc day ioc fok auction gtd:<seconds>
+                                                          post show:<qty> stp:keep|new|both
       market                                              market phase and trading day
       cancel <order_id>  |  cancel-all [SYMBOL]
       instruments  |  watch <SYMBOL>
@@ -374,16 +376,8 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             }
         }
         ["market"] => print_status(client)?,
-        [side @ ("buy" | "sell"), sym, px, qty, tif @ ..] => {
-            let tif = match tif.first().map(|t| t.to_ascii_lowercase()) {
-                None => None,
-                Some(t) if t == "gtc" => Some(TimeInForce::Gtc),
-                Some(t) if t == "day" => Some(TimeInForce::Day),
-                Some(t) if t == "ioc" => Some(TimeInForce::Ioc),
-                Some(t) => {
-                    return Err(format!("time in force must be gtc, day or ioc, not '{t}'").into());
-                }
-            };
+        [side @ ("buy" | "sell"), sym, px, qty, extras @ ..] => {
+            let options = order_options(extras)?;
             let side = if *side == "buy" {
                 Side::Buy
             } else {
@@ -394,8 +388,10 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             } else {
                 OrderKind::Limit(price(px)?)
             };
-            let client_order_id = match tif {
-                Some(tif) => client.send_order_with(symbol(sym)?, side, kind, tif, number(qty)?)?,
+            let client_order_id = match options {
+                Some(options) => {
+                    client.send_order_with(symbol(sym)?, side, kind, options, number(qty)?)?
+                }
                 None => client.send_order(symbol(sym)?, side, kind, number(qty)?)?,
             };
             let first_wait = Duration::from_secs(5);
@@ -596,6 +592,40 @@ fn print_instrument(i: &InstrumentInfo) {
         i.name,
         i.halt_reason
     );
+}
+
+fn order_options(extras: &[&str]) -> std::result::Result<Option<OrderOptions>, String> {
+    if extras.is_empty() {
+        return Ok(None);
+    }
+    let mut options = OrderOptions::default();
+    for extra in extras {
+        let word = extra.to_ascii_lowercase();
+        match word.as_str() {
+            "gtc" => options.tif = TimeInForce::Gtc,
+            "day" => options.tif = TimeInForce::Day,
+            "ioc" => options.tif = TimeInForce::Ioc,
+            "fok" => options.tif = TimeInForce::Fok,
+            "auction" => options.tif = TimeInForce::Auction,
+            "post" => options.post_only = true,
+            "stp:keep" => options.stp = StpMode::CancelResting,
+            "stp:new" => options.stp = StpMode::CancelIncoming,
+            "stp:both" => options.stp = StpMode::CancelBoth,
+            other => {
+                if let Some(seconds) = other.strip_prefix("gtd:") {
+                    let seconds = number(seconds)?;
+                    options.tif = TimeInForce::Gtd(ome_net_now() + seconds * 1_000);
+                } else if let Some(display) = other.strip_prefix("show:") {
+                    options.display_qty = Some(number(display)?);
+                } else {
+                    return Err(format!(
+                        "unknown order option '{other}' (gtc day ioc fok auction gtd:<seconds> post show:<qty> stp:keep|new|both)"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Some(options))
 }
 
 fn print_status(client: &mut Client) -> Result<()> {

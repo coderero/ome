@@ -2,8 +2,8 @@ use crate::broker::Fact;
 use ome_core::types::Timestamp;
 use ome_protocol::Asset;
 use ome_protocol::{
-    DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_charges, put_charges,
-    role_from, side_from_u8, side_to_u8, tif_from_u8, tif_to_u8,
+    DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_charges, get_order_options,
+    put_charges, put_order_options, role_from, side_from_u8, side_to_u8,
 };
 use ome_store::Entry;
 
@@ -66,7 +66,7 @@ impl Entry for Record {
                 symbol,
                 side,
                 price,
-                tif,
+                options,
                 qty,
                 reserved,
                 fee_reserve,
@@ -76,12 +76,9 @@ impl Entry for Record {
                     .u64(*client_order_id)
                     .symbol(Some(*symbol))
                     .u8(side_to_u8(*side))
-                    .u64(*price)
-                    .u8(tif_to_u8(*tif))
-                    .u64(*qty)
-                    .u64(*reserved)
-                    .u64(*fee_reserve)
-                    .end_block();
+                    .u64(*price);
+                put_order_options(&mut e, options);
+                e.u64(*qty).u64(*reserved).u64(*fee_reserve).end_block();
             }
             Fact::ExchangeReport { report, charges } => {
                 put_charges(&mut e, charges);
@@ -137,7 +134,7 @@ impl Entry for Record {
                 let symbol = d.symbol()?;
                 let side = side_from_u8(d.u8()?)?;
                 let price = d.u64()?;
-                let tif = tif_from_u8(d.u8()?)?;
+                let options = get_order_options(&mut d)?;
                 let qty = d.u64()?;
                 let reserved = d.u64()?;
                 let fee_reserve = d.u64()?;
@@ -149,7 +146,7 @@ impl Entry for Record {
                     symbol,
                     side,
                     price,
-                    tif,
+                    options,
                     qty,
                     reserved,
                     fee_reserve,
@@ -258,7 +255,7 @@ mod tests {
                 symbol: sym(),
                 side: Side::Buy,
                 price: 25_00,
-                tif: TimeInForce::Gtc,
+                options: ome_core::types::OrderOptions::tif(TimeInForce::Gtc),
                 qty: 10,
                 reserved: 250_00,
                 fee_reserve: 9,
@@ -272,7 +269,7 @@ mod tests {
                 symbol: sym(),
                 side: Side::Sell,
                 price: 26_00,
-                tif: TimeInForce::Ioc,
+                options: ome_core::types::OrderOptions::tif(TimeInForce::Ioc),
                 qty: 5,
                 reserved: 5,
                 fee_reserve: 0,

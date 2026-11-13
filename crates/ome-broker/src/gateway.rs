@@ -398,7 +398,7 @@ impl Gateway {
                 symbol,
                 side,
                 kind,
-                tif,
+                options,
                 qty,
             } if !admin => {
                 let decision = if self.exchange.is_ready() {
@@ -408,7 +408,7 @@ impl Gateway {
                         symbol,
                         side,
                         kind,
-                        tif,
+                        options,
                         qty,
                         &self.market,
                         now,
@@ -422,7 +422,7 @@ impl Gateway {
                             symbol,
                             side,
                             kind,
-                            tif,
+                            options,
                             qty,
                             &self.market,
                             now,

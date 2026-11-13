@@ -6,7 +6,8 @@ use ome_core::price::{Price, format_price};
 use ome_core::risk::{MaxQuantity, PositiveQuantity, PriceBand, RiskContext, RiskEngine};
 use ome_core::symbol::Symbol;
 use ome_core::types::{
-    AccountId, Order, OrderId, OrderKind, OrderRequest, Qty, Side, TimeInForce, Timestamp, Trade,
+    AccountId, Order, OrderId, OrderKind, OrderOptions, OrderRequest, Qty, Side, TimeInForce,
+    Timestamp, Trade,
 };
 use ome_net::auth::SecretHash;
 use ome_net::feed::{Feeds, Replay};
@@ -79,7 +80,7 @@ pub enum Command {
         symbol: Symbol,
         side: Side,
         kind: OrderKind,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
     },
     Cancel {
@@ -106,6 +107,9 @@ pub enum Command {
     },
     SetSchedule {
         schedule: Option<Schedule>,
+    },
+    ExpireGtd {
+        at: Timestamp,
     },
 }
 
@@ -181,6 +185,7 @@ pub struct Exchange {
     traded: HashMap<MemberId, BTreeMap<u64, u64>>,
     cycle: u64,
     session: Session,
+    gtd: std::collections::BTreeSet<(Timestamp, OrderId)>,
     risk: RiskEngine,
     next_order_id: OrderId,
     next_trade_id: u64,
@@ -212,6 +217,7 @@ impl Exchange {
             traded: HashMap::new(),
             cycle: 0,
             session: Session::default(),
+            gtd: std::collections::BTreeSet::new(),
             risk,
             next_order_id: 1,
             next_trade_id: 1,
@@ -289,7 +295,7 @@ impl Exchange {
                 symbol,
                 side,
                 kind,
-                tif,
+                options,
                 qty,
             } => self.new_order(
                 *member,
@@ -298,10 +304,11 @@ impl Exchange {
                 *symbol,
                 *side,
                 *kind,
-                *tif,
+                *options,
                 *qty,
                 now,
             ),
+            Command::ExpireGtd { at } => Ok(self.expire_gtd(*at)),
             Command::Cancel { member, order_id } => self.cancel(*member, *order_id, now),
             Command::CancelAll {
                 member,
@@ -335,8 +342,14 @@ impl Exchange {
             .session
             .due(now)
             .map(|phase| Command::SetPhase { phase });
+        let gtd = self
+            .gtd
+            .first()
+            .filter(|(at, _)| *at <= now)
+            .map(|_| Command::ExpireGtd { at: now });
         session
             .into_iter()
+            .chain(gtd)
             .chain(
                 self.instruments
                     .values()
@@ -356,6 +369,12 @@ impl Exchange {
         let mut events = Vec::new();
         if previous.is_call() && phase != previous {
             self.uncross_all(now, &mut events);
+            self.expire_where(
+                |tif| tif == TimeInForce::Auction,
+                now,
+                "auction ended",
+                &mut events,
+            );
         }
         if phase == MarketPhase::Closed && previous != MarketPhase::Closed {
             self.expire_day_orders(now, &mut events);
@@ -405,10 +424,43 @@ impl Exchange {
     }
 
     fn expire_day_orders(&mut self, now: Timestamp, events: &mut Vec<Event>) {
+        self.expire_where(
+            |tif| tif == TimeInForce::Day,
+            now,
+            "end of trading day",
+            events,
+        );
+    }
+
+    fn expire_gtd(&mut self, at: Timestamp) -> Vec<Event> {
+        let mut events = Vec::new();
+        let due: Vec<(Timestamp, OrderId)> =
+            self.gtd.range(..=(at, OrderId::MAX)).copied().collect();
+        for key in due {
+            self.gtd.remove(&key);
+            let Some(symbol) = self.orders.get(&key.1).map(|m| m.symbol) else {
+                continue;
+            };
+            if let Some(instrument) = self.instruments.get_mut(&symbol) {
+                instrument.book.cancel(key.1);
+            }
+            events.extend(self.close(key.1, OrderStatus::Expired, at, "good-till-date expired"));
+            events.push(Event::BookChanged(symbol));
+        }
+        events
+    }
+
+    fn expire_where(
+        &mut self,
+        matches: impl Fn(TimeInForce) -> bool,
+        now: Timestamp,
+        reason: &str,
+        events: &mut Vec<Event>,
+    ) {
         let mut ids: Vec<(OrderId, Symbol)> = self
             .orders
             .iter()
-            .filter(|(_, m)| m.tif == TimeInForce::Day)
+            .filter(|(_, m)| matches(m.tif))
             .map(|(id, m)| (*id, m.symbol))
             .collect();
         ids.sort_unstable();
@@ -417,7 +469,7 @@ impl Exchange {
             if let Some(instrument) = self.instruments.get_mut(&symbol) {
                 instrument.book.cancel(id);
             }
-            events.extend(self.close(id, OrderStatus::Expired, now, "end of trading day"));
+            events.extend(self.close(id, OrderStatus::Expired, now, reason));
             touched.insert(symbol);
         }
         events.extend(touched.into_iter().map(Event::BookChanged));
@@ -602,7 +654,7 @@ impl Exchange {
             symbol,
             Side::Sell,
             ipo_price,
-            TimeInForce::Gtc,
+            OrderOptions::default(),
             shares,
             now,
         ));
@@ -655,11 +707,12 @@ impl Exchange {
         symbol: Symbol,
         side: Side,
         kind: OrderKind,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
         now: Timestamp,
     ) -> Result<Vec<Event>, ExchangeError> {
         self.trading_member(member)?;
+        let tif = options.tif;
         let reject = |this: &mut Self, reason: String| {
             let report = ExecutionReport {
                 seq: 0,
@@ -685,6 +738,17 @@ impl Exchange {
             };
             vec![this.publish(member, ServerMessage::Execution(report))]
         };
+        let expire = |this: &mut Self, reason: &str| {
+            let mut report_events = reject(this, reason.to_string());
+            if let Some(Event::ToMember {
+                message: ServerMessage::Execution(report),
+                ..
+            }) = report_events.first_mut()
+            {
+                report.status = OrderStatus::Expired;
+            }
+            report_events
+        };
 
         if account >> ACCOUNT_BITS != 0 {
             return Ok(reject(
@@ -703,10 +767,41 @@ impl Exchange {
         if phase == MarketPhase::Closed {
             return Ok(reject(self, "market is closed".to_string()));
         }
-        if phase.is_call() && tif == TimeInForce::Ioc && kind != OrderKind::Market {
+        if phase.is_call() && tif.is_immediate() && kind != OrderKind::Market {
             return Ok(reject(
                 self,
-                format!("IOC orders are not accepted during the {}", phase.label()),
+                format!(
+                    "{} orders are not accepted during the {}",
+                    tif.label().to_uppercase(),
+                    phase.label()
+                ),
+            ));
+        }
+        if tif == TimeInForce::Auction && !phase.is_call() {
+            return Ok(reject(
+                self,
+                "auction-only orders are accepted during pre-open and the closing auction"
+                    .to_string(),
+            ));
+        }
+        if matches!(tif, TimeInForce::Gtd(at) if at <= now) {
+            return Ok(reject(
+                self,
+                "good-till-date expiry must be in the future".to_string(),
+            ));
+        }
+        if options.display_qty.is_some_and(|d| d == 0 || d >= qty) {
+            return Ok(reject(
+                self,
+                "display quantity must be between 1 and the order quantity".to_string(),
+            ));
+        }
+        if (options.post_only || options.display_qty.is_some())
+            && (kind == OrderKind::Market || tif.is_immediate())
+        {
+            return Ok(reject(
+                self,
+                "post-only and iceberg orders must be resting limit orders".to_string(),
             ));
         }
         let reference_price = instrument.last_price.unwrap_or(instrument.reference_price);
@@ -718,16 +813,32 @@ impl Exchange {
             return Ok(reject(self, rejection.to_string()));
         }
 
+        let immediate = if tif == TimeInForce::Fok {
+            TimeInForce::Fok
+        } else {
+            TimeInForce::Ioc
+        };
         let (price, tif) = match (kind, side) {
             (OrderKind::Limit(price), _) => (price, tif),
-            (OrderKind::Market, Side::Buy) => (high, TimeInForce::Ioc),
-            (OrderKind::Market, Side::Sell) => (low, TimeInForce::Ioc),
+            (OrderKind::Market, Side::Buy) => (high, immediate),
+            (OrderKind::Market, Side::Sell) => (low, immediate),
         };
-        let tif = if phase.is_call() && tif == TimeInForce::Ioc {
+        let tif = if phase.is_call() && tif.is_immediate() {
             TimeInForce::Day
         } else {
             tif
         };
+        let book = &instrument.book;
+        if options.post_only && !phase.is_call() && book.would_cross(side, price) {
+            return Ok(reject(
+                self,
+                "post-only order would take liquidity".to_string(),
+            ));
+        }
+        if tif == TimeInForce::Fok && book.fillable(side, price, owner_key(member, account)) < qty {
+            return Ok(expire(self, "fill-or-kill could not be filled completely"));
+        }
+        let options = OrderOptions { tif, ..options };
         if let Some(&limit) = self.credit_limits.get(&member) {
             let exposure = self.exposure(member);
             let notional = price.saturating_mul(qty);
@@ -750,7 +861,7 @@ impl Exchange {
             symbol,
             side,
             price,
-            tif,
+            options,
             qty,
             now,
         ))
@@ -765,11 +876,15 @@ impl Exchange {
         symbol: Symbol,
         side: Side,
         price: Price,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
         now: Timestamp,
     ) -> Vec<Event> {
+        let tif = options.tif;
         let order_id = self.next_order_id;
+        if let TimeInForce::Gtd(at) = tif {
+            self.gtd.insert((at, order_id));
+        }
         self.next_order_id += 1;
         *self.open_notional.entry(member).or_default() += price.saturating_mul(qty);
         self.orders.insert(
@@ -795,20 +910,14 @@ impl Exchange {
         let Some(instrument) = self.instruments.get_mut(&symbol) else {
             return events;
         };
-        let order = Order {
-            id: order_id,
-            account: owner_key(member, account),
-            side,
-            price,
-            qty,
-            timestamp: now,
-        };
+        let order = Order::new(order_id, owner_key(member, account), side, price, qty, now)
+            .with_display(options.display_qty);
         if calling {
             instrument.book.rest(order);
             events.push(Event::BookChanged(symbol));
             return events;
         }
-        let execution = instrument.book.submit(order, tif);
+        let execution = instrument.book.submit(order, &options);
 
         for trade in &execution.trades {
             self.fill(symbol, trade, now, &mut events);
@@ -819,6 +928,14 @@ impl Exchange {
                 OrderStatus::Cancelled,
                 now,
                 "self-trade prevention",
+            ));
+        }
+        if execution.incoming_cancelled {
+            events.extend(self.close(
+                order_id,
+                OrderStatus::Cancelled,
+                now,
+                "self-trade prevention (incoming)",
             ));
         }
         if execution.expired > 0 {
@@ -1069,7 +1186,7 @@ mod tests {
                 symbol: sym("ACME"),
                 side,
                 kind: OrderKind::Limit(price),
-                tif: TimeInForce::Gtc,
+                options: OrderOptions::tif(TimeInForce::Gtc),
                 qty,
             },
             1,
@@ -1191,7 +1308,7 @@ mod tests {
                     symbol: sym("ACME"),
                     side: Side::Buy,
                     kind: OrderKind::Limit(25_00),
-                    tif: TimeInForce::Gtc,
+                    options: OrderOptions::tif(TimeInForce::Gtc),
                     qty: 10,
                 },
                 1,
@@ -1221,7 +1338,7 @@ mod tests {
                     symbol: sym("ACME"),
                     side: Side::Buy,
                     kind: OrderKind::Market,
-                    tif: TimeInForce::Ioc,
+                    options: OrderOptions::tif(TimeInForce::Ioc),
                     qty: 1,
                 },
                 2
@@ -1295,7 +1412,7 @@ mod tests {
                 symbol: sym("ACME"),
                 side,
                 kind,
-                tif,
+                options: OrderOptions::tif(tif),
                 qty,
             },
             10,
@@ -1445,6 +1562,200 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn order_with(
+        m: &mut Market,
+        member: MemberId,
+        account: AccountId,
+        side: Side,
+        price: Price,
+        options: OrderOptions,
+        qty: Qty,
+        now: Timestamp,
+    ) -> Vec<Event> {
+        m.ex.execute(
+            &Command::NewOrder {
+                member,
+                member_order_id: 9,
+                account,
+                symbol: sym("ACME"),
+                side,
+                kind: OrderKind::Limit(price),
+                options,
+                qty,
+            },
+            now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fill_or_kill_fills_completely_or_leaves_the_book_untouched() {
+        let mut m = market();
+        let lp = m.lp;
+        let fok = OrderOptions::tif(TimeInForce::Fok);
+        let events = order_with(&mut m, lp, 4, Side::Buy, 25_00, fok, 2_000, 1);
+        let r = &reports_for(&events, lp)[0];
+        assert_eq!(r.status, OrderStatus::Expired);
+        assert!(r.reason.contains("fill-or-kill"));
+        assert!(!events.iter().any(|e| matches!(e, Event::Trade(_))));
+        assert_eq!(
+            m.ex.instrument(sym("ACME"))
+                .unwrap()
+                .book
+                .depth(Side::Sell, 1)[0]
+                .qty,
+            1_000
+        );
+
+        let events = order_with(&mut m, lp, 4, Side::Buy, 25_00, fok, 1_000, 1);
+        assert!(
+            reports_for(&events, lp)
+                .iter()
+                .any(|r| r.status == OrderStatus::Filled)
+        );
+    }
+
+    #[test]
+    fn post_only_orders_never_take_liquidity() {
+        let mut m = market();
+        let lp = m.lp;
+        let post = OrderOptions {
+            post_only: true,
+            ..OrderOptions::default()
+        };
+        let events = order_with(&mut m, lp, 4, Side::Buy, 25_00, post, 10, 1);
+        assert!(reports_for(&events, lp)[0].reason.contains("post-only"));
+        let events = order_with(&mut m, lp, 4, Side::Buy, 24_99, post, 10, 1);
+        assert_eq!(reports_for(&events, lp)[0].status, OrderStatus::New);
+        let bad = OrderOptions {
+            post_only: true,
+            ..OrderOptions::tif(TimeInForce::Ioc)
+        };
+        assert!(
+            reports_for(&order_with(&mut m, lp, 4, Side::Buy, 24_00, bad, 1, 1), lp)[0]
+                .reason
+                .contains("resting limit")
+        );
+    }
+
+    #[test]
+    fn iceberg_hides_its_reserve_in_published_depth() {
+        let mut m = market();
+        let lp = m.lp;
+        let iceberg = OrderOptions {
+            display_qty: Some(50),
+            ..OrderOptions::default()
+        };
+        order_with(&mut m, lp, 4, Side::Buy, 24_00, iceberg, 500, 1);
+        assert_eq!(
+            m.ex.instrument(sym("ACME"))
+                .unwrap()
+                .book
+                .depth(Side::Buy, 1)[0]
+                .qty,
+            50
+        );
+        let too_big = OrderOptions {
+            display_qty: Some(500),
+            ..OrderOptions::default()
+        };
+        assert!(
+            reports_for(
+                &order_with(&mut m, lp, 4, Side::Buy, 24_00, too_big, 500, 1),
+                lp
+            )[0]
+            .reason
+            .contains("display quantity")
+        );
+    }
+
+    #[test]
+    fn good_till_date_orders_expire_through_a_journaled_command() {
+        let mut m = market();
+        let lp = m.lp;
+        let past = OrderOptions::tif(TimeInForce::Gtd(5));
+        assert!(
+            reports_for(
+                &order_with(&mut m, lp, 4, Side::Buy, 24_00, past, 1, 10),
+                lp
+            )[0]
+            .reason
+            .contains("future")
+        );
+        let gtd = OrderOptions::tif(TimeInForce::Gtd(1_000));
+        let id =
+            reports_for(&order_with(&mut m, lp, 4, Side::Buy, 24_00, gtd, 1, 10), lp)[0].order_id;
+        assert!(m.ex.due_commands(999).is_empty());
+        let due = m.ex.due_commands(1_000);
+        assert_eq!(due, vec![Command::ExpireGtd { at: 1_000 }]);
+        let events = m.ex.execute(&due[0], 1_000).unwrap();
+        assert!(
+            reports_for(&events, lp)
+                .iter()
+                .any(|r| r.order_id == id && r.status == OrderStatus::Expired)
+        );
+        assert!(m.ex.due_commands(5_000).is_empty());
+    }
+
+    #[test]
+    fn auction_only_orders_live_for_one_auction() {
+        let mut m = market();
+        let lp = m.lp;
+        let auction = OrderOptions::tif(TimeInForce::Auction);
+        assert!(
+            reports_for(
+                &order_with(&mut m, lp, 4, Side::Buy, 24_00, auction, 1, 1),
+                lp
+            )[0]
+            .reason
+            .contains("auction-only")
+        );
+        phase(&mut m, MarketPhase::ClosingAuction);
+        let id = reports_for(
+            &order_with(&mut m, lp, 4, Side::Buy, 24_00, auction, 1, 1),
+            lp,
+        )[0]
+        .order_id;
+        let events = phase(&mut m, MarketPhase::Closed);
+        assert!(
+            reports_for(&events, lp)
+                .iter()
+                .any(|r| r.order_id == id && r.reason == "auction ended")
+        );
+        let fok = OrderOptions::tif(TimeInForce::Fok);
+        phase(&mut m, MarketPhase::PreOpen);
+        assert!(
+            reports_for(&order_with(&mut m, lp, 4, Side::Buy, 24_00, fok, 1, 1), lp)[0]
+                .reason
+                .contains("FOK")
+        );
+    }
+
+    #[test]
+    fn stp_cancel_incoming_keeps_the_resting_order() {
+        let mut m = market();
+        let lp = m.lp;
+        let resting = reports_for(&order(&mut m, lp, 4, Side::Sell, 24_90, 5), lp)[0].order_id;
+        let incoming = OrderOptions {
+            stp: ome_core::types::StpMode::CancelIncoming,
+            ..OrderOptions::default()
+        };
+        let events = order_with(&mut m, lp, 4, Side::Buy, 24_90, incoming, 5, 1);
+        assert!(
+            reports_for(&events, lp)
+                .iter()
+                .any(|r| r.status == OrderStatus::Cancelled && r.reason.contains("incoming"))
+        );
+        assert!(
+            m.ex.instrument(sym("ACME"))
+                .unwrap()
+                .book
+                .get(resting)
+                .is_some()
+        );
+    }
+
     #[test]
     fn sequence_numbers_are_per_member_and_gapless() {
         let mut m = market();
@@ -1542,7 +1853,7 @@ mod tests {
                 symbol: sym("ACME"),
                 side: Side::Buy,
                 kind: OrderKind::Market,
-                tif: TimeInForce::Ioc,
+                options: OrderOptions::tif(TimeInForce::Ioc),
                 qty: 1,
             },
             0,
@@ -1589,7 +1900,7 @@ mod tests {
                     symbol: sym("ACME"),
                     side: Side::Buy,
                     kind: OrderKind::Limit(25_00),
-                    tif: TimeInForce::Ioc,
+                    options: OrderOptions::tif(TimeInForce::Ioc),
                     qty: 2_000,
                 },
                 1,

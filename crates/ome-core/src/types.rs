@@ -31,6 +31,59 @@ pub enum TimeInForce {
     Gtc,
     Ioc,
     Day,
+    Fok,
+    Gtd(Timestamp),
+    Auction,
+}
+
+impl TimeInForce {
+    pub fn is_immediate(self) -> bool {
+        matches!(self, TimeInForce::Ioc | TimeInForce::Fok)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeInForce::Gtc => "gtc",
+            TimeInForce::Ioc => "ioc",
+            TimeInForce::Day => "day",
+            TimeInForce::Fok => "fok",
+            TimeInForce::Gtd(_) => "gtd",
+            TimeInForce::Auction => "auction",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StpMode {
+    #[default]
+    CancelResting,
+    CancelIncoming,
+    CancelBoth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderOptions {
+    pub tif: TimeInForce,
+    pub post_only: bool,
+    pub display_qty: Option<Qty>,
+    pub stp: StpMode,
+}
+
+impl Default for OrderOptions {
+    fn default() -> Self {
+        Self::tif(TimeInForce::Gtc)
+    }
+}
+
+impl OrderOptions {
+    pub fn tif(tif: TimeInForce) -> Self {
+        Self {
+            tif,
+            post_only: false,
+            display_qty: None,
+            stp: StpMode::CancelResting,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +101,40 @@ pub struct Order {
     pub price: Price,
     pub qty: Qty,
     pub timestamp: Timestamp,
+    pub display: Option<Qty>,
+    pub visible: Qty,
+}
+
+impl Order {
+    pub fn new(
+        id: OrderId,
+        account: AccountId,
+        side: Side,
+        price: Price,
+        qty: Qty,
+        timestamp: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            account,
+            side,
+            price,
+            qty,
+            timestamp,
+            display: None,
+            visible: qty,
+        }
+    }
+
+    pub fn with_display(mut self, display: Option<Qty>) -> Self {
+        self.display = display.filter(|d| *d > 0 && *d < self.qty);
+        self.refill();
+        self
+    }
+
+    pub fn refill(&mut self) {
+        self.visible = self.display.map_or(self.qty, |d| d.min(self.qty));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -6,7 +6,7 @@ use ome_core::price::Price;
 use ome_core::risk::RiskContext;
 use ome_core::symbol::Symbol;
 use ome_core::types::{
-    AccountId, OrderId, OrderKind, OrderRequest, Qty, Side, TimeInForce, Timestamp,
+    AccountId, OrderId, OrderKind, OrderOptions, OrderRequest, Qty, Side, TimeInForce, Timestamp,
 };
 use ome_net::auth::SecretHash;
 use ome_protocol::{
@@ -38,7 +38,7 @@ pub enum Fact {
         symbol: Symbol,
         side: Side,
         price: Price,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
         reserved: u64,
         fee_reserve: u64,
@@ -210,7 +210,7 @@ impl Broker {
         symbol: Symbol,
         side: Side,
         kind: OrderKind,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
         market: &MarketCache,
         now: Timestamp,
@@ -248,11 +248,16 @@ impl Broker {
         if market.phase() == MarketPhase::Closed {
             return Err(reject("market is closed".to_string()));
         }
-        if market.phase().is_call() && tif == TimeInForce::Ioc && kind != OrderKind::Market {
+        let tif = options.tif;
+        if market.phase().is_call() && tif.is_immediate() && kind != OrderKind::Market {
             return Err(reject(format!(
-                "IOC orders are not accepted during the {}",
+                "{} orders are not accepted during the {}",
+                tif.label().to_uppercase(),
                 market.phase().label()
             )));
+        }
+        if let Err(reason) = Profile::permits(holder.role, kind, &options) {
+            return Err(reject(reason));
         }
         if !market.is_trading(symbol) {
             return Err(reject(format!(
@@ -280,9 +285,13 @@ impl Broker {
                 )));
             }
             (OrderKind::Limit(p), _) => (p, tif),
+            (OrderKind::Market, _) if tif == TimeInForce::Fok => {
+                (if side == Side::Buy { high } else { low }, tif)
+            }
             (OrderKind::Market, Side::Buy) => (high, TimeInForce::Ioc),
             (OrderKind::Market, Side::Sell) => (low, TimeInForce::Ioc),
         };
+        let options = OrderOptions { tif, ..options };
         let fee_reserve = self.fees.reserve(holder.role, side, price, qty);
         let reserved = match side {
             Side::Buy => {
@@ -314,7 +323,7 @@ impl Broker {
             symbol,
             side,
             price,
-            tif,
+            options,
             qty,
             reserved,
             fee_reserve,
@@ -376,7 +385,7 @@ impl Broker {
                 symbol,
                 side,
                 price,
-                tif,
+                options,
                 qty,
                 reserved,
                 fee_reserve,
@@ -416,7 +425,7 @@ impl Broker {
                         symbol: *symbol,
                         side: *side,
                         kind: OrderKind::Limit(*price),
-                        tif: *tif,
+                        options: *options,
                         qty: *qty,
                     }),
                 ]
@@ -840,7 +849,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Market,
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 10,
                 &market(),
                 0,
@@ -856,7 +865,10 @@ pub mod tests {
             e,
             Effect::ToExchange(MemberMessage::NewOrder {
                 kind: OrderKind::Limit(27_50),
-                tif: TimeInForce::Ioc,
+                options: OrderOptions {
+                    tif: TimeInForce::Ioc,
+                    ..
+                },
                 member_order_id: 1,
                 ..
             })
@@ -875,7 +887,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(26_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 10,
                 &market(),
                 0,
@@ -927,7 +939,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 10,
                 &m,
                 0
@@ -941,7 +953,7 @@ pub mod tests {
                 sym(),
                 Side::Sell,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 1,
                 &m,
                 0
@@ -955,7 +967,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(99_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 1,
                 &m,
                 0
@@ -969,7 +981,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 5_000,
                 &m,
                 0
@@ -1060,7 +1072,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 10,
                 &market(),
                 0,
@@ -1087,7 +1099,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 10,
                 &market(),
                 0,
@@ -1146,7 +1158,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_50),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 20,
                 &market(),
                 0,
@@ -1160,7 +1172,7 @@ pub mod tests {
                 sym(),
                 Side::Sell,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 20,
                 &market(),
                 0,
@@ -1233,7 +1245,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 1_000,
                 &market(),
                 0,
@@ -1275,7 +1287,7 @@ pub mod tests {
             sym(),
             Side::Buy,
             OrderKind::Limit(27_00),
-            TimeInForce::Gtc,
+            OrderOptions::default(),
             1_000,
             &market(),
             0,
@@ -1294,7 +1306,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
-                TimeInForce::Gtc,
+                OrderOptions::default(),
                 10,
                 &market(),
                 0,
@@ -1367,7 +1379,7 @@ pub mod tests {
             sym(),
             Side::Buy,
             OrderKind::Limit(25_00),
-            TimeInForce::Day,
+            OrderOptions::tif(TimeInForce::Day),
             1,
             &m,
             0,
@@ -1381,7 +1393,7 @@ pub mod tests {
             sym(),
             Side::Buy,
             OrderKind::Limit(25_00),
-            TimeInForce::Ioc,
+            OrderOptions::tif(TimeInForce::Ioc),
             1,
             &m,
             0,
@@ -1394,7 +1406,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
-                TimeInForce::Day,
+                OrderOptions::tif(TimeInForce::Day),
                 1,
                 &m,
                 0,
@@ -1404,7 +1416,10 @@ pub mod tests {
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::ToExchange(MemberMessage::NewOrder {
-                tif: TimeInForce::Day,
+                options: OrderOptions {
+                    tif: TimeInForce::Day,
+                    ..
+                },
                 ..
             })
         )));

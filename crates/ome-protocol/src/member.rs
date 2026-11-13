@@ -3,7 +3,7 @@ use crate::template::*;
 use crate::types::*;
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
-use ome_core::types::{AccountId, OrderId, OrderKind, Qty, Side, TimeInForce};
+use ome_core::types::{AccountId, OrderId, OrderKind, OrderOptions, Qty, Side};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberMessage {
@@ -19,7 +19,7 @@ pub enum MemberMessage {
         symbol: Symbol,
         side: Side,
         kind: OrderKind,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
     },
     Cancel {
@@ -131,7 +131,7 @@ impl MemberMessage {
                 symbol,
                 side,
                 kind,
-                tif,
+                options,
                 qty,
             } => {
                 e.u64(*member_order_id)
@@ -139,7 +139,8 @@ impl MemberMessage {
                     .symbol(Some(*symbol))
                     .u8(side_to_u8(*side));
                 put_order_kind(&mut e, *kind);
-                e.u8(tif_to_u8(*tif)).u64(*qty).end_block();
+                put_order_options(&mut e, options);
+                e.u64(*qty).end_block();
             }
             MemberMessage::Cancel { order_id } => {
                 e.u64(*order_id).end_block();
@@ -273,7 +274,7 @@ impl MemberMessage {
                 let symbol = d.symbol()?;
                 let side = side_from_u8(d.u8()?)?;
                 let kind = get_order_kind(&mut d)?;
-                let tif = tif_from_u8(d.u8()?)?;
+                let options = get_order_options(&mut d)?;
                 let qty = d.u64()?;
                 d.end_block()?;
                 MemberMessage::NewOrder {
@@ -282,7 +283,7 @@ impl MemberMessage {
                     symbol,
                     side,
                     kind,
-                    tif,
+                    options,
                     qty,
                 }
             }
@@ -355,6 +356,7 @@ impl MemberMessage {
 pub mod tests {
     use super::*;
     use crate::client::tests::sym;
+    use ome_core::types::TimeInForce;
 
     pub fn samples() -> Vec<MemberMessage> {
         vec![
@@ -370,7 +372,7 @@ pub mod tests {
                 symbol: sym("ACME"),
                 side: Side::Buy,
                 kind: OrderKind::Limit(2_510),
-                tif: TimeInForce::Ioc,
+                options: OrderOptions::tif(TimeInForce::Ioc),
                 qty: 5,
             },
             MemberMessage::NewOrder {
@@ -379,7 +381,7 @@ pub mod tests {
                 symbol: sym("ACME"),
                 side: Side::Sell,
                 kind: OrderKind::Market,
-                tif: TimeInForce::Gtc,
+                options: OrderOptions::tif(TimeInForce::Gtc),
                 qty: 5,
             },
             MemberMessage::Cancel { order_id: 3 },

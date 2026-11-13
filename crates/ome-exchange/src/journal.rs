@@ -2,8 +2,8 @@ use crate::exchange::Command;
 use crate::session::Schedule;
 use ome_core::types::Timestamp;
 use ome_protocol::{
-    DecodeError, Decoder, Encoder, get_order_kind, member_kind_from, phase_from, put_order_kind,
-    side_from_u8, side_to_u8, tif_from_u8, tif_to_u8,
+    DecodeError, Decoder, Encoder, get_order_kind, get_order_options, member_kind_from, phase_from,
+    put_order_kind, put_order_options, side_from_u8, side_to_u8,
 };
 use ome_store::Entry;
 
@@ -20,6 +20,7 @@ mod template {
     pub const SET_CREDIT_LIMIT: u16 = 209;
     pub const SET_PHASE: u16 = 210;
     pub const SET_SCHEDULE: u16 = 211;
+    pub const EXPIRE_GTD: u16 = 212;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,7 @@ impl Entry for Record {
             Command::SetCreditLimit { .. } => template::SET_CREDIT_LIMIT,
             Command::SetPhase { .. } => template::SET_PHASE,
             Command::SetSchedule { .. } => template::SET_SCHEDULE,
+            Command::ExpireGtd { .. } => template::EXPIRE_GTD,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -79,7 +81,7 @@ impl Entry for Record {
                 symbol,
                 side,
                 kind,
-                tif,
+                options,
                 qty,
             } => {
                 e.u64(*member)
@@ -88,7 +90,8 @@ impl Entry for Record {
                     .symbol(Some(*symbol))
                     .u8(side_to_u8(*side));
                 put_order_kind(&mut e, *kind);
-                e.u8(tif_to_u8(*tif)).u64(*qty).end_block();
+                put_order_options(&mut e, options);
+                e.u64(*qty).end_block();
             }
             Command::Cancel { member, order_id } => {
                 e.u64(*member).u64(*order_id).end_block();
@@ -108,6 +111,9 @@ impl Entry for Record {
             }
             Command::SetCreditLimit { member, limit } => {
                 e.u64(*member).u64(*limit).end_block();
+            }
+            Command::ExpireGtd { at } => {
+                e.u64(*at).end_block();
             }
             Command::SetPhase { phase } => {
                 e.u8(*phase as u8).end_block();
@@ -180,7 +186,7 @@ impl Entry for Record {
                 let symbol = d.symbol()?;
                 let side = side_from_u8(d.u8()?)?;
                 let kind = get_order_kind(&mut d)?;
-                let tif = tif_from_u8(d.u8()?)?;
+                let options = get_order_options(&mut d)?;
                 let qty = d.u64()?;
                 d.end_block()?;
                 Command::NewOrder {
@@ -190,7 +196,7 @@ impl Entry for Record {
                     symbol,
                     side,
                     kind,
-                    tif,
+                    options,
                     qty,
                 }
             }
@@ -227,6 +233,11 @@ impl Entry for Record {
                 d.end_block()?;
                 Command::SetCreditLimit { member, limit }
             }
+            template::EXPIRE_GTD => {
+                let at = d.u64()?;
+                d.end_block()?;
+                Command::ExpireGtd { at }
+            }
             template::SET_PHASE => {
                 let phase = phase_from(d.u8()?)?;
                 d.end_block()?;
@@ -256,7 +267,7 @@ mod tests {
     use super::*;
     use crate::exchange::{Exchange, ExchangeConfig};
     use ome_core::symbol::Symbol;
-    use ome_core::types::{OrderKind, Side, TimeInForce};
+    use ome_core::types::{OrderKind, OrderOptions, Side, TimeInForce};
     use ome_net::auth::hash_secret;
     use ome_protocol::MemberKind;
     use ome_store::Journal;
@@ -304,10 +315,15 @@ mod tests {
                 } else {
                     OrderKind::Limit(24_00 + (i * 7) % 150)
                 },
-                tif: if i % 4 == 0 {
-                    TimeInForce::Ioc
+                options: if i % 4 == 0 {
+                    OrderOptions::tif(TimeInForce::Ioc)
+                } else if i % 7 == 0 {
+                    OrderOptions {
+                        display_qty: Some(1),
+                        ..OrderOptions::tif(TimeInForce::Gtd(1_000_000))
+                    }
                 } else {
-                    TimeInForce::Gtc
+                    OrderOptions::tif(TimeInForce::Gtc)
                 },
                 qty: 1 + i % 9,
             });
@@ -345,6 +361,7 @@ mod tests {
             phase: ome_protocol::MarketPhase::Open,
         });
         commands.push(Command::SetSchedule { schedule: None });
+        commands.push(Command::ExpireGtd { at: 2_000_000 });
         commands.push(Command::OpenCycle { cycle: 1 });
         commands.push(Command::SetCreditLimit {
             member: 2,

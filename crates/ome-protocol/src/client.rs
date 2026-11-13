@@ -2,7 +2,7 @@ use crate::codec::{DecodeError, Decoder, Encoder};
 use crate::template::*;
 use crate::types::*;
 use ome_core::symbol::Symbol;
-use ome_core::types::{AccountId, OrderId, OrderKind, Qty, Side, TimeInForce};
+use ome_core::types::{AccountId, OrderId, OrderKind, OrderOptions, Qty, Side};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
@@ -16,7 +16,7 @@ pub enum ClientMessage {
         symbol: Symbol,
         side: Side,
         kind: OrderKind,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
     },
     Cancel {
@@ -85,14 +85,16 @@ impl ClientMessage {
                 symbol,
                 side,
                 kind,
-                tif,
+                options,
                 qty,
             } => {
                 e.u64(*client_order_id)
                     .symbol(Some(*symbol))
                     .u8(side_to_u8(*side));
                 put_order_kind(&mut e, *kind);
-                e.u64(*qty).u8(tif_to_u8(*tif)).end_block();
+                e.u64(*qty);
+                put_order_options(&mut e, options);
+                e.end_block();
             }
             ClientMessage::Cancel { order_id } => {
                 e.u64(*order_id).end_block();
@@ -165,14 +167,14 @@ impl ClientMessage {
                 let side = side_from_u8(d.u8()?)?;
                 let kind = get_order_kind(&mut d)?;
                 let qty = d.u64()?;
-                let tif = tif_from_u8(d.u8()?)?;
+                let options = get_order_options(&mut d)?;
                 d.end_block()?;
                 ClientMessage::NewOrder {
                     client_order_id,
                     symbol,
                     side,
                     kind,
-                    tif,
+                    options,
                     qty,
                 }
             }
@@ -227,6 +229,7 @@ impl ClientMessage {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use ome_core::types::TimeInForce;
 
     pub fn sym(s: &str) -> Symbol {
         Symbol::parse(s).unwrap()
@@ -244,7 +247,12 @@ pub mod tests {
                 symbol: sym("ACME"),
                 side: Side::Buy,
                 kind: OrderKind::Limit(2_500),
-                tif: TimeInForce::Day,
+                options: OrderOptions {
+                    tif: TimeInForce::Gtd(1_700_000_000_000),
+                    post_only: true,
+                    display_qty: Some(2),
+                    stp: ome_core::types::StpMode::CancelBoth,
+                },
                 qty: 10,
             },
             ClientMessage::NewOrder {
@@ -252,7 +260,7 @@ pub mod tests {
                 symbol: sym("ACME"),
                 side: Side::Sell,
                 kind: OrderKind::Market,
-                tif: TimeInForce::Ioc,
+                options: OrderOptions::tif(TimeInForce::Ioc),
                 qty: 3,
             },
             ClientMessage::Cancel { order_id: 77 },
@@ -302,7 +310,7 @@ pub mod tests {
     #[test]
     fn new_order_has_fixed_compact_layout() {
         let bytes = samples()[2].encode();
-        assert_eq!(bytes.len(), 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1);
+        assert_eq!(bytes.len(), 8 + 8 + 8 + 1 + 1 + 8 + 8 + 19);
         assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), NEW_ORDER);
     }
 

@@ -144,6 +144,28 @@ ome broker --addr 127.0.0.1:7101 fees        # broker admin: revenue and taxes c
 ome exchange members                         # net exchange fees per member
 ```
 
+## Order Types
+
+All order types below are matched natively by the exchange; brokers decide which account types may use them.
+
+| Option | Meaning | Who may use it |
+|---|---|---|
+| `gtc` | good till cancelled (default for limits) | everyone |
+| `day` | expires at the close | everyone except issuers |
+| `ioc` | fill what you can now, cancel the rest (default for market orders) | everyone except issuers |
+| `fok` | fill completely now or not at all; the book is untouched if it can't | everyone except issuers |
+| `gtd:<seconds>` | good till a date; expired by a journaled exchange command | everyone except issuers |
+| `auction` | only for the current auction (pre-open or closing), then expires | everyone except issuers |
+| `post` | post-only: rejected if it would take liquidity | quant, prop, HFT, LP desks |
+| `show:<qty>` | iceberg: shows `<qty>`; each refill goes to the back of the queue; hidden quantity is not in published depth but does join auctions | quant, prop, HFT, LP desks |
+| `stp:keep\|new\|both` | self-trade prevention: cancel the resting order (default), the incoming order, or both | quant, prop, HFT, LP desks |
+
+```bash
+ome broker --addr 127.0.0.1:7102 --user fund --secret fund-pw buy ACME 24.00 2000 show:50
+ome broker --addr 127.0.0.1:7102 --user fund --secret fund-pw buy ACME 26.50 5 post
+# rejected: post-only order would take liquidity
+```
+
 ## Market Sessions and Auctions
 
 The exchange runs a trading day in four phases, either manually or on a repeating schedule set by exchange operations:
@@ -222,17 +244,20 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 129 tests
+cargo test --workspace     # 139 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1e** PostgreSQL (accounts, trades, settlements) and Redis (market data)
-- **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts
+- **1e-ii** member controls: kill switch, cancel-on-disconnect, message throttling, bulk two-sided quotes with market-maker protection
+- **1f** broker-held orders (stop, trailing stop, OCO, bracket, GTT) and institutional algorithms (TWAP, VWAP, POV)
+- **1g** off-exchange execution: broker internalization, wholesaler with payment for order flow, dark pool
+- **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)
+- **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane
 - **3** local-LLM newsroom: company reports, IPO prospectuses, news and macro events
-- **4** GPUI desktop app (the terminal UI was retired in this release)
+- **4** GPUI desktop apps, one per party (the terminal UI was retired)
 
 ## License
 

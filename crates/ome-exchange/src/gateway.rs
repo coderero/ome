@@ -276,7 +276,7 @@ impl Gateway {
                 symbol,
                 side,
                 kind,
-                tif,
+                options,
                 qty,
             } if trader => Command::NewOrder {
                 member,
@@ -285,7 +285,7 @@ impl Gateway {
                 symbol,
                 side,
                 kind,
-                tif,
+                options,
                 qty,
             },
             MemberMessage::Cancel { order_id } if trader => Command::Cancel { member, order_id },
@@ -619,7 +619,7 @@ fn describe_admin_action(command: &Command, events: &[Event]) -> Option<String> 
 mod tests {
     use super::*;
     use crate::exchange::ExchangeConfig;
-    use ome_core::types::{OrderKind, TimeInForce};
+    use ome_core::types::{OrderKind, OrderOptions, TimeInForce};
     use ome_protocol::OrderStatus;
     use std::sync::Mutex;
 
@@ -773,7 +773,7 @@ mod tests {
                 symbol: sym("ACME"),
                 side: Side::Buy,
                 kind: OrderKind::Market,
-                tif: TimeInForce::Ioc,
+                options: OrderOptions::tif(TimeInForce::Ioc),
                 qty: 1,
             },
         );
@@ -807,7 +807,7 @@ mod tests {
                 symbol: sym("ACME"),
                 side: Side::Buy,
                 kind: OrderKind::Limit(10_00),
-                tif: TimeInForce::Gtc,
+                options: OrderOptions::tif(TimeInForce::Gtc),
                 qty: 5,
             },
         );

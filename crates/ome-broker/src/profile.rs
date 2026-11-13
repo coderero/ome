@@ -1,5 +1,5 @@
 use ome_core::risk::{MaxNotional, MaxQuantity, PositiveQuantity, RiskEngine};
-use ome_core::types::Qty;
+use ome_core::types::{OrderKind, OrderOptions, Qty, StpMode, TimeInForce};
 use ome_protocol::Role;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +71,34 @@ impl Profile {
         }
     }
 
+    pub fn permits(role: Role, kind: OrderKind, options: &OrderOptions) -> Result<(), String> {
+        let advanced = options.post_only
+            || options.display_qty.is_some()
+            || options.stp != StpMode::CancelResting;
+        let allowed = match role {
+            Role::BrokerAdmin => false,
+            Role::Issuer => {
+                kind != OrderKind::Market && options.tif == TimeInForce::Gtc && !advanced
+            }
+            Role::Retail => !advanced,
+            Role::Quant | Role::Prop | Role::Hft | Role::LpDesk => true,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} accounts may not use {} orders{}",
+                role.label(),
+                options.tif.label(),
+                if advanced {
+                    " with post-only, iceberg or self-trade options"
+                } else {
+                    ""
+                }
+            ))
+        }
+    }
+
     pub fn risk(role: Role) -> RiskEngine {
         let limits = Self::limits(role);
         RiskEngine::new()
@@ -92,5 +120,21 @@ mod tests {
         assert!(Profile::new(ProfileKind::Prime).allows(Role::Quant));
         assert!(Profile::new(ProfileKind::Lp).allows(Role::LpDesk));
         assert!(Profile::new(ProfileKind::Lp).allows(Role::BrokerAdmin));
+    }
+
+    #[test]
+    fn advanced_order_features_follow_the_participant_matrix() {
+        let iceberg = OrderOptions {
+            display_qty: Some(10),
+            ..OrderOptions::default()
+        };
+        let fok = OrderOptions::tif(TimeInForce::Fok);
+        assert!(Profile::permits(Role::Retail, OrderKind::Limit(1), &fok).is_ok());
+        assert!(Profile::permits(Role::Retail, OrderKind::Limit(1), &iceberg).is_err());
+        assert!(Profile::permits(Role::Quant, OrderKind::Limit(1), &iceberg).is_ok());
+        assert!(Profile::permits(Role::Issuer, OrderKind::Limit(1), &fok).is_err());
+        assert!(
+            Profile::permits(Role::Issuer, OrderKind::Limit(1), &OrderOptions::default()).is_ok()
+        );
     }
 }

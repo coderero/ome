@@ -3,7 +3,10 @@ use ome_core::candles::Candle;
 use ome_core::order_book::Level;
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
-use ome_core::types::{AccountId, Balance, OrderId, OrderKind, Qty, Side, TimeInForce, Timestamp};
+use ome_core::types::{
+    AccountId, Balance, OrderId, OrderKind, OrderOptions, Qty, Side, StpMode, TimeInForce,
+    Timestamp,
+};
 
 pub type MemberId = u64;
 
@@ -466,21 +469,53 @@ pub fn get_order_kind(d: &mut Decoder) -> Result<OrderKind, DecodeError> {
     }
 }
 
-pub fn tif_to_u8(tif: TimeInForce) -> u8 {
-    match tif {
-        TimeInForce::Gtc => 1,
-        TimeInForce::Ioc => 2,
-        TimeInForce::Day => 3,
-    }
+pub fn put_order_options(e: &mut Encoder, options: &OrderOptions) {
+    let (code, expire_at) = match options.tif {
+        TimeInForce::Gtc => (1, 0),
+        TimeInForce::Ioc => (2, 0),
+        TimeInForce::Day => (3, 0),
+        TimeInForce::Fok => (4, 0),
+        TimeInForce::Gtd(at) => (5, at),
+        TimeInForce::Auction => (6, 0),
+    };
+    let stp = match options.stp {
+        StpMode::CancelResting => 1,
+        StpMode::CancelIncoming => 2,
+        StpMode::CancelBoth => 3,
+    };
+    e.u8(code)
+        .u64(expire_at)
+        .u8(options.post_only as u8)
+        .u64(options.display_qty.unwrap_or(0))
+        .u8(stp);
 }
 
-pub fn tif_from_u8(v: u8) -> Result<TimeInForce, DecodeError> {
-    match v {
-        1 => Ok(TimeInForce::Gtc),
-        2 => Ok(TimeInForce::Ioc),
-        3 => Ok(TimeInForce::Day),
-        _ => Err(DecodeError::Invalid("time in force")),
-    }
+pub fn get_order_options(d: &mut Decoder) -> Result<OrderOptions, DecodeError> {
+    let code = d.u8()?;
+    let expire_at = d.u64()?;
+    let tif = match code {
+        1 => TimeInForce::Gtc,
+        2 => TimeInForce::Ioc,
+        3 => TimeInForce::Day,
+        4 => TimeInForce::Fok,
+        5 => TimeInForce::Gtd(expire_at),
+        6 => TimeInForce::Auction,
+        _ => return Err(DecodeError::Invalid("time in force")),
+    };
+    let post_only = d.u8()? != 0;
+    let display_qty = Some(d.u64()?).filter(|&q| q > 0);
+    let stp = match d.u8()? {
+        1 => StpMode::CancelResting,
+        2 => StpMode::CancelIncoming,
+        3 => StpMode::CancelBoth,
+        _ => return Err(DecodeError::Invalid("self-trade prevention mode")),
+    };
+    Ok(OrderOptions {
+        tif,
+        post_only,
+        display_qty,
+        stp,
+    })
 }
 
 pub fn role_from(v: u8) -> Result<Role, DecodeError> {

@@ -1,7 +1,7 @@
 pub mod upstream;
 
 use ome_core::symbol::Symbol;
-use ome_core::types::{AccountId, OrderKind, Qty, Side, TimeInForce};
+use ome_core::types::{AccountId, OrderKind, OrderOptions, Qty, Side, TimeInForce};
 use ome_protocol::framing::{frame, read_frame};
 use ome_protocol::{ClientMessage, MemberId, MemberKind, MemberMessage, Role, ServerMessage};
 use std::fmt;
@@ -255,7 +255,7 @@ impl Client {
             OrderKind::Limit(_) => TimeInForce::Gtc,
             OrderKind::Market => TimeInForce::Ioc,
         };
-        self.send_order_with(symbol, side, kind, tif, qty)
+        self.send_order_with(symbol, side, kind, OrderOptions::tif(tif), qty)
     }
 
     pub fn send_order_with(
@@ -263,7 +263,7 @@ impl Client {
         symbol: Symbol,
         side: Side,
         kind: OrderKind,
-        tif: TimeInForce,
+        options: OrderOptions,
         qty: Qty,
     ) -> Result<u64, ClientError> {
         self.next_client_order_id += 1;
@@ -273,7 +273,7 @@ impl Client {
             symbol,
             side,
             kind,
-            tif,
+            options,
             qty,
         })?;
         Ok(client_order_id)

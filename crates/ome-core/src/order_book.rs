@@ -1,5 +1,5 @@
 use crate::price::Price;
-use crate::types::{AccountId, Order, OrderId, Qty, Side, TimeInForce, Trade};
+use crate::types::{AccountId, Order, OrderId, OrderOptions, Qty, Side, StpMode, Trade};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub struct Execution {
     pub rested: Qty,
     pub expired: Qty,
     pub self_trade_cancelled: Vec<Order>,
+    pub incoming_cancelled: bool,
 }
 
 #[derive(Default)]
@@ -36,10 +37,10 @@ impl OrderBook {
         Self::default()
     }
 
-    pub fn submit(&mut self, mut incoming: Order, tif: TimeInForce) -> Execution {
+    pub fn submit(&mut self, mut incoming: Order, options: &OrderOptions) -> Execution {
         let mut execution = Execution::default();
 
-        while incoming.qty > 0 {
+        'levels: while incoming.qty > 0 {
             let best_level = match incoming.side {
                 Side::Buy => self.asks.first_entry(),
                 Side::Sell => self.bids.last_entry(),
@@ -64,16 +65,26 @@ impl OrderBook {
                 };
 
                 if resting.account == incoming.account {
-                    if let Some(cancelled) = queue.pop_front() {
+                    if options.stp != StpMode::CancelIncoming
+                        && let Some(cancelled) = queue.pop_front()
+                    {
                         self.index.remove(&cancelled.id);
                         execution.self_trade_cancelled.push(cancelled);
+                    }
+                    if options.stp != StpMode::CancelResting {
+                        execution.incoming_cancelled = true;
+                        if queue.is_empty() {
+                            level.remove();
+                        }
+                        break 'levels;
                     }
                     continue;
                 }
 
-                let qty = incoming.qty.min(resting.qty);
+                let qty = incoming.qty.min(resting.visible);
                 incoming.qty -= qty;
                 resting.qty -= qty;
+                resting.visible -= qty;
 
                 execution.trades.push(Trade {
                     maker_order: resting.id,
@@ -90,6 +101,11 @@ impl OrderBook {
                     let filled_id = resting.id;
                     queue.pop_front();
                     self.index.remove(&filled_id);
+                } else if resting.visible == 0 {
+                    resting.refill();
+                    if let Some(refilled) = queue.pop_front() {
+                        queue.push_back(refilled);
+                    }
                 }
             }
 
@@ -98,21 +114,35 @@ impl OrderBook {
             }
         }
 
-        if incoming.qty > 0 {
-            match tif {
-                TimeInForce::Gtc | TimeInForce::Day => {
-                    execution.rested = incoming.qty;
-                    self.index
-                        .insert(incoming.id, (incoming.side, incoming.price));
-                    self.levels_mut(incoming.side)
-                        .entry(incoming.price)
-                        .or_default()
-                        .push_back(incoming);
-                }
-                TimeInForce::Ioc => execution.expired = incoming.qty,
+        if incoming.qty > 0 && !execution.incoming_cancelled {
+            if options.tif.is_immediate() {
+                execution.expired = incoming.qty;
+            } else {
+                execution.rested = incoming.qty;
+                incoming.refill();
+                self.rest(incoming);
             }
         }
         execution
+    }
+
+    pub fn would_cross(&self, side: Side, price: Price) -> bool {
+        match side {
+            Side::Buy => self.best_ask().is_some_and(|ask| ask <= price),
+            Side::Sell => self.best_bid().is_some_and(|bid| bid >= price),
+        }
+    }
+
+    pub fn fillable(&self, side: Side, price: Price, account: AccountId) -> Qty {
+        let opposite: Box<dyn Iterator<Item = (&Price, &VecDeque<Order>)>> = match side {
+            Side::Buy => Box::new(self.asks.range(..=price)),
+            Side::Sell => Box::new(self.bids.range(price..).rev()),
+        };
+        opposite
+            .flat_map(|(_, queue)| queue.iter())
+            .filter(|o| o.account != account)
+            .map(|o| o.qty)
+            .sum()
     }
 
     pub fn rest(&mut self, order: Order) {
@@ -192,6 +222,8 @@ impl OrderBook {
                 let qty = bid.qty.min(ask.qty);
                 bid.qty -= qty;
                 ask.qty -= qty;
+                bid.refill();
+                ask.refill();
                 let (maker, taker, taker_side) = if bid.id < ask.id {
                     (&*bid, &*ask, Side::Sell)
                 } else {
@@ -264,7 +296,7 @@ impl OrderBook {
     pub fn depth(&self, side: Side, max_levels: usize) -> Vec<Level> {
         let summarize = |(price, queue): (&Price, &VecDeque<Order>)| Level {
             price: *price,
-            qty: queue.iter().map(|o| o.qty).sum(),
+            qty: queue.iter().map(|o| o.visible).sum(),
             orders: queue.len() as u32,
         };
         match side {
@@ -309,19 +341,20 @@ impl OrderBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TimeInForce;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
     fn order_for(account: AccountId, side: Side, price: Price, qty: Qty) -> Order {
-        Order {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        Order::new(
+            NEXT_ID.fetch_add(1, Ordering::Relaxed),
             account,
             side,
             price,
             qty,
-            timestamp: 0,
-        }
+            0,
+        )
     }
 
     fn order(side: Side, price: Price, qty: Qty) -> Order {
@@ -339,7 +372,7 @@ mod tests {
     }
 
     fn gtc(book: &mut OrderBook, order: Order) -> Vec<Trade> {
-        book.submit(order, TimeInForce::Gtc).trades
+        book.submit(order, &OrderOptions::default()).trades
     }
 
     #[test]
@@ -391,7 +424,7 @@ mod tests {
         let mut book = OrderBook::new();
         gtc(&mut book, order(Side::Sell, 10000, 4));
 
-        let execution = book.submit(order(Side::Buy, 10200, 10), TimeInForce::Gtc);
+        let execution = book.submit(order(Side::Buy, 10200, 10), &OrderOptions::default());
 
         assert_eq!(execution.trades.len(), 1);
         assert_eq!(execution.rested, 6);
@@ -432,7 +465,10 @@ mod tests {
         let mut book = OrderBook::new();
         gtc(&mut book, order(Side::Sell, 10000, 3));
 
-        let execution = book.submit(order(Side::Buy, 10000, 5), TimeInForce::Ioc);
+        let execution = book.submit(
+            order(Side::Buy, 10000, 5),
+            &OrderOptions::tif(TimeInForce::Ioc),
+        );
 
         assert_eq!(execution.trades.len(), 1);
         assert_eq!(execution.expired, 2);
@@ -448,7 +484,7 @@ mod tests {
         gtc(&mut book, own);
         gtc(&mut book, order_for(8, Side::Sell, 10000, 5));
 
-        let execution = book.submit(order_for(7, Side::Buy, 10000, 5), TimeInForce::Gtc);
+        let execution = book.submit(order_for(7, Side::Buy, 10000, 5), &OrderOptions::default());
 
         assert_eq!(execution.self_trade_cancelled.len(), 1);
         assert_eq!(execution.self_trade_cancelled[0].id, own_id);
@@ -617,5 +653,79 @@ mod tests {
         assert!(execution.trades.is_empty());
         assert_eq!(execution.self_trade_cancelled[0].id, new);
         assert!(book.get(old).is_some());
+    }
+
+    #[test]
+    fn iceberg_shows_only_its_display_and_refills_at_the_back() {
+        let mut book = OrderBook::new();
+        let iceberg = order_for(2, Side::Sell, 10_000, 100).with_display(Some(10));
+        let iceberg_id = iceberg.id;
+        gtc(&mut book, iceberg);
+        let behind = order_for(3, Side::Sell, 10_000, 5);
+        let behind_id = behind.id;
+        gtc(&mut book, behind);
+        assert_eq!(book.depth(Side::Sell, 1)[0].qty, 15);
+
+        let trades = gtc(&mut book, order_for(1, Side::Buy, 10_000, 12));
+        let makers: Vec<(OrderId, Qty)> = trades.iter().map(|t| (t.maker_order, t.qty)).collect();
+        assert_eq!(makers, vec![(iceberg_id, 10), (behind_id, 2)]);
+        assert_eq!(book.get(iceberg_id).unwrap().qty, 90);
+        assert_eq!(book.get(iceberg_id).unwrap().visible, 10);
+        assert_eq!(book.depth(Side::Sell, 1)[0].qty, 13);
+    }
+
+    #[test]
+    fn stp_modes_choose_which_side_is_cancelled() {
+        let options = |stp| OrderOptions {
+            stp,
+            ..OrderOptions::default()
+        };
+        for (stp, resting_survives, incoming_rests) in [
+            (StpMode::CancelResting, false, true),
+            (StpMode::CancelIncoming, true, false),
+            (StpMode::CancelBoth, false, false),
+        ] {
+            let mut book = OrderBook::new();
+            let resting = order_for(7, Side::Sell, 10_000, 5);
+            let resting_id = resting.id;
+            gtc(&mut book, resting);
+            let incoming = order_for(7, Side::Buy, 10_000, 5);
+            let incoming_id = incoming.id;
+            let execution = book.submit(incoming, &options(stp));
+            assert!(execution.trades.is_empty());
+            assert_eq!(book.get(resting_id).is_some(), resting_survives, "{stp:?}");
+            assert_eq!(book.get(incoming_id).is_some(), incoming_rests, "{stp:?}");
+            assert_eq!(execution.incoming_cancelled, !incoming_rests, "{stp:?}");
+        }
+    }
+
+    #[test]
+    fn fillable_and_would_cross_support_fok_and_post_only() {
+        let mut book = OrderBook::new();
+        gtc(&mut book, order_for(2, Side::Sell, 10_000, 5));
+        gtc(
+            &mut book,
+            order_for(3, Side::Sell, 10_100, 5).with_display(Some(1)),
+        );
+        gtc(&mut book, order_for(4, Side::Sell, 10_200, 5));
+        assert_eq!(
+            book.fillable(Side::Buy, 10_100, 1),
+            10,
+            "hidden iceberg quantity counts"
+        );
+        assert_eq!(
+            book.fillable(Side::Buy, 10_100, 2),
+            5,
+            "own orders do not count"
+        );
+        assert!(book.would_cross(Side::Buy, 10_000));
+        assert!(!book.would_cross(Side::Buy, 9_999));
+        assert!(!book.would_cross(Side::Sell, 1));
+        let fok = book.submit(
+            order_for(1, Side::Buy, 10_000, 3),
+            &OrderOptions::tif(TimeInForce::Fok),
+        );
+        assert_eq!(fok.trades.len(), 1);
+        assert_eq!(fok.rested, 0);
     }
 }
