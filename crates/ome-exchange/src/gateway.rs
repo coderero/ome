@@ -308,6 +308,25 @@ impl Gateway {
             MemberMessage::QueryMembers if admin || clearing => {
                 return self.reply(id, ServerMessage::MemberList(self.member_list()));
             }
+            MemberMessage::QueryMembers => {
+                let directory = self
+                    .member_list()
+                    .into_iter()
+                    .map(|m| ome_protocol::MemberInfo {
+                        member_id: m.member_id,
+                        kind: m.kind,
+                        connected: m.connected,
+                        open_orders: 0,
+                        net_fees: 0,
+                        credit_limit: 0,
+                        exposure: 0,
+                        suspended: m.suspended,
+                        cancel_on_disconnect: false,
+                        name: m.name,
+                    })
+                    .collect();
+                return self.reply(id, ServerMessage::MemberList(directory));
+            }
             MemberMessage::NewOrder {
                 member_order_id,
                 account,
@@ -349,6 +368,8 @@ impl Gateway {
                 price,
                 qty,
                 venue,
+                buy_member,
+                sell_member,
             } if trader => Command::TradeReport {
                 member,
                 report_id,
@@ -356,6 +377,8 @@ impl Gateway {
                 price,
                 qty,
                 venue,
+                buy_member,
+                sell_member,
             },
             MemberMessage::SetMmp {
                 account,

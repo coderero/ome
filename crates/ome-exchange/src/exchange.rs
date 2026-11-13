@@ -61,6 +61,8 @@ pub enum Command {
         price: Price,
         qty: Qty,
         venue: Venue,
+        buy_member: MemberId,
+        sell_member: MemberId,
     },
     CreateMember {
         kind: MemberKind,
@@ -304,8 +306,17 @@ impl Exchange {
                 price,
                 qty,
                 venue,
+                buy_member,
+                sell_member,
                 ..
-            } => self.report_trade(*member, *symbol, (*price, *qty), *venue, now),
+            } => self.report_trade(
+                *member,
+                *symbol,
+                (*price, *qty),
+                *venue,
+                (*buy_member, *sell_member),
+                now,
+            ),
             Command::CreateMember { kind, name, secret } => self
                 .members
                 .admit(name, *kind, *secret)
@@ -1259,6 +1270,7 @@ impl Exchange {
         symbol: Symbol,
         (price, qty): (Price, Qty),
         venue: Venue,
+        (buy_member, sell_member): (MemberId, MemberId),
         now: Timestamp,
     ) -> Result<Vec<Event>, ExchangeError> {
         self.trading_member(member)?;
@@ -1266,6 +1278,16 @@ impl Exchange {
             return Err(ExchangeError::InvalidReport(
                 "needs an off-exchange venue and a quantity".into(),
             ));
+        }
+        let cleared = buy_member != 0 && sell_member != 0;
+        if (buy_member != 0) != (sell_member != 0) {
+            return Err(ExchangeError::InvalidReport(
+                "name both counterparties or neither".into(),
+            ));
+        }
+        if cleared {
+            self.trading_member(buy_member)?;
+            self.trading_member(sell_member)?;
         }
         let circuit_bps = self.config.circuit_bps;
         let instrument = self
@@ -1298,7 +1320,7 @@ impl Exchange {
             venue: venue as u8,
         });
         *self.off_exchange.entry((symbol, venue)).or_default() += qty;
-        Ok(vec![Event::Trade(TradeEvent {
+        let mut events = vec![Event::Trade(TradeEvent {
             symbol,
             trade_id,
             price,
@@ -1306,7 +1328,36 @@ impl Exchange {
             aggressor: Side::Buy,
             timestamp: now,
             venue,
-        })])
+        })];
+        if cleared {
+            for party in [buy_member, sell_member] {
+                *self
+                    .traded
+                    .entry(party)
+                    .or_default()
+                    .entry(self.cycle)
+                    .or_default() += price.saturating_mul(qty);
+            }
+            let cleared = ClearedTrade {
+                seq: 0,
+                trade_id,
+                cycle: self.cycle,
+                symbol,
+                price,
+                qty,
+                buy_member,
+                buy_account: 0,
+                buy_fee: 0,
+                sell_member,
+                sell_account: 0,
+                sell_fee: 0,
+                timestamp: now,
+            };
+            for clearing in self.clearing_members() {
+                events.push(self.publish(clearing, ServerMessage::ClearedTrade(cleared.clone())));
+            }
+        }
+        Ok(events)
     }
 
     pub fn off_exchange_volume(&self, symbol: Symbol, venue: Venue) -> Qty {
@@ -2316,6 +2367,8 @@ mod tests {
             price,
             qty: 30,
             venue,
+            buy_member: 0,
+            sell_member: 0,
         };
         let events = m.ex.execute(&report(25_10, Venue::Internal), 5).unwrap();
         assert!(matches!(
@@ -2340,12 +2393,54 @@ mod tests {
                     symbol: sym("ACME"),
                     price: 25_00,
                     qty: 1,
-                    venue: Venue::Internal
+                    venue: Venue::Internal,
+                    buy_member: 0,
+                    sell_member: 0,
                 },
                 5
             )
             .is_err(),
             "the admin member does not trade"
+        );
+        let lp = m.lp;
+        let clearing = admit(&mut m.ex, "ccp", MemberKind::Clearing);
+        let events =
+            m.ex.execute(
+                &Command::TradeReport {
+                    member: lp,
+                    report_id: 3,
+                    symbol: sym("ACME"),
+                    price: 25_00,
+                    qty: 10,
+                    venue: Venue::Wholesaler,
+                    buy_member: broker,
+                    sell_member: lp,
+                },
+                6,
+            )
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ToMember {
+                member,
+                message: ServerMessage::ClearedTrade(t)
+            } if *member == clearing && t.buy_member == broker && t.sell_member == lp && t.qty == 10
+        )));
+        assert!(
+            m.ex.execute(
+                &Command::TradeReport {
+                    member: lp,
+                    report_id: 4,
+                    symbol: sym("ACME"),
+                    price: 25_00,
+                    qty: 10,
+                    venue: Venue::Wholesaler,
+                    buy_member: broker,
+                    sell_member: 0,
+                },
+                6,
+            )
+            .is_err()
         );
     }
 

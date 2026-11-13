@@ -12,7 +12,7 @@ use ome_net::auth::{hash_secret, valid_username, verify};
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
 use ome_protocol::{
-    ClientMessage, Decoder, MarketPhase, MemberMessage, Role, ServerMessage, template,
+    ClientMessage, Decoder, MarketPhase, MemberMessage, Role, ServerMessage, Venue, template,
 };
 use ome_store::Journal;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +34,7 @@ pub struct Gateway {
     dropped: BTreeSet<SessionId>,
     exchange: Upstream,
     clearing: Option<Upstream>,
+    venues: BTreeMap<Venue, Upstream>,
     clock: Timestamp,
     last_heartbeat: Timestamp,
     guard: EntryGuard,
@@ -46,6 +47,7 @@ impl Gateway {
         journal: Option<Journal<Record>>,
         exchange: Upstream,
         clearing: Option<Upstream>,
+        venues: BTreeMap<Venue, Upstream>,
         clock: Timestamp,
     ) -> Self {
         Self {
@@ -56,6 +58,7 @@ impl Gateway {
             dropped: BTreeSet::new(),
             exchange,
             clearing,
+            venues,
             clock,
             last_heartbeat: clock,
             guard: EntryGuard::default(),
@@ -124,6 +127,9 @@ impl Gateway {
         if let Some(clearing) = &mut self.clearing {
             clearing.tick(now, self.broker.last_settlement_seq());
         }
+        for (venue, link) in self.venues.iter_mut() {
+            link.tick(now, self.broker.last_venue_seq(*venue));
+        }
         self.market.roll(now);
         self.release_after_market_orders(now);
         self.step_algos(now);
@@ -159,8 +165,13 @@ impl Gateway {
                 break;
             }
         }
+        let wholesaler = self
+            .venues
+            .get(&Venue::Wholesaler)
+            .is_some_and(|link| link.is_ready());
         for order_ref in self.broker.held_orders() {
-            let _ = self.record(Fact::Released { order_ref }, now);
+            let fact = self.broker.route_held(order_ref, wholesaler);
+            let _ = self.record(fact, now);
         }
     }
 
@@ -235,6 +246,43 @@ impl Gateway {
         self.drop_slow_sessions();
     }
 
+    pub fn on_venue(&mut self, venue: Venue, generation: u64, event: LinkEvent, now: Timestamp) {
+        let now = self.advance(now);
+        let Some(link) = self.venues.get_mut(&venue) else {
+            return;
+        };
+        match link.on_event(generation, event, now) {
+            Some(UpstreamEvent::LoggedOn { member_id, .. }) => log(&format!(
+                "logged on to the {} as member {member_id}",
+                venue.label()
+            )),
+            Some(UpstreamEvent::Ready { .. }) => {
+                for order_ref in self.broker.pending_orders(venue) {
+                    let _ = self.record(Fact::OrderAbandoned { order_ref }, now);
+                }
+                log(&format!("{} replay complete; ready", venue.label()));
+            }
+            Some(UpstreamEvent::Message(ServerMessage::Execution(report)))
+                if self.broker.is_new_from(venue, report.seq) =>
+            {
+                let charges = self.broker.venue_charges(&report);
+                let _ = self.record(
+                    Fact::VenueReport {
+                        venue,
+                        report,
+                        charges,
+                    },
+                    now,
+                );
+            }
+            Some(UpstreamEvent::Message(ServerMessage::Reject { reason, .. })) => {
+                log(&format!("{} rejected a request: {reason}", venue.label()))
+            }
+            _ => {}
+        }
+        self.drop_slow_sessions();
+    }
+
     pub fn on_exchange(&mut self, generation: u64, event: LinkEvent, now: Timestamp) {
         let now = self.advance(now);
         let message = match self.exchange.on_event(generation, event, now) {
@@ -248,7 +296,7 @@ impl Gateway {
                 return;
             }
             Some(UpstreamEvent::Ready { next_seq }) => {
-                let pending = self.broker.pending_orders();
+                let pending = self.broker.pending_orders(Venue::Exchange);
                 if !pending.is_empty() {
                     log(&format!(
                         "abandoning {} order(s) the exchange never received",
@@ -375,6 +423,15 @@ impl Gateway {
                 Effect::ToExchange(message) => {
                     self.send_exchange(message);
                 }
+                Effect::ToVenue(venue, message) => {
+                    if !self
+                        .venues
+                        .get_mut(venue)
+                        .is_some_and(|link| link.send(message))
+                    {
+                        log(&format!("{} link is down: message not sent", venue.label()));
+                    }
+                }
                 Effect::AccountOpened(_) => {}
             }
         }
@@ -484,6 +541,7 @@ impl Gateway {
                 | ClientMessage::CancelConditional { .. }
                 | ClientMessage::AlgoOrder { .. }
                 | ClientMessage::CancelAlgo { .. }
+                | ClientMessage::DarkOrder { .. }
         );
         if entry
             && !admin
@@ -721,14 +779,55 @@ impl Gateway {
                 let decision = self.broker.decide_cancel_conditional(account, cond_id);
                 self.record_or_reject(id, ref_template, decision, now);
             }
-            ClientMessage::Cancel { order_id } if !admin => match self
-                .broker
-                .decide_cancel(account, order_id)
-            {
-                Ok(message) if self.send_exchange(&message) => {}
-                Ok(_) => self.reject(id, ref_template, "exchange link is down, try again shortly"),
-                Err(reason) => self.reject(id, ref_template, &reason),
-            },
+            ClientMessage::Cancel { order_id } if !admin => {
+                match self.broker.decide_cancel(account, order_id) {
+                    Ok((venue, message)) => {
+                        let sent = match venue {
+                            Venue::Exchange => self.send_exchange(&message),
+                            other => self
+                                .venues
+                                .get_mut(&other)
+                                .is_some_and(|link| link.send(&message)),
+                        };
+                        if !sent {
+                            self.reject(id, ref_template, "venue link is down, try again shortly");
+                        }
+                    }
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
+            ClientMessage::DarkOrder {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                limit,
+                min_qty,
+            } if !admin => {
+                if !self.venues.get(&Venue::Ats).is_some_and(|l| l.is_ready()) {
+                    return self.reject(id, ref_template, "no dark pool is connected");
+                }
+                match self.broker.decide_dark(
+                    account,
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    limit,
+                    min_qty,
+                    &self.market,
+                    now,
+                ) {
+                    Ok(fact) => {
+                        if self.record(fact, now).is_err() {
+                            self.reject(id, ref_template, "journal unavailable");
+                        }
+                    }
+                    Err(report) => {
+                        self.send_to_account(account, &ServerMessage::Execution(*report))
+                    }
+                }
+            }
             ClientMessage::Quote { symbol, bid, ask } if !admin => {
                 if !self.exchange.is_ready() {
                     return self.reject(
@@ -771,6 +870,11 @@ impl Gateway {
                 }
             }
             ClientMessage::CancelAll { symbol } if !admin => {
+                for (venue, order_id) in self.broker.venue_orders(account, symbol) {
+                    if let Some(link) = self.venues.get_mut(&venue) {
+                        link.send(&MemberMessage::Cancel { order_id });
+                    }
+                }
                 if !self.send_exchange(&MemberMessage::CancelAll {
                     account: Some(account),
                     symbol,

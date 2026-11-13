@@ -155,6 +155,8 @@ impl Entry for Record {
                 price,
                 qty,
                 venue,
+                buy_member,
+                sell_member,
             } => {
                 e.u64(*member)
                     .u64(*report_id)
@@ -162,6 +164,8 @@ impl Entry for Record {
                     .u64(*price)
                     .u64(*qty)
                     .u8(*venue as u8)
+                    .u64(*buy_member)
+                    .u64(*sell_member)
                     .end_block();
             }
             Command::SetMmp {
@@ -331,6 +335,8 @@ impl Entry for Record {
                 let qty = d.u64()?;
                 let venue =
                     ome_protocol::Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
+                let buy_member = d.u64()?;
+                let sell_member = d.u64()?;
                 d.end_block()?;
                 Command::TradeReport {
                     member,
@@ -339,6 +345,8 @@ impl Entry for Record {
                     price,
                     qty,
                     venue,
+                    buy_member,
+                    sell_member,
                 }
             }
             template::SET_MMP => {
@@ -490,6 +498,8 @@ mod tests {
             price: 25_05,
             qty: 12,
             venue: ome_protocol::Venue::Wholesaler,
+            buy_member: 2,
+            sell_member: 3,
         });
         commands.push(Command::SetMmp {
             member: 3,

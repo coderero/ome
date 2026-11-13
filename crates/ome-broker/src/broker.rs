@@ -99,6 +99,20 @@ pub enum Fact {
         marks: Vec<(Symbol, Price)>,
     },
     OrderHeld(Box<Fact>),
+    RoutedToVenue {
+        order_ref: u64,
+        venue: Venue,
+    },
+    VenueReport {
+        venue: Venue,
+        report: ExecutionReport,
+        charges: Charges,
+    },
+    DarkAccepted {
+        order: Box<Fact>,
+        limit: Option<Price>,
+        min_qty: Qty,
+    },
     InternalCross(Cross),
     Released {
         order_ref: u64,
@@ -146,6 +160,7 @@ pub enum Effect {
         message: ServerMessage,
     },
     ToExchange(MemberMessage),
+    ToVenue(Venue, MemberMessage),
 }
 
 #[derive(Default)]
@@ -166,6 +181,8 @@ struct OrderMeta {
     fee_reserve: u64,
     commission_paid: u64,
     exchange_id: Option<OrderId>,
+    venue: Venue,
+    options: OrderOptions,
 }
 
 pub struct Broker {
@@ -190,6 +207,7 @@ pub struct Broker {
     held: BTreeMap<u64, OrderOptions>,
     cycle: u64,
     next_cross_id: u64,
+    venue_seqs: BTreeMap<Venue, u64>,
 }
 
 impl Broker {
@@ -216,6 +234,7 @@ impl Broker {
             held: BTreeMap::new(),
             cycle: 0,
             next_cross_id: 1,
+            venue_seqs: BTreeMap::new(),
         }
     }
 
@@ -1146,7 +1165,7 @@ impl Broker {
         &self,
         account: AccountId,
         order_id: OrderId,
-    ) -> Result<MemberMessage, String> {
+    ) -> Result<(Venue, MemberMessage), String> {
         let meta = self
             .by_exchange
             .get(&order_id)
@@ -1155,7 +1174,108 @@ impl Broker {
         if meta.account != account {
             return Err(format!("order #{order_id} is not yours"));
         }
-        Ok(MemberMessage::Cancel { order_id })
+        Ok((meta.venue, MemberMessage::Cancel { order_id }))
+    }
+
+    pub fn venue_orders(
+        &self,
+        account: AccountId,
+        symbol: Option<Symbol>,
+    ) -> Vec<(Venue, OrderId)> {
+        self.orders
+            .values()
+            .filter(|m| m.account == account && m.venue == Venue::Ats)
+            .filter(|m| symbol.is_none_or(|s| s == m.symbol))
+            .filter_map(|m| m.exchange_id.map(|id| (m.venue, id)))
+            .collect()
+    }
+
+    pub fn last_venue_seq(&self, venue: Venue) -> u64 {
+        self.venue_seqs.get(&venue).copied().unwrap_or(0)
+    }
+
+    pub fn is_new_from(&self, venue: Venue, seq: u64) -> bool {
+        seq > self.last_venue_seq(venue)
+    }
+
+    pub fn venue_charges(&self, report: &ExecutionReport) -> Charges {
+        self.charges_with(report, 0)
+    }
+
+    pub fn route_held(&self, order_ref: u64, wholesaler_ready: bool) -> Fact {
+        let retail = self
+            .orders
+            .get(&order_ref)
+            .and_then(|m| self.ledger.get(m.account))
+            .is_some_and(|a| a.role == Role::Retail);
+        if wholesaler_ready && retail && self.profile.kind == crate::profile::ProfileKind::Retail {
+            Fact::RoutedToVenue {
+                order_ref,
+                venue: Venue::Wholesaler,
+            }
+        } else {
+            Fact::Released { order_ref }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_dark(
+        &self,
+        account: AccountId,
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        limit: Option<Price>,
+        min_qty: Qty,
+        market: &MarketCache,
+        now: Timestamp,
+    ) -> Result<Fact, Box<ExecutionReport>> {
+        let kind = limit.map_or(OrderKind::Market, OrderKind::Limit);
+        let reject = |reason: &str| {
+            rejection(
+                account,
+                client_order_id,
+                symbol,
+                side,
+                kind,
+                qty,
+                now,
+                reason.to_string(),
+            )
+        };
+        let role = self.ledger.get(account).map(|a| a.role);
+        if !matches!(role, Some(Role::Quant | Role::Prop)) {
+            return Err(reject("dark orders are for quant and prop accounts"));
+        }
+        if !self.profile.internalize {
+            return Err(reject(
+                "off-exchange venues are not allowed under this market regime",
+            ));
+        }
+        if min_qty > qty {
+            return Err(reject("minimum quantity cannot exceed the order quantity"));
+        }
+        let Some((low, high)) = market.band(symbol) else {
+            return Err(reject("unknown symbol"));
+        };
+        let reserve_at = limit.unwrap_or(if side == Side::Buy { high } else { low });
+        let order = self.decide_order(
+            account,
+            client_order_id,
+            symbol,
+            side,
+            OrderKind::Limit(reserve_at),
+            OrderOptions::default(),
+            qty,
+            market,
+            now,
+        )?;
+        Ok(Fact::DarkAccepted {
+            order: Box::new(order),
+            limit,
+            min_qty,
+        })
     }
 
     pub fn hold_for_crossing(&self, fact: Fact, market: &MarketCache) -> Fact {
@@ -1280,10 +1400,11 @@ impl Broker {
         self.apply_report(&report, charges)
     }
 
-    pub fn pending_orders(&self) -> Vec<u64> {
+    pub fn pending_orders(&self, venue: Venue) -> Vec<u64> {
         self.orders
             .iter()
             .filter(|(r, _)| !self.held.contains_key(r))
+            .filter(|(_, m)| m.venue == venue)
             .filter(|(_, m)| m.exchange_id.is_none())
             .map(|(r, _)| *r)
             .collect()
@@ -1350,6 +1471,8 @@ impl Broker {
                         fee_reserve: *fee_reserve,
                         commission_paid: 0,
                         exchange_id: None,
+                        venue: Venue::Exchange,
+                        options: *options,
                     },
                 );
                 self.fee_totals.routed_orders += 1;
@@ -1409,6 +1532,8 @@ impl Broker {
                             fee_reserve: leg.fee_reserve,
                             commission_paid: 0,
                             exchange_id: None,
+                            venue: Venue::Exchange,
+                            options: OrderOptions::default(),
                         },
                     );
                     sides[slot] = QuoteSide {
@@ -1563,7 +1688,98 @@ impl Broker {
                     price: cross.price,
                     qty: cross.qty,
                     venue: Venue::Internal,
+                    buy_member: 0,
+                    sell_member: 0,
                 }));
+                effects
+            }
+            Fact::RoutedToVenue { order_ref, venue } => {
+                self.held.remove(order_ref);
+                let Some(meta) = self.orders.get_mut(order_ref) else {
+                    return vec![];
+                };
+                meta.venue = *venue;
+                self.fee_totals.wholesaler_orders += 1;
+                vec![Effect::ToVenue(
+                    *venue,
+                    MemberMessage::NewOrder {
+                        member_order_id: *order_ref,
+                        account: meta.account,
+                        symbol: meta.symbol,
+                        side: meta.side,
+                        kind: OrderKind::Limit(meta.price),
+                        options: OrderOptions::tif(TimeInForce::Ioc),
+                        qty: meta.qty - meta.filled,
+                    },
+                )]
+            }
+            Fact::VenueReport {
+                venue,
+                report,
+                charges,
+            } => {
+                let seq = self.venue_seqs.entry(*venue).or_default();
+                *seq = (*seq).max(report.seq);
+                if *venue == Venue::Wholesaler && report.status == OrderStatus::Rejected {
+                    let Some(meta) = self.orders.get_mut(&report.client_order_id) else {
+                        return vec![];
+                    };
+                    meta.venue = Venue::Exchange;
+                    self.fee_totals.routed_orders += 1;
+                    return vec![Effect::ToExchange(MemberMessage::NewOrder {
+                        member_order_id: report.client_order_id,
+                        account: meta.account,
+                        symbol: meta.symbol,
+                        side: meta.side,
+                        kind: OrderKind::Limit(meta.price),
+                        options: meta.options,
+                        qty: meta.qty - meta.filled,
+                    })];
+                }
+                if report.last_qty > 0 {
+                    match venue {
+                        Venue::Wholesaler => {
+                            self.fee_totals.wholesaler_shares += report.last_qty;
+                            self.fee_totals.pfof_earned -= report.fees;
+                        }
+                        Venue::Ats => self.fee_totals.dark_shares += report.last_qty,
+                        _ => {}
+                    }
+                }
+                let report = ExecutionReport {
+                    cycle: report.cycle.max(self.cycle),
+                    fees: 0,
+                    ..report.clone()
+                };
+                self.apply_report(&report, charges)
+            }
+            Fact::DarkAccepted {
+                order,
+                limit,
+                min_qty,
+            } => {
+                let mut effects = self.apply(order);
+                effects.retain(|e| !matches!(e, Effect::ToExchange(_)));
+                let Fact::OrderAccepted { order_ref, .. } = order.as_ref() else {
+                    return effects;
+                };
+                let Some(meta) = self.orders.get_mut(order_ref) else {
+                    return effects;
+                };
+                meta.venue = Venue::Ats;
+                self.fee_totals.routed_orders -= 1;
+                effects.push(Effect::ToVenue(
+                    Venue::Ats,
+                    MemberMessage::DarkOrder {
+                        member_order_id: *order_ref,
+                        account: meta.account,
+                        symbol: meta.symbol,
+                        side: meta.side,
+                        limit: *limit,
+                        qty: meta.qty,
+                        min_qty: *min_qty,
+                    },
+                ));
                 effects
             }
             Fact::Released { order_ref } => {
@@ -1638,6 +1854,9 @@ impl Broker {
                     account: Some(*account),
                     symbol: None,
                 }));
+                for (venue, order_id) in self.venue_orders(*account, None) {
+                    effects.push(Effect::ToVenue(venue, MemberMessage::Cancel { order_id }));
+                }
                 effects.push(Effect::AccountChanged(*account));
                 effects.append(&mut stopped);
                 effects
@@ -1691,6 +1910,10 @@ impl Broker {
     }
 
     pub fn charges_for(&self, report: &ExecutionReport) -> Charges {
+        self.charges_with(report, report.fees)
+    }
+
+    fn charges_with(&self, report: &ExecutionReport, exchange_fee: i64) -> Charges {
         if report.last_qty == 0 {
             return Charges::default();
         }
@@ -1705,7 +1928,7 @@ impl Broker {
             meta.side,
             report.last_price,
             report.last_qty,
-            report.fees,
+            exchange_fee,
             meta.commission_paid,
         )
     }
@@ -1741,6 +1964,8 @@ impl Broker {
                     fee_reserve: 0,
                     commission_paid: 0,
                     exchange_id: None,
+                    venue: Venue::Exchange,
+                    options: OrderOptions::default(),
                 },
             );
             order_ref
@@ -2162,7 +2387,7 @@ pub mod tests {
                 ..
             })
         )));
-        assert_eq!(broker.pending_orders(), vec![1]);
+        assert_eq!(broker.pending_orders(Venue::Exchange), vec![1]);
     }
 
     #[test]
@@ -2212,7 +2437,7 @@ pub mod tests {
         assert_eq!(a.position(sym()).available, 10);
         assert!(effects.iter().any(|e| matches!(e, Effect::ToAccount { message: ServerMessage::Execution(r), .. } if r.client_order_id == 5 && r.order_id == 900)));
         assert_eq!(broker.last_seq(), 2);
-        assert!(broker.pending_orders().is_empty());
+        assert!(broker.pending_orders(Venue::Exchange).is_empty());
     }
 
     #[test]
@@ -2373,7 +2598,7 @@ pub mod tests {
             broker.ledger().get(alice).unwrap().cash.available,
             10_000_00
         );
-        assert!(broker.pending_orders().is_empty());
+        assert!(broker.pending_orders(Venue::Exchange).is_empty());
     }
 
     #[test]
@@ -2408,7 +2633,7 @@ pub mod tests {
         );
         assert_eq!(
             broker.decide_cancel(alice, 900),
-            Ok(MemberMessage::Cancel { order_id: 900 })
+            Ok((Venue::Exchange, MemberMessage::Cancel { order_id: 900 }))
         );
         deliver(
             &mut broker,

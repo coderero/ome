@@ -23,11 +23,25 @@ start_bg clearing "$BIN/ome-clearing" --listen "$OME_CLEARING" --exchange "$OME_
 wait_for clearing_cmd status
 (( fresh )) && scripts/seed.sh clearing
 
+for v in "${venues[@]}"; do
+  read -r name kind _ port <<<"$v"
+  start_bg "$name" "$BIN/ome-venue" --kind "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
+    --member "$name" --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/$name.journal" --ops-secret "$OME_VENUE_SECRET"
+done
+for v in "${venues[@]}"; do
+  read -r name _ _ _ <<<"$v"
+  wait_for venue_cmd "$name" status
+done
+(( fresh )) && scripts/seed.sh venues
+
 for p in "${providers[@]}"; do
   read -r name kind member port <<<"$p"
+  routes=()
+  if [[ "$OME_REGIME" == "us" && "$name" == "retail-co" ]]; then routes=(--wholesaler "$(venue_addr wholesale-co)"); fi
+  if [[ "$OME_REGIME" == "us" && "$name" == "prime-co" ]]; then routes=(--ats "$(venue_addr ats-co)"); fi
   start_bg "$name" "$BIN/ome-broker" --profile "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
     --member "$name" --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/$name.journal" --admin-secret "$OME_BROKER_SECRET" \
-    --clearing "$OME_CLEARING" --regime "$OME_REGIME"
+    --clearing "$OME_CLEARING" --regime "$OME_REGIME" "${routes[@]}"
 done
 for p in "${providers[@]}"; do
   read -r name _ _ _ <<<"$p"
@@ -51,6 +65,8 @@ market is live:
   prime       $(provider_addr prime-co)   fund / fund-pw (quant), issuers
   dma         $(provider_addr dma-co)   HFT desks
   lp          $(provider_addr lp-co)   market-making desks
+  wholesaler  $(venue_addr wholesale-co)   buys retail flow from retail-co, pays PFOF   ./target/release/ome venue --addr $(venue_addr wholesale-co) status
+  dark pool   $(venue_addr ats-co)   midpoint matching for prime-co (regime: $OME_REGIME)
 examples:
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw balance
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw buy ACME mkt 5

@@ -39,6 +39,7 @@ pub enum ServerMessage {
     ClearedTrade(ClearedTrade),
     ConditionalUpdate(ConditionalReport),
     AlgoUpdate(AlgoReport),
+    VenueStatus(VenueStatus),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -69,6 +70,7 @@ impl ServerMessage {
             ServerMessage::ClearedTrade(_) => CLEARED_TRADE,
             ServerMessage::ConditionalUpdate(_) => CONDITIONAL_UPDATE,
             ServerMessage::AlgoUpdate(_) => ALGO_UPDATE,
+            ServerMessage::VenueStatus(_) => VENUE_STATUS,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -232,6 +234,29 @@ impl ServerMessage {
                     e.end_entry_block(&mut g);
                 }
             }
+            ServerMessage::VenueStatus(v) => {
+                e.u8(v.venue as u8)
+                    .u64(v.fills)
+                    .u64(v.declined)
+                    .u64(v.shares)
+                    .i64(v.pfof_paid)
+                    .i64(v.cash)
+                    .u64(v.resting)
+                    .end_block();
+                let mut g = e.begin_group(v.inventory.len());
+                for (symbol, qty) in &v.inventory {
+                    e.begin_entry(&mut g);
+                    e.symbol(Some(*symbol)).i64(*qty);
+                    e.end_entry_block(&mut g);
+                }
+                let mut g = e.begin_group(v.members.len());
+                for m in &v.members {
+                    e.begin_entry(&mut g);
+                    e.u64(m.member_id).u64(m.orders).u64(m.shares);
+                    e.end_entry_block(&mut g);
+                    e.var(&m.name);
+                }
+            }
             ServerMessage::ClearingStatus(c) => {
                 e.u64(c.cycle)
                     .u64(c.settled_cycle)
@@ -270,6 +295,10 @@ impl ServerMessage {
                     .u64(f.routed_orders)
                     .u64(f.internal_crosses)
                     .u64(f.internalized_shares)
+                    .u64(f.wholesaler_orders)
+                    .u64(f.wholesaler_shares)
+                    .i64(f.pfof_earned)
+                    .u64(f.dark_shares)
                     .end_block();
             }
             ServerMessage::InstrumentList(list) => {
@@ -599,6 +628,51 @@ impl ServerMessage {
                     positions,
                 })
             }
+            VENUE_STATUS => {
+                let venue = Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
+                let fills = d.u64()?;
+                let declined = d.u64()?;
+                let shares = d.u64()?;
+                let pfof_paid = d.i64()?;
+                let cash = d.i64()?;
+                let resting = d.u64()?;
+                d.end_block()?;
+                let g = d.group()?;
+                let mut inventory = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let symbol = d.symbol()?;
+                    let qty = d.i64()?;
+                    d.end_entry_block(start, &g)?;
+                    inventory.push((symbol, qty));
+                }
+                let g = d.group()?;
+                let mut members = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let member_id = d.u64()?;
+                    let orders = d.u64()?;
+                    let shares = d.u64()?;
+                    d.end_entry_block(start, &g)?;
+                    members.push(VenueMemberInfo {
+                        member_id,
+                        orders,
+                        shares,
+                        name: d.var()?,
+                    });
+                }
+                ServerMessage::VenueStatus(VenueStatus {
+                    venue,
+                    fills,
+                    declined,
+                    shares,
+                    pfof_paid,
+                    cash,
+                    resting,
+                    inventory,
+                    members,
+                })
+            }
             CLEARING_STATUS => {
                 let cycle = d.u64()?;
                 let settled_cycle = d.u64()?;
@@ -681,6 +755,10 @@ impl ServerMessage {
                 let routed_orders = d.u64()?;
                 let internal_crosses = d.u64()?;
                 let internalized_shares = d.u64()?;
+                let wholesaler_orders = d.u64()?;
+                let wholesaler_shares = d.u64()?;
+                let pfof_earned = d.i64()?;
+                let dark_shares = d.u64()?;
                 d.end_block()?;
                 ServerMessage::FeeSummary(FeeSummary {
                     charges,
@@ -688,6 +766,10 @@ impl ServerMessage {
                     routed_orders,
                     internal_crosses,
                     internalized_shares,
+                    wholesaler_orders,
+                    wholesaler_shares,
+                    pfof_earned,
+                    dark_shares,
                 })
             }
             INSTRUMENT_LIST => {
@@ -1064,6 +1146,26 @@ mod tests {
                 routed_orders: 9,
                 internal_crosses: 2,
                 internalized_shares: 40,
+                wholesaler_orders: 5,
+                wholesaler_shares: 60,
+                pfof_earned: 12,
+                dark_shares: 300,
+            }),
+            ServerMessage::VenueStatus(VenueStatus {
+                venue: Venue::Wholesaler,
+                fills: 10,
+                declined: 2,
+                shares: 400,
+                pfof_paid: 80,
+                cash: -1_234,
+                resting: 0,
+                inventory: vec![(sym("ACME"), -30), (sym("NOVA"), 12)],
+                members: vec![VenueMemberInfo {
+                    member_id: 2,
+                    orders: 12,
+                    shares: 400,
+                    name: "retail-co".into(),
+                }],
             }),
             ServerMessage::Allocation(Allocation {
                 seq: 3,

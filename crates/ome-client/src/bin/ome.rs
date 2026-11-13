@@ -55,7 +55,12 @@ const USAGE: &str = "usage:
       slice <SYMBOL> <side> <qty> <clip> <limit> [follow]   broker-side iceberg slicer
                                                           algorithmic parent orders (quant and prop accounts)
       algos  |  cancel-algo <id>                          working algos with progress
+      dark <SYMBOL> <side> <qty> [limit] [min:<qty>]      midpoint order in the dark pool (quant and prop)
       instruments  |  watch <SYMBOL>
+
+  ome venue [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>   (wholesaler 7301, dark pool 7302)
+      status                                              fills, routing members, inventory and PFOF
+      register <member-name> <secret>                     let an exchange member route to this venue
 
   ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
       status                                              cycles, collateral, margin, credit, fails
@@ -69,6 +74,7 @@ enum Target {
     Exchange,
     Broker,
     Clearing,
+    Venue,
 }
 
 struct Options {
@@ -98,6 +104,13 @@ fn parse_options() -> std::result::Result<Options, String> {
             addr: env("OME_CLEARING", "127.0.0.1:7200"),
             user: env("OME_CLEARING_OPS", "ops"),
             secret: env("OME_CLEARING_SECRET", "ops"),
+            command: Vec::new(),
+        },
+        Some("venue") => Options {
+            target: Target::Venue,
+            addr: env("OME_VENUE", "127.0.0.1:7301"),
+            user: env("OME_VENUE_OPS", "ops"),
+            secret: env("OME_VENUE_SECRET", "ops"),
             command: Vec::new(),
         },
         Some("broker") => Options {
@@ -146,6 +159,9 @@ fn main() {
         Target::Clearing => Client::connect_member(&options.addr, &options.user, &options.secret)
             .map_err(Into::into)
             .and_then(|(mut client, _)| clearing(&mut client, &args)),
+        Target::Venue => Client::connect_member(&options.addr, &options.user, &options.secret)
+            .map_err(Into::into)
+            .and_then(|(mut client, _)| venue(&mut client, &args)),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -343,11 +359,19 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             println!("regulatory fee   {}", format_price(c.regulatory_fee));
             println!("GST              {}", format_price(c.gst));
             println!("total charged    {}", format_signed(c.total()));
-            println!("orders routed    {}", summary.routed_orders);
+            println!("order routing (606):");
+            println!("  exchange       {} orders", summary.routed_orders);
             println!(
-                "internal crosses {} ({} shares)",
+                "  internal       {} crosses, {} shares",
                 summary.internal_crosses, summary.internalized_shares
             );
+            println!(
+                "  wholesaler     {} orders, {} shares, payment for order flow {}",
+                summary.wholesaler_orders,
+                summary.wholesaler_shares,
+                format_signed(summary.pfof_earned)
+            );
+            println!("  dark pool      {} shares", summary.dark_shares);
         }
         ["accounts"] => {
             for a in accounts(client)? {
@@ -791,6 +815,44 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 _ => unreachable!(),
             }
         }
+        ["dark", sym, side, qty, rest @ ..] if rest.len() <= 2 => {
+            let mut limit = None;
+            let mut min_qty = 0;
+            for word in rest {
+                match word.strip_prefix("min:") {
+                    Some(min) => min_qty = number(min)?,
+                    None => limit = Some(price(word)?),
+                }
+            }
+            let client_order_id = client.next_order_id();
+            client.send(&ClientMessage::DarkOrder {
+                client_order_id,
+                symbol: symbol(sym)?,
+                side: side_of(side)?,
+                qty: number(qty)?,
+                limit,
+                min_qty,
+            })?;
+            match client.wait_for(Duration::from_secs(5), |m| match m {
+                ServerMessage::Execution(r) => r.client_order_id == client_order_id,
+                ServerMessage::Reject { .. } => true,
+                _ => false,
+            })? {
+                ServerMessage::Reject { reason, .. } => {
+                    return Err(ClientError::Rejected(reason).into());
+                }
+                ServerMessage::Execution(r) => println!(
+                    "#{} {} {} {}/{} {}",
+                    r.order_id,
+                    r.status.label(),
+                    r.side.label(),
+                    r.filled,
+                    r.qty,
+                    r.reason
+                ),
+                _ => unreachable!(),
+            }
+        }
         ["conditionals"] => {
             client.send(&ClientMessage::QueryAccount)?;
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -1040,6 +1102,56 @@ fn clearing(client: &mut Client, args: &[&str]) -> Result<()> {
             println!(
                 "{}",
                 client.request_member(&MemberMessage::Deposit { member, amount })?
+            );
+        }
+        _ => usage()?,
+    }
+    Ok(())
+}
+
+fn venue(client: &mut Client, args: &[&str]) -> Result<()> {
+    match args {
+        ["status"] => {
+            client.send_member(&MemberMessage::QueryVenue)?;
+            let ServerMessage::VenueStatus(v) = client.wait_for(Duration::from_secs(5), |m| {
+                matches!(m, ServerMessage::VenueStatus(_))
+            })?
+            else {
+                unreachable!()
+            };
+            println!(
+                "{} · fills {} · declined {} · shares {} · resting {}",
+                v.venue.label(),
+                v.fills,
+                v.declined,
+                v.shares,
+                v.resting
+            );
+            if v.venue == ome_protocol::Venue::Wholesaler {
+                println!(
+                    "cash {} · payment for order flow paid {}",
+                    format_signed(v.cash),
+                    format_signed(v.pfof_paid)
+                );
+                for (symbol, qty) in &v.inventory {
+                    println!("  inventory {symbol:<8} {qty:>8}");
+                }
+            }
+            for m in &v.members {
+                println!(
+                    "{:>4}  {:<16} orders {:>8}  shares {:>10}",
+                    m.member_id, m.name, m.orders, m.shares
+                );
+            }
+        }
+        ["register", name, secret] => {
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::CreateMember {
+                    kind: MemberKind::Broker,
+                    name: name.to_string(),
+                    secret: secret.to_string(),
+                })?
             );
         }
         _ => usage()?,

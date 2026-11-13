@@ -35,6 +35,8 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str) -> SocketAdd
         member_secret: "pw".into(),
         clearing_addr: None,
         regime: Regime::India,
+        wholesaler_addr: None,
+        ats_addr: None,
     })
     .unwrap()
     .0

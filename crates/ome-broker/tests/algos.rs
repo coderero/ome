@@ -40,6 +40,8 @@ fn twap_parent_fills_through_child_orders_on_the_real_exchange() {
         member_secret: "pw".into(),
         clearing_addr: None,
         regime: Regime::India,
+        wholesaler_addr: None,
+        ats_addr: None,
     })
     .unwrap()
     .0;

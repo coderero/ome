@@ -76,6 +76,14 @@ pub enum ClientMessage {
     CancelAlgo {
         algo_id: u64,
     },
+    DarkOrder {
+        client_order_id: u64,
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        limit: Option<Price>,
+        min_qty: Qty,
+    },
     Subscribe {
         symbol: Symbol,
     },
@@ -127,6 +135,7 @@ impl ClientMessage {
             ClientMessage::CancelConditional { .. } => CANCEL_CONDITIONAL,
             ClientMessage::AlgoOrder { .. } => ALGO_ORDER,
             ClientMessage::CancelAlgo { .. } => CANCEL_ALGO,
+            ClientMessage::DarkOrder { .. } => DARK_ORDER,
             ClientMessage::Subscribe { .. } => SUBSCRIBE,
             ClientMessage::Unsubscribe { .. } => UNSUBSCRIBE,
             ClientMessage::QueryAccount => QUERY_ACCOUNT,
@@ -255,6 +264,22 @@ impl ClientMessage {
             }
             ClientMessage::CancelAlgo { algo_id } => {
                 e.u64(*algo_id).end_block();
+            }
+            ClientMessage::DarkOrder {
+                client_order_id,
+                symbol,
+                side,
+                qty,
+                limit,
+                min_qty,
+            } => {
+                e.u64(*client_order_id)
+                    .symbol(Some(*symbol))
+                    .u8(side_to_u8(*side))
+                    .u64(*qty)
+                    .u64(limit.unwrap_or(0))
+                    .u64(*min_qty)
+                    .end_block();
             }
             ClientMessage::SetMmp { window_ms, max_qty } => {
                 e.u64(*window_ms).u64(*max_qty).end_block();
@@ -460,6 +485,23 @@ impl ClientMessage {
                     strategy,
                 }
             }
+            DARK_ORDER => {
+                let client_order_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let limit = Some(d.u64()?).filter(|&p| p > 0);
+                let min_qty = d.u64()?;
+                d.end_block()?;
+                ClientMessage::DarkOrder {
+                    client_order_id,
+                    symbol,
+                    side,
+                    qty,
+                    limit,
+                    min_qty,
+                }
+            }
             CANCEL_ALGO => {
                 let algo_id = d.u64()?;
                 d.end_block()?;
@@ -615,6 +657,14 @@ pub mod tests {
                 },
             },
             ClientMessage::CancelAlgo { algo_id: 2 },
+            ClientMessage::DarkOrder {
+                client_order_id: 40,
+                symbol: sym("ACME"),
+                side: Side::Sell,
+                qty: 2_000,
+                limit: None,
+                min_qty: 100,
+            },
             ClientMessage::CancelAll {
                 symbol: Some(sym("NOVA")),
             },

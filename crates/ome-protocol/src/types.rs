@@ -524,6 +524,31 @@ pub struct FeeSummary {
     pub routed_orders: u64,
     pub internal_crosses: u64,
     pub internalized_shares: u64,
+    pub wholesaler_orders: u64,
+    pub wholesaler_shares: u64,
+    pub pfof_earned: i64,
+    pub dark_shares: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenueMemberInfo {
+    pub member_id: MemberId,
+    pub orders: u64,
+    pub shares: u64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenueStatus {
+    pub venue: Venue,
+    pub fills: u64,
+    pub declined: u64,
+    pub shares: u64,
+    pub pfof_paid: i64,
+    pub cash: i64,
+    pub resting: u64,
+    pub inventory: Vec<(Symbol, i64)>,
+    pub members: Vec<VenueMemberInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -55,7 +55,19 @@ pub enum MemberMessage {
         price: Price,
         qty: Qty,
         venue: Venue,
+        buy_member: MemberId,
+        sell_member: MemberId,
     },
+    DarkOrder {
+        member_order_id: u64,
+        account: AccountId,
+        symbol: Symbol,
+        side: Side,
+        limit: Option<Price>,
+        qty: Qty,
+        min_qty: Qty,
+    },
+    QueryVenue,
     SetMemberStatus {
         member: MemberId,
         enabled: bool,
@@ -125,6 +137,8 @@ impl MemberMessage {
             MemberMessage::Quote { .. } => MEMBER_QUOTE,
             MemberMessage::SetMmp { .. } => MEMBER_SET_MMP,
             MemberMessage::TradeReport { .. } => MEMBER_TRADE_REPORT,
+            MemberMessage::DarkOrder { .. } => MEMBER_DARK_ORDER,
+            MemberMessage::QueryVenue => QUERY_VENUE,
             MemberMessage::SetMemberStatus { .. } => SET_MEMBER_STATUS,
             MemberMessage::SetCancelOnDisconnect { .. } => SET_CANCEL_ON_DISCONNECT,
             MemberMessage::CreateMember { .. } => CREATE_MEMBER,
@@ -155,7 +169,8 @@ impl MemberMessage {
             MemberMessage::Heartbeat
             | MemberMessage::QueryInstruments
             | MemberMessage::QueryMembers
-            | MemberMessage::QueryClearing => {
+            | MemberMessage::QueryClearing
+            | MemberMessage::QueryVenue => {
                 e.end_block();
             }
             MemberMessage::NewOrder {
@@ -205,12 +220,34 @@ impl MemberMessage {
                 price,
                 qty,
                 venue,
+                buy_member,
+                sell_member,
             } => {
                 e.u64(*report_id)
                     .symbol(Some(*symbol))
                     .u64(*price)
                     .u64(*qty)
                     .u8(*venue as u8)
+                    .u64(*buy_member)
+                    .u64(*sell_member)
+                    .end_block();
+            }
+            MemberMessage::DarkOrder {
+                member_order_id,
+                account,
+                symbol,
+                side,
+                limit,
+                qty,
+                min_qty,
+            } => {
+                e.u64(*member_order_id)
+                    .u64(*account)
+                    .symbol(Some(*symbol))
+                    .u8(side_to_u8(*side))
+                    .u64(limit.unwrap_or(0))
+                    .u64(*qty)
+                    .u64(*min_qty)
                     .end_block();
             }
             MemberMessage::SetMemberStatus { member, enabled }
@@ -382,6 +419,8 @@ impl MemberMessage {
                 let price = d.u64()?;
                 let qty = d.u64()?;
                 let venue = Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
+                let buy_member = d.u64()?;
+                let sell_member = d.u64()?;
                 d.end_block()?;
                 MemberMessage::TradeReport {
                     report_id,
@@ -389,7 +428,32 @@ impl MemberMessage {
                     price,
                     qty,
                     venue,
+                    buy_member,
+                    sell_member,
                 }
+            }
+            MEMBER_DARK_ORDER => {
+                let member_order_id = d.u64()?;
+                let account = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let limit = Some(d.u64()?).filter(|&p| p > 0);
+                let qty = d.u64()?;
+                let min_qty = d.u64()?;
+                d.end_block()?;
+                MemberMessage::DarkOrder {
+                    member_order_id,
+                    account,
+                    symbol,
+                    side,
+                    limit,
+                    qty,
+                    min_qty,
+                }
+            }
+            QUERY_VENUE => {
+                d.end_block()?;
+                MemberMessage::QueryVenue
             }
             MEMBER_SET_MMP => {
                 let account = d.u64()?;
@@ -582,7 +646,19 @@ pub mod tests {
                 price: 2_505,
                 qty: 30,
                 venue: Venue::Internal,
+                buy_member: 0,
+                sell_member: 0,
             },
+            MemberMessage::DarkOrder {
+                member_order_id: 9,
+                account: 4,
+                symbol: sym("ACME"),
+                side: Side::Buy,
+                limit: Some(2_510),
+                qty: 5_000,
+                min_qty: 500,
+            },
+            MemberMessage::QueryVenue,
             MemberMessage::SetMemberStatus {
                 member: 3,
                 enabled: false,

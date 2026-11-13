@@ -41,6 +41,8 @@ fn broker(
         member_secret: "pw".into(),
         clearing_addr: Some(clearing.to_string()),
         regime: Regime::India,
+        wholesaler_addr: None,
+        ats_addr: None,
     })
     .unwrap()
     .0

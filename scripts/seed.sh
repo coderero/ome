@@ -5,16 +5,21 @@ source scripts/env.sh
 
 seed_members() {
   exchange_cmd add-member ccp "$OME_MEMBER_SECRET" clearing
-  for p in "${providers[@]}"; do
+  for p in "${providers[@]}" "${venues[@]}"; do
     read -r name _ member _ <<<"$p"
     exchange_cmd add-member "$name" "$OME_MEMBER_SECRET" "$member"
   done
 }
 
+seed_venues() {
+  wait_for venue_cmd wholesale-co register retail-co "$OME_MEMBER_SECRET" || true
+  wait_for venue_cmd ats-co register prime-co "$OME_MEMBER_SECRET" || true
+}
+
 registered() { clearing_cmd status | grep -q " $1 "; }
 
 seed_clearing() {
-  for p in "${providers[@]}"; do
+  for p in "${providers[@]}" "wholesale-co"; do
     read -r name _ _ _ <<<"$p"
     wait_for clearing_cmd register "$name" "$OME_MEMBER_SECRET" || registered "$name"
     clearing_cmd deposit "$name" "$OME_COLLATERAL"
@@ -84,6 +89,7 @@ seed_market() {
 case "${1:-}" in
   members) seed_members ;;
   clearing) seed_clearing ;;
+  venues) seed_venues ;;
   market) seed_market ;;
-  *) echo "usage: scripts/seed.sh members|clearing|market" >&2; exit 2 ;;
+  *) echo "usage: scripts/seed.sh members|clearing|venues|market" >&2; exit 2 ;;
 esac

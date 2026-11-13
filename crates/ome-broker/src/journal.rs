@@ -2,12 +2,12 @@ use crate::algo::Algo;
 use crate::broker::{Cross, Fact, QuoteLeg};
 use crate::oms::Conditional;
 use ome_core::types::Timestamp;
-use ome_protocol::Asset;
 use ome_protocol::{
     AlgoStatus, DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_algo_strategy,
     get_charges, get_order_kind, get_order_options, get_trigger, put_algo_strategy, put_charges,
     put_order_kind, put_order_options, put_trigger, role_from, side_from_u8, side_to_u8,
 };
+use ome_protocol::{Asset, Venue};
 use ome_store::Entry;
 
 mod template {
@@ -34,6 +34,9 @@ mod template {
     pub const ORDER_HELD: u16 = 320;
     pub const INTERNAL_CROSS: u16 = 321;
     pub const RELEASED: u16 = 322;
+    pub const ROUTED_TO_VENUE: u16 = 323;
+    pub const VENUE_REPORT: u16 = 324;
+    pub const DARK_ACCEPTED: u16 = 325;
     pub const CONDITIONAL: u16 = 399;
 }
 
@@ -113,6 +116,9 @@ impl Entry for Record {
             Fact::OrderHeld(_) => template::ORDER_HELD,
             Fact::InternalCross(_) => template::INTERNAL_CROSS,
             Fact::Released { .. } => template::RELEASED,
+            Fact::RoutedToVenue { .. } => template::ROUTED_TO_VENUE,
+            Fact::VenueReport { .. } => template::VENUE_REPORT,
+            Fact::DarkAccepted { .. } => template::DARK_ACCEPTED,
             Fact::AlgoChild { .. } => template::ALGO_CHILD,
             Fact::AlgoFinished { .. } => template::ALGO_FINISHED,
         };
@@ -275,6 +281,29 @@ impl Entry for Record {
             }
             Fact::Released { order_ref } => {
                 e.u64(*order_ref).end_block();
+            }
+            Fact::RoutedToVenue { order_ref, venue } => {
+                e.u64(*order_ref).u8(*venue as u8).end_block();
+            }
+            Fact::VenueReport {
+                venue,
+                report,
+                charges,
+            } => {
+                e.u8(*venue as u8);
+                put_charges(&mut e, charges);
+                e.end_block()
+                    .var_bytes(&ServerMessage::Execution(report.clone()).encode());
+            }
+            Fact::DarkAccepted {
+                order,
+                limit,
+                min_qty,
+            } => {
+                e.u64(limit.unwrap_or(0))
+                    .u64(*min_qty)
+                    .end_block()
+                    .var_bytes(&encode_inner(order));
             }
             Fact::AlgoChild { algo_id, order } => {
                 e.u64(*algo_id).end_block().var_bytes(&encode_inner(order));
@@ -509,6 +538,35 @@ impl Entry for Record {
                 };
                 d.end_block()?;
                 Fact::InternalCross(cross)
+            }
+            template::ROUTED_TO_VENUE => {
+                let order_ref = d.u64()?;
+                let venue = Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
+                d.end_block()?;
+                Fact::RoutedToVenue { order_ref, venue }
+            }
+            template::VENUE_REPORT => {
+                let venue = Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
+                let charges = get_charges(&mut d)?;
+                d.end_block()?;
+                match ServerMessage::decode(d.var_bytes()?)? {
+                    ServerMessage::Execution(report) => Fact::VenueReport {
+                        venue,
+                        report,
+                        charges,
+                    },
+                    _ => return Err(DecodeError::Invalid("embedded execution report")),
+                }
+            }
+            template::DARK_ACCEPTED => {
+                let limit = Some(d.u64()?).filter(|&p| p > 0);
+                let min_qty = d.u64()?;
+                d.end_block()?;
+                Fact::DarkAccepted {
+                    order: decode_inner(d.var_bytes()?)?,
+                    limit,
+                    min_qty,
+                }
             }
             template::RELEASED => {
                 let order_ref = d.u64()?;
@@ -793,6 +851,38 @@ mod tests {
                 timestamp: 9,
             }),
             Fact::Released { order_ref: 30 },
+            Fact::RoutedToVenue {
+                order_ref: 31,
+                venue: Venue::Wholesaler,
+            },
+            Fact::VenueReport {
+                venue: Venue::Ats,
+                report: ExecutionReport {
+                    seq: 4,
+                    order_id: 3 << 60,
+                    client_order_id: 31,
+                    account: 2,
+                    symbol: sym(),
+                    side: Side::Buy,
+                    status: OrderStatus::New,
+                    price: 0,
+                    qty: 5,
+                    filled: 0,
+                    leaves: 5,
+                    last_price: 0,
+                    last_qty: 0,
+                    fees: 0,
+                    cycle: 0,
+                    timestamp: 3,
+                    reason: String::new(),
+                },
+                charges: ome_protocol::Charges::default(),
+            },
+            Fact::DarkAccepted {
+                order: Box::new(Fact::OrderAbandoned { order_ref: 32 }),
+                limit: None,
+                min_qty: 100,
+            },
             Fact::AccountStatusSet {
                 account: 2,
                 suspended: true,

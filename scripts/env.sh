@@ -8,6 +8,7 @@ OME_CLEARING="${OME_CLEARING:-$OME_HOST:7200}"
 OME_CLEARING_SECRET="${OME_CLEARING_SECRET:-ops}"
 OME_TRADING_DAY="${OME_TRADING_DAY:-5 45 5 5}"
 OME_REGIME="${OME_REGIME:-us}"
+OME_VENUE_SECRET="${OME_VENUE_SECRET:-ops}"
 if [[ "$OME_TRADING_DAY" == "off" ]]; then
   OME_CYCLE_MS="${OME_CYCLE_MS:-30000}"
 else
@@ -22,6 +23,22 @@ providers=(
   "dma-co dma broker 7103"
   "lp-co lp lp 7104"
 )
+
+venues=(
+  "wholesale-co wholesaler lp 7301"
+  "ats-co ats broker 7302"
+)
+
+venue_addr() {
+  local name kind member port
+  for v in "${venues[@]}"; do
+    read -r name kind member port <<<"$v"
+    if [[ "$name" == "$1" ]]; then echo "$OME_HOST:$port"; return; fi
+  done
+  return 1
+}
+
+venue_cmd() { local addr; addr="$(venue_addr "$1")"; shift; "$BIN/ome" venue --addr "$addr" --user ops --secret "$OME_VENUE_SECRET" "$@"; }
 
 provider_addr() {
   local name kind member port

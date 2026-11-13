@@ -37,12 +37,16 @@ pub struct BrokerConfig {
     pub member_secret: String,
     pub clearing_addr: Option<String>,
     pub regime: Regime,
+    pub wholesaler_addr: Option<String>,
+    pub ats_addr: Option<String>,
 }
 
 pub enum BrokerInbound {
     Client(Inbound),
     Exchange { generation: u64, event: LinkEvent },
     Clearing { generation: u64, event: LinkEvent },
+    Wholesaler { generation: u64, event: LinkEvent },
+    Ats { generation: u64, event: LinkEvent },
 }
 
 impl From<Inbound> for BrokerInbound {
@@ -57,6 +61,14 @@ fn exchange_event(generation: u64, event: LinkEvent) -> BrokerInbound {
 
 fn clearing_event(generation: u64, event: LinkEvent) -> BrokerInbound {
     BrokerInbound::Clearing { generation, event }
+}
+
+fn wholesaler_event(generation: u64, event: LinkEvent) -> BrokerInbound {
+    BrokerInbound::Wholesaler { generation, event }
+}
+
+fn ats_event(generation: u64, event: LinkEvent) -> BrokerInbound {
+    BrokerInbound::Ats { generation, event }
 }
 
 pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
@@ -103,7 +115,28 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
             credentials(),
         )
     });
-    let mut gateway = Gateway::new(broker, journal, exchange, clearing, last_ts);
+    let mut venues = std::collections::BTreeMap::new();
+    if let Some(addr) = config.wholesaler_addr.clone() {
+        venues.insert(
+            ome_protocol::Venue::Wholesaler,
+            Upstream::new(
+                "wholesaler",
+                Box::new(TcpConnector::new(addr, tx.clone(), wholesaler_event)),
+                credentials(),
+            ),
+        );
+    }
+    if let Some(addr) = config.ats_addr.clone() {
+        venues.insert(
+            ome_protocol::Venue::Ats,
+            Upstream::new(
+                "dark pool",
+                Box::new(TcpConnector::new(addr, tx.clone(), ats_event)),
+                credentials(),
+            ),
+        );
+    }
+    let mut gateway = Gateway::new(broker, journal, exchange, clearing, venues, last_ts);
     gateway.ensure_admin(&config.admin_name, &config.admin_secret, now_ms())?;
     gateway.flush().map_err(|e| e.to_string())?;
 
@@ -156,6 +189,12 @@ fn handle(gateway: &mut Gateway, inbound: BrokerInbound) {
         }
         BrokerInbound::Clearing { generation, event } => {
             gateway.on_clearing(generation, event, now_ms())
+        }
+        BrokerInbound::Wholesaler { generation, event } => {
+            gateway.on_venue(ome_protocol::Venue::Wholesaler, generation, event, now_ms())
+        }
+        BrokerInbound::Ats { generation, event } => {
+            gateway.on_venue(ome_protocol::Venue::Ats, generation, event, now_ms())
         }
     }
 }
