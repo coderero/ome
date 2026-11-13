@@ -521,6 +521,9 @@ pub struct ContractNote {
 pub struct FeeSummary {
     pub charges: Charges,
     pub fills: u64,
+    pub routed_orders: u64,
+    pub internal_crosses: u64,
+    pub internalized_shares: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -627,6 +630,36 @@ pub struct BookSnapshot {
     pub asks: Vec<Level>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Venue {
+    #[default]
+    Exchange = 0,
+    Internal = 1,
+    Wholesaler = 2,
+    Ats = 3,
+}
+
+impl Venue {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Venue::Exchange,
+            1 => Venue::Internal,
+            2 => Venue::Wholesaler,
+            3 => Venue::Ats,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Venue::Exchange => "exchange",
+            Venue::Internal => "internal",
+            Venue::Wholesaler => "wholesaler",
+            Venue::Ats => "dark pool",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TradeEvent {
     pub symbol: Symbol,
@@ -635,6 +668,7 @@ pub struct TradeEvent {
     pub qty: Qty,
     pub aggressor: Side,
     pub timestamp: Timestamp,
+    pub venue: Venue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

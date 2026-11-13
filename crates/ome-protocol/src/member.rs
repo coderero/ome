@@ -49,6 +49,13 @@ pub enum MemberMessage {
         window_ms: u64,
         max_qty: Qty,
     },
+    TradeReport {
+        report_id: u64,
+        symbol: Symbol,
+        price: Price,
+        qty: Qty,
+        venue: Venue,
+    },
     SetMemberStatus {
         member: MemberId,
         enabled: bool,
@@ -117,6 +124,7 @@ impl MemberMessage {
             MemberMessage::QueryInstruments => MEMBER_QUERY_INSTRUMENTS,
             MemberMessage::Quote { .. } => MEMBER_QUOTE,
             MemberMessage::SetMmp { .. } => MEMBER_SET_MMP,
+            MemberMessage::TradeReport { .. } => MEMBER_TRADE_REPORT,
             MemberMessage::SetMemberStatus { .. } => SET_MEMBER_STATUS,
             MemberMessage::SetCancelOnDisconnect { .. } => SET_CANCEL_ON_DISCONNECT,
             MemberMessage::CreateMember { .. } => CREATE_MEMBER,
@@ -190,6 +198,20 @@ impl MemberMessage {
                 max_qty,
             } => {
                 e.u64(*account).u64(*window_ms).u64(*max_qty).end_block();
+            }
+            MemberMessage::TradeReport {
+                report_id,
+                symbol,
+                price,
+                qty,
+                venue,
+            } => {
+                e.u64(*report_id)
+                    .symbol(Some(*symbol))
+                    .u64(*price)
+                    .u64(*qty)
+                    .u8(*venue as u8)
+                    .end_block();
             }
             MemberMessage::SetMemberStatus { member, enabled }
             | MemberMessage::SetCancelOnDisconnect { member, enabled } => {
@@ -352,6 +374,21 @@ impl MemberMessage {
                     bid,
                     ask_ref,
                     ask,
+                }
+            }
+            MEMBER_TRADE_REPORT => {
+                let report_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let price = d.u64()?;
+                let qty = d.u64()?;
+                let venue = Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
+                d.end_block()?;
+                MemberMessage::TradeReport {
+                    report_id,
+                    symbol,
+                    price,
+                    qty,
+                    venue,
                 }
             }
             MEMBER_SET_MMP => {
@@ -538,6 +575,13 @@ pub mod tests {
                 account: 4,
                 window_ms: 1_000,
                 max_qty: 200,
+            },
+            MemberMessage::TradeReport {
+                report_id: 7,
+                symbol: sym("ACME"),
+                price: 2_505,
+                qty: 30,
+                venue: Venue::Internal,
             },
             MemberMessage::SetMemberStatus {
                 member: 3,

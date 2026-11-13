@@ -16,7 +16,7 @@ use ome_protocol::{
     AccountInfo, AccountSnapshot, AlgoReport, AlgoStatus, AlgoStrategy, Allocation, Asset, Charges,
     ConditionalReport, ConditionalStatus, ContractNote, ExecutionReport, FeeSummary, MarketPhase,
     MemberMessage, OrderStatus, Position, QuoteSide, Role, ServerMessage, SettlementReport,
-    Trigger,
+    Trigger, Venue,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -98,6 +98,11 @@ pub enum Fact {
         day: u64,
         marks: Vec<(Symbol, Price)>,
     },
+    OrderHeld(Box<Fact>),
+    InternalCross(Cross),
+    Released {
+        order_ref: u64,
+    },
     AlgoStarted(Algo),
     AlgoChild {
         algo_id: u64,
@@ -108,6 +113,19 @@ pub enum Fact {
         status: AlgoStatus,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cross {
+    pub cross_id: u64,
+    pub buy_ref: u64,
+    pub sell_ref: u64,
+    pub price: Price,
+    pub qty: Qty,
+    pub cycle: u64,
+    pub buy_charges: Charges,
+    pub sell_charges: Charges,
+    pub timestamp: Timestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +187,9 @@ pub struct Broker {
     algos: BTreeMap<u64, Algo>,
     algo_children: BTreeMap<u64, u64>,
     next_algo_id: u64,
+    held: BTreeMap<u64, OrderOptions>,
+    cycle: u64,
+    next_cross_id: u64,
 }
 
 impl Broker {
@@ -192,6 +213,9 @@ impl Broker {
             algos: BTreeMap::new(),
             algo_children: BTreeMap::new(),
             next_algo_id: 1,
+            held: BTreeMap::new(),
+            cycle: 0,
+            next_cross_id: 1,
         }
     }
 
@@ -1134,9 +1158,132 @@ impl Broker {
         Ok(MemberMessage::Cancel { order_id })
     }
 
+    pub fn hold_for_crossing(&self, fact: Fact, market: &MarketCache) -> Fact {
+        let Fact::OrderAccepted {
+            symbol,
+            side,
+            price,
+            options,
+            ..
+        } = &fact
+        else {
+            return fact;
+        };
+        let eligible_tif = matches!(
+            options.tif,
+            TimeInForce::Gtc | TimeInForce::Day | TimeInForce::Ioc | TimeInForce::Gtd(_)
+        );
+        let marketable = market.best(*symbol).is_some_and(|(bid, ask)| match side {
+            Side::Buy => *price >= ask,
+            Side::Sell => *price <= bid,
+        });
+        if self.profile.internalize
+            && eligible_tif
+            && !options.post_only
+            && options.display_qty.is_none()
+            && market.phase() == MarketPhase::Open
+            && market.is_trading(*symbol)
+            && marketable
+        {
+            Fact::OrderHeld(Box::new(fact))
+        } else {
+            fact
+        }
+    }
+
+    pub fn held_orders(&self) -> Vec<u64> {
+        self.held.keys().copied().collect()
+    }
+
+    pub fn next_cross(&self, market: &MarketCache, now: Timestamp) -> Option<Fact> {
+        let open = |r: &u64| {
+            self.orders
+                .get(r)
+                .filter(|m| m.filled < m.qty)
+                .map(|m| (*r, m))
+        };
+        let held: Vec<(u64, &OrderMeta)> = self.held.keys().filter_map(open).collect();
+        for (buy_ref, buy) in held.iter().filter(|(_, m)| m.side == Side::Buy) {
+            if market.phase() != MarketPhase::Open || !market.is_trading(buy.symbol) {
+                continue;
+            }
+            let Some((bid, ask)) = market.best(buy.symbol) else {
+                continue;
+            };
+            let mid = (bid + ask) / 2;
+            if buy.price < mid {
+                continue;
+            }
+            let Some((sell_ref, sell)) = held.iter().find(|(_, s)| {
+                s.side == Side::Sell
+                    && s.symbol == buy.symbol
+                    && s.account != buy.account
+                    && s.price <= mid
+            }) else {
+                continue;
+            };
+            let qty = (buy.qty - buy.filled).min(sell.qty - sell.filled);
+            let charges = |meta: &OrderMeta| {
+                let role = self
+                    .ledger
+                    .get(meta.account)
+                    .map_or(Role::Retail, |a| a.role);
+                self.fees
+                    .charges(role, meta.side, mid, qty, 0, meta.commission_paid)
+            };
+            return Some(Fact::InternalCross(Cross {
+                cross_id: self.next_cross_id,
+                buy_ref: *buy_ref,
+                sell_ref: *sell_ref,
+                price: mid,
+                qty,
+                cycle: self.cycle,
+                buy_charges: charges(buy),
+                sell_charges: charges(sell),
+                timestamp: now,
+            }));
+        }
+        None
+    }
+
+    fn cross_leg(&mut self, order_ref: u64, cross: &Cross, charges: &Charges) -> Vec<Effect> {
+        let Some(meta) = self.orders.get(&order_ref) else {
+            return vec![];
+        };
+        let filled = meta.filled + cross.qty;
+        let report = ExecutionReport {
+            seq: 0,
+            order_id: 0,
+            client_order_id: order_ref,
+            account: meta.account,
+            symbol: meta.symbol,
+            side: meta.side,
+            status: if filled >= meta.qty {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            },
+            price: meta.price,
+            qty: meta.qty,
+            filled,
+            leaves: meta.qty - filled,
+            last_price: cross.price,
+            last_qty: cross.qty,
+            fees: 0,
+            cycle: cross.cycle,
+            timestamp: cross.timestamp,
+            reason: "internal cross".into(),
+        };
+        if filled >= meta.qty {
+            self.held.remove(&order_ref);
+        }
+        self.apply_report(&report, charges)
+    }
+
     pub fn pending_orders(&self) -> Vec<u64> {
         self.orders
             .iter()
+            .filter(|(r, _)| !self.held.contains_key(r))
             .filter(|(_, m)| m.exchange_id.is_none())
             .map(|(r, _)| *r)
             .collect()
@@ -1205,6 +1352,7 @@ impl Broker {
                         exchange_id: None,
                     },
                 );
+                self.fee_totals.routed_orders += 1;
                 vec![
                     Effect::AccountChanged(*account),
                     Effect::ToExchange(MemberMessage::NewOrder {
@@ -1283,6 +1431,7 @@ impl Broker {
             }
             Fact::ExchangeReport { report, charges } => {
                 self.last_seq = self.last_seq.max(report.seq);
+                self.cycle = self.cycle.max(report.cycle);
                 self.apply_report(report, charges)
             }
             Fact::Allocated(allocation) => {
@@ -1382,6 +1531,58 @@ impl Broker {
                     );
                 }
                 effects
+            }
+            Fact::OrderHeld(order) => {
+                let mut effects = self.apply(order);
+                effects.retain(|e| !matches!(e, Effect::ToExchange(_)));
+                if let Fact::OrderAccepted {
+                    order_ref, options, ..
+                } = order.as_ref()
+                    && self.orders.contains_key(order_ref)
+                {
+                    self.fee_totals.routed_orders -= 1;
+                    self.held.insert(*order_ref, *options);
+                }
+                effects
+            }
+            Fact::InternalCross(cross) => {
+                self.next_cross_id = self.next_cross_id.max(cross.cross_id + 1);
+                let Some(symbol) = self.orders.get(&cross.buy_ref).map(|m| m.symbol) else {
+                    return vec![];
+                };
+                if !self.orders.contains_key(&cross.sell_ref) {
+                    return vec![];
+                }
+                let mut effects = self.cross_leg(cross.buy_ref, cross, &cross.buy_charges);
+                effects.extend(self.cross_leg(cross.sell_ref, cross, &cross.sell_charges));
+                self.fee_totals.internal_crosses += 1;
+                self.fee_totals.internalized_shares += cross.qty;
+                effects.push(Effect::ToExchange(MemberMessage::TradeReport {
+                    report_id: cross.cross_id,
+                    symbol,
+                    price: cross.price,
+                    qty: cross.qty,
+                    venue: Venue::Internal,
+                }));
+                effects
+            }
+            Fact::Released { order_ref } => {
+                let Some(options) = self.held.remove(order_ref) else {
+                    return vec![];
+                };
+                let Some(meta) = self.orders.get(order_ref) else {
+                    return vec![];
+                };
+                self.fee_totals.routed_orders += 1;
+                vec![Effect::ToExchange(MemberMessage::NewOrder {
+                    member_order_id: *order_ref,
+                    account: meta.account,
+                    symbol: meta.symbol,
+                    side: meta.side,
+                    kind: OrderKind::Limit(meta.price),
+                    options,
+                    qty: meta.qty - meta.filled,
+                })]
             }
             Fact::AlgoStarted(algo) => {
                 self.next_algo_id = self.next_algo_id.max(algo.algo_id + 1);
@@ -2964,6 +3165,7 @@ pub mod tests {
             qty: 1,
             aggressor: Side::Sell,
             timestamp: 0,
+            venue: ome_protocol::Venue::Exchange,
         }));
         let refused = broker.decide_order(
             alice,
@@ -3152,5 +3354,116 @@ pub mod tests {
             0,
         );
         assert!(refused.unwrap_err().contains("algorithmic"));
+    }
+
+    fn quoted_market() -> MarketCache {
+        let mut m = market();
+        let level = |price| ome_core::order_book::Level {
+            price,
+            qty: 100,
+            orders: 1,
+        };
+        m.apply(&ServerMessage::Book(ome_protocol::BookSnapshot {
+            symbol: sym(),
+            timestamp: 0,
+            bids: vec![level(24_90)],
+            asks: vec![level(25_10)],
+        }));
+        m
+    }
+
+    #[test]
+    fn internalizer_crosses_marketable_orders_at_the_midpoint_and_routes_the_rest() {
+        use crate::profile::Regime;
+        let mut broker = Broker::new(Profile::with_regime(ProfileKind::Retail, Regime::Us));
+        let alice = open(&mut broker, "alice", Role::Retail, 10_000_00);
+        let bob = holding(&mut broker, "bob", Role::Retail, 50);
+        let m = quoted_market();
+        let order = |broker: &Broker, account, side, kind, qty| {
+            let fact = broker
+                .decide_order(
+                    account,
+                    1,
+                    sym(),
+                    side,
+                    kind,
+                    OrderOptions::default(),
+                    qty,
+                    &m,
+                    0,
+                )
+                .unwrap();
+            broker.hold_for_crossing(fact, &m)
+        };
+
+        let resting = order(&broker, alice, Side::Buy, OrderKind::Limit(25_00), 3);
+        assert!(
+            matches!(resting, Fact::OrderAccepted { .. }),
+            "non-marketable goes to the exchange"
+        );
+        let buy = order(&broker, alice, Side::Buy, OrderKind::Market, 10);
+        assert!(matches!(buy, Fact::OrderHeld(_)));
+        assert!(routed(&broker.apply(&buy)).is_empty());
+        let sell = order(&broker, bob, Side::Sell, OrderKind::Limit(24_90), 6);
+        broker.apply(&sell);
+        assert_eq!(broker.held_orders(), vec![1, 2]);
+
+        let cross = broker.next_cross(&m, 5).unwrap();
+        let Fact::InternalCross(c) = &cross else {
+            unreachable!()
+        };
+        assert_eq!((c.price, c.qty, c.buy_charges.exchange_fee), (25_00, 6, 0));
+        let effects = broker.apply(&cross);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ToExchange(MemberMessage::TradeReport {
+                price: 25_00,
+                qty: 6,
+                venue: Venue::Internal,
+                ..
+            })
+        )));
+        assert_eq!(broker.next_cross(&m, 5), None);
+        assert_eq!(broker.held_orders(), vec![1], "bob was filled completely");
+        assert_eq!(
+            broker.ledger().get(bob).unwrap().position(sym()).total(),
+            44
+        );
+
+        let effects = broker.apply(&Fact::Released { order_ref: 1 });
+        assert_eq!(
+            routed(&effects),
+            vec![(Side::Buy, OrderKind::Limit(27_50), 4)]
+        );
+        assert!(broker.held_orders().is_empty());
+        let stats = broker.fee_summary();
+        assert_eq!(
+            (
+                stats.internal_crosses,
+                stats.internalized_shares,
+                stats.routed_orders
+            ),
+            (1, 6, 1)
+        );
+
+        let mut india = Broker::new(Profile::with_regime(ProfileKind::Retail, Regime::India));
+        let carol = open(&mut india, "carol", Role::Retail, 10_000_00);
+        let fact = india
+            .decide_order(
+                carol,
+                1,
+                sym(),
+                Side::Buy,
+                OrderKind::Market,
+                OrderOptions::default(),
+                1,
+                &m,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            india.hold_for_crossing(fact, &m),
+            Fact::OrderAccepted { .. }
+        ));
     }
 }

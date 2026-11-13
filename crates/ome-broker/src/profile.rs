@@ -43,9 +43,26 @@ pub struct Limits {
     pub max_notional: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Regime {
+    Us,
+    India,
+}
+
+impl Regime {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "us" => Some(Regime::Us),
+            "india" => Some(Regime::India),
+            _ => None,
+        }
+    }
+}
+
 pub struct Profile {
     pub kind: ProfileKind,
     pub allowed: Vec<Role>,
+    pub internalize: bool,
 }
 
 impl Profile {
@@ -56,7 +73,19 @@ impl Profile {
             ProfileKind::Dma => vec![Role::Hft],
             ProfileKind::Lp => vec![Role::LpDesk],
         };
-        Self { kind, allowed }
+        Self {
+            kind,
+            allowed,
+            internalize: false,
+        }
+    }
+
+    pub fn with_regime(kind: ProfileKind, regime: Regime) -> Self {
+        Self {
+            internalize: regime == Regime::Us
+                && matches!(kind, ProfileKind::Retail | ProfileKind::Prime),
+            ..Self::new(kind)
+        }
     }
 
     pub fn allows(&self, role: Role) -> bool {

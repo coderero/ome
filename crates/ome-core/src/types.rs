@@ -147,6 +147,7 @@ pub struct Trade {
     pub price: Price,
     pub qty: Qty,
     pub timestamp: Timestamp,
+    pub venue: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

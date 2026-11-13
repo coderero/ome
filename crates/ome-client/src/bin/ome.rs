@@ -343,6 +343,11 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             println!("regulatory fee   {}", format_price(c.regulatory_fee));
             println!("GST              {}", format_price(c.gst));
             println!("total charged    {}", format_signed(c.total()));
+            println!("orders routed    {}", summary.routed_orders);
+            println!(
+                "internal crosses {} ({} shares)",
+                summary.internal_crosses, summary.internalized_shares
+            );
         }
         ["accounts"] => {
             for a in accounts(client)? {
@@ -1165,15 +1170,22 @@ fn watch(client: &mut Client) -> Result<()> {
     loop {
         match client.recv_timeout(Duration::from_secs(10))? {
             Some(ServerMessage::Trade(t)) if t.trade_id != 0 => println!(
-                "{} {} {:>10} x {}",
+                "{} {} {:>10} x {}{}",
                 t.symbol,
-                if t.aggressor == Side::Buy {
+                if t.venue != ome_protocol::Venue::Exchange {
+                    "◆"
+                } else if t.aggressor == Side::Buy {
                     "▲"
                 } else {
                     "▼"
                 },
                 format_price(t.price),
-                t.qty
+                t.qty,
+                if t.venue == ome_protocol::Venue::Exchange {
+                    String::new()
+                } else {
+                    format!("  ({} print)", t.venue.label())
+                }
             ),
             Some(ServerMessage::Instrument(i)) if !i.halt_reason.is_empty() => {
                 println!("{} HALTED: {}", i.symbol, i.halt_reason)

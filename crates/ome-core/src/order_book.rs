@@ -95,6 +95,7 @@ impl OrderBook {
                     price: level_price,
                     qty,
                     timestamp: incoming.timestamp,
+                    venue: 0,
                 });
 
                 if resting.qty == 0 {
@@ -238,6 +239,7 @@ impl OrderBook {
                     price,
                     qty,
                     timestamp,
+                    venue: 0,
                 });
                 if bid.qty == 0 {
                     let id = bid.id;

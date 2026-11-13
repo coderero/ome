@@ -105,7 +105,7 @@ SBE (schema 7, version 2) with SOFH framing on every connection. All integers ar
 | Family | Direction | Messages |
 |---|---|---|
 | client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Quote, SetMmp, Conditional, Oco, Bracket, CancelConditional, AlgoOrder, CancelAlgo, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, SetAccountStatus, SetRestricted, SetLossLimit, QueryAccounts |
-| member | provider → exchange | Logon (with `last_seq`), NewOrder (account ref + time in force), Cancel, CancelAll, Subscribe; ops: CreateMember, ListInstrument, Halt, Resume, QueryMembers |
+| member | provider → exchange | Logon (with `last_seq`), NewOrder (account ref + time in force), Cancel, CancelAll, Quote, SetMmp, TradeReport, Subscribe; ops: CreateMember, ListInstrument, Halt, Resume, QueryMembers |
 | server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, ConditionalUpdate, AlgoUpdate, ContractNote, Ack, Reject, Heartbeat |
 
 Client and member templates never overlap; sending one family's message to the other service fails to decode (tested).
@@ -186,6 +186,14 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw bracket ACME buy
 # cond #5 armed sell 5 ACME when last >= 27.00 (bracket exit armed)
 # cond #6 armed sell 5 ACME when last <= 23.50 (bracket exit armed)
 ```
+
+## Off-Exchange Execution
+
+Brokers run under a market regime: `--regime us` (the default) lets retail and prime brokers **internalize**, and `--regime india` sends every order to the exchange, as SEBI requires. Set it for the demo with `OME_REGIME=india`.
+
+The internalizer only crosses **marketable** orders, so resting liquidity always reaches the lit book. A client order that would trade immediately at the exchange (a market order, or a limit at or through the best price) is held until the broker's next 50 ms crossing batch. Held buys and sells from different accounts are matched first-come first-served at the **exchange midpoint**: both clients get price improvement over the quote, and neither pays an exchange fee. Brokerage and taxes still apply. Whatever does not cross is sent on to the exchange at once. Held orders are journaled, so a crash resumes the batch instead of losing them.
+
+Every internal cross is reported to the exchange with a `TradeReport` and printed on the public tape flagged with its venue (`◆ ... (internal print)` in `watch`). Prints update last price, volume and candles everywhere, and the exchange rejects any print outside the circuit limits or while the symbol is halted. `ome broker fees` shows the broker's routing statistics: orders routed to the exchange, internal crosses and internalized shares.
 
 ## Algorithmic Orders
 
@@ -312,7 +320,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 169 tests
+cargo test --workspace     # 171 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -320,7 +328,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 ## Roadmap
 
 - **1f** ~~broker-held orders, broker risk controls, algorithmic orders (TWAP, VWAP, POV, iceberg slicer)~~ done
-- **1g** off-exchange execution: broker internalization, wholesaler with payment for order flow, dark pool
+- **1g** off-exchange execution: ~~broker internalization and tape reporting~~ done; wholesaler with payment for order flow, dark pool, market stats, designated market makers
 - **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane
 - **3** local-LLM newsroom: company reports, IPO prospectuses, news and macro events

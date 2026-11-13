@@ -1,5 +1,5 @@
 use crate::algo::Algo;
-use crate::broker::{Fact, QuoteLeg};
+use crate::broker::{Cross, Fact, QuoteLeg};
 use crate::oms::Conditional;
 use ome_core::types::Timestamp;
 use ome_protocol::Asset;
@@ -31,6 +31,9 @@ mod template {
     pub const ALGO_STARTED: u16 = 317;
     pub const ALGO_CHILD: u16 = 318;
     pub const ALGO_FINISHED: u16 = 319;
+    pub const ORDER_HELD: u16 = 320;
+    pub const INTERNAL_CROSS: u16 = 321;
+    pub const RELEASED: u16 = 322;
     pub const CONDITIONAL: u16 = 399;
 }
 
@@ -107,6 +110,9 @@ impl Entry for Record {
             Fact::LossLimitSet { .. } => template::LOSS_LIMIT_SET,
             Fact::TradingDayStarted { .. } => template::TRADING_DAY_STARTED,
             Fact::AlgoStarted(_) => template::ALGO_STARTED,
+            Fact::OrderHeld(_) => template::ORDER_HELD,
+            Fact::InternalCross(_) => template::INTERNAL_CROSS,
+            Fact::Released { .. } => template::RELEASED,
             Fact::AlgoChild { .. } => template::ALGO_CHILD,
             Fact::AlgoFinished { .. } => template::ALGO_FINISHED,
         };
@@ -252,6 +258,23 @@ impl Entry for Record {
                     .u64(a.limit.unwrap_or(0));
                 put_algo_strategy(&mut e, &a.strategy);
                 e.u64(a.started_at).u64(a.volume_base).end_block();
+            }
+            Fact::OrderHeld(order) => {
+                e.end_block().var_bytes(&encode_inner(order));
+            }
+            Fact::InternalCross(c) => {
+                e.u64(c.cross_id)
+                    .u64(c.buy_ref)
+                    .u64(c.sell_ref)
+                    .u64(c.price)
+                    .u64(c.qty)
+                    .u64(c.cycle);
+                put_charges(&mut e, &c.buy_charges);
+                put_charges(&mut e, &c.sell_charges);
+                e.u64(c.timestamp).end_block();
+            }
+            Fact::Released { order_ref } => {
+                e.u64(*order_ref).end_block();
             }
             Fact::AlgoChild { algo_id, order } => {
                 e.u64(*algo_id).end_block().var_bytes(&encode_inner(order));
@@ -467,6 +490,30 @@ impl Entry for Record {
                 };
                 d.end_block()?;
                 Fact::AlgoStarted(algo)
+            }
+            template::ORDER_HELD => {
+                d.end_block()?;
+                Fact::OrderHeld(decode_inner(d.var_bytes()?)?)
+            }
+            template::INTERNAL_CROSS => {
+                let cross = Cross {
+                    cross_id: d.u64()?,
+                    buy_ref: d.u64()?,
+                    sell_ref: d.u64()?,
+                    price: d.u64()?,
+                    qty: d.u64()?,
+                    cycle: d.u64()?,
+                    buy_charges: get_charges(&mut d)?,
+                    sell_charges: get_charges(&mut d)?,
+                    timestamp: d.u64()?,
+                };
+                d.end_block()?;
+                Fact::InternalCross(cross)
+            }
+            template::RELEASED => {
+                let order_ref = d.u64()?;
+                d.end_block()?;
+                Fact::Released { order_ref }
             }
             template::ALGO_CHILD => {
                 let algo_id = d.u64()?;
@@ -727,6 +774,25 @@ mod tests {
                 status: AlgoStatus::Cancelled,
                 reason: "cancelled by the client".into(),
             },
+            Fact::OrderHeld(Box::new(Fact::OrderAbandoned { order_ref: 5 })),
+            Fact::InternalCross(Cross {
+                cross_id: 1,
+                buy_ref: 30,
+                sell_ref: 31,
+                price: 25_05,
+                qty: 4,
+                cycle: 2,
+                buy_charges: ome_protocol::Charges {
+                    commission: 3,
+                    ..Default::default()
+                },
+                sell_charges: ome_protocol::Charges {
+                    transaction_tax: 1,
+                    ..Default::default()
+                },
+                timestamp: 9,
+            }),
+            Fact::Released { order_ref: 30 },
             Fact::AccountStatusSet {
                 account: 2,
                 suspended: true,

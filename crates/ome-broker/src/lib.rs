@@ -16,7 +16,7 @@ use ome_client::LinkEvent;
 use ome_client::upstream::{MemberCredentials, TcpConnector, Upstream};
 use ome_net::{Inbound, listen, log, now_ms};
 use ome_store::Journal;
-use profile::{Profile, ProfileKind};
+use profile::{Profile, ProfileKind, Regime};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -36,6 +36,7 @@ pub struct BrokerConfig {
     pub member_name: String,
     pub member_secret: String,
     pub clearing_addr: Option<String>,
+    pub regime: Regime,
 }
 
 pub enum BrokerInbound {
@@ -59,7 +60,7 @@ fn clearing_event(generation: u64, event: LinkEvent) -> BrokerInbound {
 }
 
 pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
-    let mut broker = Broker::new(Profile::new(config.profile));
+    let mut broker = Broker::new(Profile::with_regime(config.profile, config.regime));
     let mut last_ts = 0;
     let journal = match &config.journal {
         Some(path) => {

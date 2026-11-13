@@ -33,6 +33,7 @@ pub const MEMBER_UNSUBSCRIBE: u16 = 64;
 pub const MEMBER_QUERY_INSTRUMENTS: u16 = 65;
 pub const MEMBER_QUOTE: u16 = 66;
 pub const MEMBER_SET_MMP: u16 = 67;
+pub const MEMBER_TRADE_REPORT: u16 = 68;
 pub const CREATE_MEMBER: u16 = 70;
 pub const LIST_INSTRUMENT: u16 = 71;
 pub const HALT: u16 = 72;

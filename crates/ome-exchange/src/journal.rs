@@ -26,6 +26,7 @@ mod template {
     pub const SET_CANCEL_ON_DISCONNECT: u16 = 214;
     pub const QUOTE: u16 = 215;
     pub const SET_MMP: u16 = 216;
+    pub const TRADE_REPORT: u16 = 217;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,7 @@ impl Entry for Record {
             Command::SetCancelOnDisconnect { .. } => template::SET_CANCEL_ON_DISCONNECT,
             Command::Quote { .. } => template::QUOTE,
             Command::SetMmp { .. } => template::SET_MMP,
+            Command::TradeReport { .. } => template::TRADE_REPORT,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -145,6 +147,22 @@ impl Entry for Record {
                 e.u64(*ask_ref);
                 put_quote_side(&mut e, ask);
                 e.end_block();
+            }
+            Command::TradeReport {
+                member,
+                report_id,
+                symbol,
+                price,
+                qty,
+                venue,
+            } => {
+                e.u64(*member)
+                    .u64(*report_id)
+                    .symbol(Some(*symbol))
+                    .u64(*price)
+                    .u64(*qty)
+                    .u8(*venue as u8)
+                    .end_block();
             }
             Command::SetMmp {
                 member,
@@ -305,6 +323,24 @@ impl Entry for Record {
                     ask,
                 }
             }
+            template::TRADE_REPORT => {
+                let member = d.u64()?;
+                let report_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let price = d.u64()?;
+                let qty = d.u64()?;
+                let venue =
+                    ome_protocol::Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
+                d.end_block()?;
+                Command::TradeReport {
+                    member,
+                    report_id,
+                    symbol,
+                    price,
+                    qty,
+                    venue,
+                }
+            }
             template::SET_MMP => {
                 let member = d.u64()?;
                 let account = d.u64()?;
@@ -447,6 +483,14 @@ mod tests {
         });
         commands.push(Command::SetSchedule { schedule: None });
         commands.push(Command::ExpireGtd { at: 2_000_000 });
+        commands.push(Command::TradeReport {
+            member: 3,
+            report_id: 4,
+            symbol: sym("ACME"),
+            price: 25_05,
+            qty: 12,
+            venue: ome_protocol::Venue::Wholesaler,
+        });
         commands.push(Command::SetMmp {
             member: 3,
             account: 2,

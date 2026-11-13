@@ -266,7 +266,11 @@ impl ServerMessage {
             }
             ServerMessage::FeeSummary(f) => {
                 put_charges(&mut e, &f.charges);
-                e.u64(f.fills).end_block();
+                e.u64(f.fills)
+                    .u64(f.routed_orders)
+                    .u64(f.internal_crosses)
+                    .u64(f.internalized_shares)
+                    .end_block();
             }
             ServerMessage::InstrumentList(list) => {
                 e.end_block();
@@ -300,6 +304,7 @@ impl ServerMessage {
                     .u64(t.qty)
                     .u8(side_to_u8(t.aggressor))
                     .u64(t.timestamp)
+                    .u8(t.venue as u8)
                     .end_block();
             }
             ServerMessage::Candles(c) => {
@@ -673,8 +678,17 @@ impl ServerMessage {
             FEE_SUMMARY => {
                 let charges = get_charges(&mut d)?;
                 let fills = d.u64()?;
+                let routed_orders = d.u64()?;
+                let internal_crosses = d.u64()?;
+                let internalized_shares = d.u64()?;
                 d.end_block()?;
-                ServerMessage::FeeSummary(FeeSummary { charges, fills })
+                ServerMessage::FeeSummary(FeeSummary {
+                    charges,
+                    fills,
+                    routed_orders,
+                    internal_crosses,
+                    internalized_shares,
+                })
             }
             INSTRUMENT_LIST => {
                 d.end_block()?;
@@ -730,6 +744,7 @@ impl ServerMessage {
                 let qty = d.u64()?;
                 let aggressor = side_from_u8(d.u8()?)?;
                 let timestamp = d.u64()?;
+                let venue = Venue::from_u8(d.u8()?).ok_or(DecodeError::Invalid("venue"))?;
                 d.end_block()?;
                 ServerMessage::Trade(TradeEvent {
                     symbol,
@@ -738,6 +753,7 @@ impl ServerMessage {
                     qty,
                     aggressor,
                     timestamp,
+                    venue,
                 })
             }
             CANDLE_SNAPSHOT => {
@@ -1045,6 +1061,9 @@ mod tests {
                     ..Charges::default()
                 },
                 fills: 3,
+                routed_orders: 9,
+                internal_crosses: 2,
+                internalized_shares: 40,
             }),
             ServerMessage::Allocation(Allocation {
                 seq: 3,
@@ -1080,6 +1099,7 @@ mod tests {
                 qty: 2,
                 aggressor: Side::Buy,
                 timestamp: 8,
+                venue: Venue::Internal,
             }),
             ServerMessage::Candles(CandleSnapshot {
                 symbol: sym("ACME"),

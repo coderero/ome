@@ -343,6 +343,20 @@ impl Gateway {
                 ask_ref,
                 ask,
             },
+            MemberMessage::TradeReport {
+                report_id,
+                symbol,
+                price,
+                qty,
+                venue,
+            } if trader => Command::TradeReport {
+                member,
+                report_id,
+                symbol,
+                price,
+                qty,
+                venue,
+            },
             MemberMessage::SetMmp {
                 account,
                 window_ms,
@@ -520,6 +534,7 @@ impl Gateway {
                 qty: t.qty,
                 aggressor: t.taker_side,
                 timestamp: t.timestamp,
+                venue: ome_protocol::Venue::from_u8(t.venue).unwrap_or_default(),
             })
             .collect();
         trades.reverse();

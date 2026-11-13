@@ -106,6 +106,11 @@ impl MarketCache {
         self.quotes.get(&symbol)
     }
 
+    pub fn best(&self, symbol: Symbol) -> Option<(Price, Price)> {
+        let book = self.quotes.get(&symbol)?.book.as_ref()?;
+        Some((book.bids.first()?.price, book.asks.first()?.price))
+    }
+
     pub fn symbols(&self) -> impl Iterator<Item = Symbol> + '_ {
         self.quotes.keys().copied()
     }
@@ -197,6 +202,7 @@ mod tests {
             qty: 3,
             aggressor: Side::Buy,
             timestamp: 10,
+            venue: ome_protocol::Venue::Exchange,
         }));
         assert_eq!(cache.band(acme), Some((94_50, 115_50)));
         assert_eq!(cache.snapshot(acme).len(), 3);

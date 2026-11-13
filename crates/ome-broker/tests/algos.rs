@@ -1,4 +1,4 @@
-use ome_broker::profile::ProfileKind;
+use ome_broker::profile::{ProfileKind, Regime};
 use ome_broker::{BrokerConfig, start as start_broker};
 use ome_client::Client;
 use ome_core::symbol::Symbol;
@@ -39,6 +39,7 @@ fn twap_parent_fills_through_child_orders_on_the_real_exchange() {
         member_name: "prime-co".into(),
         member_secret: "pw".into(),
         clearing_addr: None,
+        regime: Regime::India,
     })
     .unwrap()
     .0;

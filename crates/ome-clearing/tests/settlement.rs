@@ -1,4 +1,4 @@
-use ome_broker::profile::ProfileKind;
+use ome_broker::profile::{ProfileKind, Regime};
 use ome_broker::{BrokerConfig, start as start_broker};
 use ome_clearing::clearing::ClearingConfig;
 use ome_clearing::{ServiceConfig, start as start_clearing};
@@ -40,6 +40,7 @@ fn broker(
         member_name: member.into(),
         member_secret: "pw".into(),
         clearing_addr: Some(clearing.to_string()),
+        regime: Regime::India,
     })
     .unwrap()
     .0

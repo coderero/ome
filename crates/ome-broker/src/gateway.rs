@@ -127,6 +127,7 @@ impl Gateway {
         self.market.roll(now);
         self.release_after_market_orders(now);
         self.step_algos(now);
+        self.run_crossing(now);
         if now >= self.last_heartbeat + HEARTBEAT_MS {
             self.last_heartbeat = now;
             let heartbeat = encode(&ServerMessage::Heartbeat { server_time: now });
@@ -146,6 +147,20 @@ impl Gateway {
             if let Some(fact) = self.broker.decide_trigger(cond_id, 0, &self.market, now) {
                 let _ = self.record(fact, now);
             }
+        }
+    }
+
+    fn run_crossing(&mut self, now: Timestamp) {
+        if !self.exchange.is_ready() || self.broker.held_orders().is_empty() {
+            return;
+        }
+        while let Some(fact) = self.broker.next_cross(&self.market, now) {
+            if self.record(fact, now).is_err() {
+                break;
+            }
+        }
+        for order_ref in self.broker.held_orders() {
+            let _ = self.record(Fact::Released { order_ref }, now);
         }
     }
 
@@ -570,6 +585,7 @@ impl Gateway {
                 };
                 match decision {
                     Ok(fact) => {
+                        let fact = self.broker.hold_for_crossing(fact, &self.market);
                         if self.record(fact, now).is_err() {
                             self.reject(
                                 id,

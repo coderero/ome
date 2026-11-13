@@ -1,9 +1,9 @@
-use ome_broker::profile::ProfileKind;
+use ome_broker::profile::{ProfileKind, Regime};
 use ome_broker::{BrokerConfig, start};
 use ome_client::DEFAULT_EXCHANGE_ADDR;
 
 const USAGE: &str = "usage: ome-broker --profile retail|prime|dma|lp --member NAME --member-secret SECRET
-                  [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
+                  [--regime us|india] [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
 
 fn parse_args() -> Result<BrokerConfig, String> {
     let mut config = BrokerConfig {
@@ -17,6 +17,7 @@ fn parse_args() -> Result<BrokerConfig, String> {
         member_name: String::new(),
         member_secret: String::new(),
         clearing_addr: std::env::var("OME_CLEARING").ok(),
+        regime: Regime::Us,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -25,6 +26,9 @@ fn parse_args() -> Result<BrokerConfig, String> {
             "--profile" => {
                 config.profile = ProfileKind::parse(&value()?)
                     .ok_or("profile must be retail, prime, dma or lp")?
+            }
+            "--regime" => {
+                config.regime = Regime::parse(&value()?).ok_or("regime must be us or india")?
             }
             "--listen" => config.listen = value()?,
             "--exchange" => config.exchange_addr = value()?,

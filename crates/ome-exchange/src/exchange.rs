@@ -14,7 +14,7 @@ use ome_net::feed::{Feeds, Replay};
 use ome_protocol::{
     Allocation, AuctionInfo, ClearedTrade, ExecutionReport, InstrumentInfo, MarketPhase,
     MarketStatus, MemberId, MemberInfo, MemberKind, OrderStatus, QuoteSide, ServerMessage,
-    TradeEvent,
+    TradeEvent, Venue,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -54,6 +54,14 @@ impl Default for ExchangeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    TradeReport {
+        member: MemberId,
+        report_id: u64,
+        symbol: Symbol,
+        price: Price,
+        qty: Qty,
+        venue: Venue,
+    },
     CreateMember {
         kind: MemberKind,
         name: String,
@@ -170,6 +178,7 @@ pub enum ExchangeError {
     NotHalted(Symbol),
     UnknownOrder(OrderId),
     NotOwner(OrderId),
+    InvalidReport(String),
 }
 
 impl fmt::Display for ExchangeError {
@@ -188,6 +197,7 @@ impl fmt::Display for ExchangeError {
             ExchangeError::NotHalted(s) => write!(f, "{s} is not halted"),
             ExchangeError::UnknownOrder(id) => write!(f, "order #{id} is not open"),
             ExchangeError::NotOwner(id) => write!(f, "order #{id} belongs to another member"),
+            ExchangeError::InvalidReport(why) => write!(f, "trade report rejected: {why}"),
         }
     }
 }
@@ -226,6 +236,7 @@ pub struct Exchange {
     risk: RiskEngine,
     next_order_id: OrderId,
     next_trade_id: u64,
+    off_exchange: BTreeMap<(Symbol, Venue), Qty>,
     next_allocation_id: u64,
 }
 
@@ -264,6 +275,7 @@ impl Exchange {
             risk,
             next_order_id: 1,
             next_trade_id: 1,
+            off_exchange: BTreeMap::new(),
             next_allocation_id: 1,
         }
     }
@@ -286,6 +298,14 @@ impl Exchange {
         now: Timestamp,
     ) -> Result<Vec<Event>, ExchangeError> {
         match command {
+            Command::TradeReport {
+                member,
+                symbol,
+                price,
+                qty,
+                venue,
+                ..
+            } => self.report_trade(*member, *symbol, (*price, *qty), *venue, now),
             Command::CreateMember { kind, name, secret } => self
                 .members
                 .admit(name, *kind, *secret)
@@ -1233,6 +1253,69 @@ impl Exchange {
         events
     }
 
+    fn report_trade(
+        &mut self,
+        member: MemberId,
+        symbol: Symbol,
+        (price, qty): (Price, Qty),
+        venue: Venue,
+        now: Timestamp,
+    ) -> Result<Vec<Event>, ExchangeError> {
+        self.trading_member(member)?;
+        if venue == Venue::Exchange || qty == 0 {
+            return Err(ExchangeError::InvalidReport(
+                "needs an off-exchange venue and a quantity".into(),
+            ));
+        }
+        let circuit_bps = self.config.circuit_bps;
+        let instrument = self
+            .instruments
+            .get_mut(&symbol)
+            .ok_or(ExchangeError::UnknownSymbol(symbol))?;
+        if instrument.halt.is_some() {
+            return Err(ExchangeError::InvalidReport(format!("{symbol} is halted")));
+        }
+        let (low, high) = instrument.circuit_limits(circuit_bps);
+        if price < low || price > high {
+            return Err(ExchangeError::InvalidReport(format!(
+                "price {} outside {} - {}",
+                ome_core::price::format_price(price),
+                ome_core::price::format_price(low),
+                ome_core::price::format_price(high)
+            )));
+        }
+        let trade_id = self.next_trade_id;
+        self.next_trade_id += 1;
+        instrument.record_trade(&Trade {
+            maker_order: 0,
+            taker_order: 0,
+            maker_account: 0,
+            taker_account: 0,
+            taker_side: Side::Buy,
+            price,
+            qty,
+            timestamp: now,
+            venue: venue as u8,
+        });
+        *self.off_exchange.entry((symbol, venue)).or_default() += qty;
+        Ok(vec![Event::Trade(TradeEvent {
+            symbol,
+            trade_id,
+            price,
+            qty,
+            aggressor: Side::Buy,
+            timestamp: now,
+            venue,
+        })])
+    }
+
+    pub fn off_exchange_volume(&self, symbol: Symbol, venue: Venue) -> Qty {
+        self.off_exchange
+            .get(&(symbol, venue))
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn fill(&mut self, symbol: Symbol, trade: &Trade, now: Timestamp, events: &mut Vec<Event>) {
         let trade_id = self.next_trade_id;
         self.next_trade_id += 1;
@@ -1246,6 +1329,7 @@ impl Exchange {
             qty: trade.qty,
             aggressor: trade.taker_side,
             timestamp: now,
+            venue: Venue::Exchange,
         }));
         let mut legs = Vec::with_capacity(2);
         for (order_id, maker) in [(trade.maker_order, true), (trade.taker_order, false)] {
@@ -2218,6 +2302,50 @@ mod tests {
                 1
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn off_exchange_trade_reports_print_on_the_tape_within_the_circuit() {
+        let mut m = market();
+        let broker = m.broker;
+        let report = |price, venue| Command::TradeReport {
+            member: broker,
+            report_id: 1,
+            symbol: sym("ACME"),
+            price,
+            qty: 30,
+            venue,
+        };
+        let events = m.ex.execute(&report(25_10, Venue::Internal), 5).unwrap();
+        assert!(matches!(
+            events[..],
+            [Event::Trade(TradeEvent {
+                price: 25_10,
+                qty: 30,
+                venue: Venue::Internal,
+                ..
+            })]
+        ));
+        let acme = m.ex.instrument(sym("ACME")).unwrap();
+        assert_eq!((acme.last_price, acme.volume), (Some(25_10), 30));
+        assert_eq!(m.ex.off_exchange_volume(sym("ACME"), Venue::Internal), 30);
+        assert!(m.ex.execute(&report(25_10, Venue::Exchange), 5).is_err());
+        assert!(m.ex.execute(&report(1_00, Venue::Internal), 5).is_err());
+        assert!(
+            m.ex.execute(
+                &Command::TradeReport {
+                    member: 1,
+                    report_id: 2,
+                    symbol: sym("ACME"),
+                    price: 25_00,
+                    qty: 1,
+                    venue: Venue::Internal
+                },
+                5
+            )
+            .is_err(),
+            "the admin member does not trade"
         );
     }
 
