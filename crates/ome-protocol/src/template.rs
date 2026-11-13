@@ -15,6 +15,9 @@ pub const QUERY_ACCOUNT: u16 = 22;
 pub const QUERY_INSTRUMENTS: u16 = 23;
 pub const CREATE_ACCOUNT: u16 = 30;
 pub const SET_BALANCE: u16 = 31;
+pub const SET_ACCOUNT_STATUS: u16 = 32;
+pub const SET_RESTRICTED: u16 = 33;
+pub const SET_LOSS_LIMIT: u16 = 34;
 pub const QUERY_ACCOUNTS: u16 = 35;
 pub const QUERY_FEES: u16 = 36;
 

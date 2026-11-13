@@ -5,6 +5,7 @@ use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{Side, Timestamp};
 use ome_net::auth::{hash_secret, valid_username, verify};
+use ome_net::throttle::TokenBucket;
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
 use ome_protocol::{
@@ -26,23 +27,7 @@ struct Session {
     outbox: Box<dyn Outbox>,
     login: Option<(MemberId, MemberKind)>,
     subscriptions: BTreeSet<Symbol>,
-    tokens: f64,
-    refilled_at: Timestamp,
-    throttled: u64,
-}
-
-impl Session {
-    fn allow(&mut self, now: Timestamp) -> bool {
-        let elapsed = now.saturating_sub(self.refilled_at) as f64 / 1_000.0;
-        self.tokens = (self.tokens + elapsed * THROTTLE_PER_SECOND).min(THROTTLE_BURST);
-        self.refilled_at = now;
-        if self.tokens < 1.0 {
-            self.throttled += 1;
-            return false;
-        }
-        self.tokens -= 1.0;
-        true
-    }
+    throttle: TokenBucket,
 }
 
 pub struct Gateway {
@@ -102,9 +87,7 @@ impl Gateway {
                 outbox,
                 login: None,
                 subscriptions: BTreeSet::new(),
-                tokens: THROTTLE_BURST,
-                refilled_at: self.clock,
-                throttled: 0,
+                throttle: TokenBucket::new(THROTTLE_PER_SECOND, THROTTLE_BURST, self.clock),
             },
         );
     }
@@ -145,11 +128,11 @@ impl Gateway {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        if !session.allow(now) {
-            if session.throttled % 1_000 == 1 {
+        if !session.throttle.allow(now) {
+            if session.throttle.dropped() % 1_000 == 1 {
                 log(&format!(
                     "session {id} throttled ({} messages dropped)",
-                    session.throttled
+                    session.throttle.dropped()
                 ));
             }
             let ref_template = Decoder::peek_template(bytes).unwrap_or(0);

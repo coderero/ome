@@ -73,6 +73,18 @@ pub enum ClientMessage {
     },
     QueryAccount,
     QueryInstruments,
+    SetAccountStatus {
+        account_id: AccountId,
+        suspended: bool,
+    },
+    SetRestricted {
+        symbol: Symbol,
+        restricted: bool,
+    },
+    SetLossLimit {
+        account_id: AccountId,
+        amount: u64,
+    },
     CreateAccount {
         role: Role,
         cash: u64,
@@ -110,6 +122,9 @@ impl ClientMessage {
             ClientMessage::SetBalance { .. } => SET_BALANCE,
             ClientMessage::QueryAccounts => QUERY_ACCOUNTS,
             ClientMessage::QueryFees => QUERY_FEES,
+            ClientMessage::SetAccountStatus { .. } => SET_ACCOUNT_STATUS,
+            ClientMessage::SetRestricted { .. } => SET_RESTRICTED,
+            ClientMessage::SetLossLimit { .. } => SET_LOSS_LIMIT,
         }
     }
 
@@ -215,6 +230,18 @@ impl ClientMessage {
             ClientMessage::Subscribe { symbol } | ClientMessage::Unsubscribe { symbol } => {
                 e.symbol(Some(*symbol)).end_block();
             }
+            ClientMessage::SetAccountStatus {
+                account_id,
+                suspended,
+            } => {
+                e.u64(*account_id).u8(*suspended as u8).end_block();
+            }
+            ClientMessage::SetRestricted { symbol, restricted } => {
+                e.symbol(Some(*symbol)).u8(*restricted as u8).end_block();
+            }
+            ClientMessage::SetLossLimit { account_id, amount } => {
+                e.u64(*account_id).u64(*amount).end_block();
+            }
             ClientMessage::CreateAccount {
                 role,
                 cash,
@@ -270,6 +297,27 @@ impl ClientMessage {
             QUERY_FEES => {
                 d.end_block()?;
                 ClientMessage::QueryFees
+            }
+            SET_ACCOUNT_STATUS => {
+                let account_id = d.u64()?;
+                let suspended = d.u8()? != 0;
+                d.end_block()?;
+                ClientMessage::SetAccountStatus {
+                    account_id,
+                    suspended,
+                }
+            }
+            SET_RESTRICTED => {
+                let symbol = d.symbol()?;
+                let restricted = d.u8()? != 0;
+                d.end_block()?;
+                ClientMessage::SetRestricted { symbol, restricted }
+            }
+            SET_LOSS_LIMIT => {
+                let account_id = d.u64()?;
+                let amount = d.u64()?;
+                d.end_block()?;
+                ClientMessage::SetLossLimit { account_id, amount }
             }
             NEW_ORDER => {
                 let client_order_id = d.u64()?;
@@ -519,6 +567,18 @@ pub mod tests {
             },
             ClientMessage::QueryAccounts,
             ClientMessage::QueryFees,
+            ClientMessage::SetAccountStatus {
+                account_id: 4,
+                suspended: true,
+            },
+            ClientMessage::SetRestricted {
+                symbol: sym("NOVA"),
+                restricted: true,
+            },
+            ClientMessage::SetLossLimit {
+                account_id: 4,
+                amount: 500_00,
+            },
         ]
     }
 

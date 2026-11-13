@@ -23,6 +23,10 @@ mod template {
     pub const CONDITIONAL_TRIGGERED: u16 = 310;
     pub const CONDITIONAL_CANCELLED: u16 = 311;
     pub const BRACKET_ACCEPTED: u16 = 312;
+    pub const ACCOUNT_STATUS_SET: u16 = 313;
+    pub const RESTRICTION_SET: u16 = 314;
+    pub const LOSS_LIMIT_SET: u16 = 315;
+    pub const TRADING_DAY_STARTED: u16 = 316;
     pub const CONDITIONAL: u16 = 399;
 }
 
@@ -94,6 +98,10 @@ impl Entry for Record {
             Fact::ConditionalTriggered { .. } => template::CONDITIONAL_TRIGGERED,
             Fact::ConditionalCancelled { .. } => template::CONDITIONAL_CANCELLED,
             Fact::BracketAccepted { .. } => template::BRACKET_ACCEPTED,
+            Fact::AccountStatusSet { .. } => template::ACCOUNT_STATUS_SET,
+            Fact::RestrictionSet { .. } => template::RESTRICTION_SET,
+            Fact::LossLimitSet { .. } => template::LOSS_LIMIT_SET,
+            Fact::TradingDayStarted { .. } => template::TRADING_DAY_STARTED,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -217,6 +225,24 @@ impl Entry for Record {
                     .u64(*stop_loss)
                     .end_block()
                     .var_bytes(&encode_inner(order));
+            }
+            Fact::AccountStatusSet { account, suspended } => {
+                e.u64(*account).u8(*suspended as u8).end_block();
+            }
+            Fact::RestrictionSet { symbol, restricted } => {
+                e.symbol(Some(*symbol)).u8(*restricted as u8).end_block();
+            }
+            Fact::LossLimitSet { account, amount } => {
+                e.u64(*account).u64(*amount).end_block();
+            }
+            Fact::TradingDayStarted { day, marks } => {
+                e.u64(*day).end_block();
+                let mut g = e.begin_group(marks.len());
+                for (symbol, price) in marks {
+                    e.begin_entry(&mut g);
+                    e.symbol(Some(*symbol)).u64(*price);
+                    e.end_entry_block(&mut g);
+                }
             }
         }
         e.finish()
@@ -375,6 +401,38 @@ impl Entry for Record {
                     take_profit,
                     stop_loss,
                 }
+            }
+            template::ACCOUNT_STATUS_SET => {
+                let account = d.u64()?;
+                let suspended = d.u8()? != 0;
+                d.end_block()?;
+                Fact::AccountStatusSet { account, suspended }
+            }
+            template::RESTRICTION_SET => {
+                let symbol = d.symbol()?;
+                let restricted = d.u8()? != 0;
+                d.end_block()?;
+                Fact::RestrictionSet { symbol, restricted }
+            }
+            template::LOSS_LIMIT_SET => {
+                let account = d.u64()?;
+                let amount = d.u64()?;
+                d.end_block()?;
+                Fact::LossLimitSet { account, amount }
+            }
+            template::TRADING_DAY_STARTED => {
+                let day = d.u64()?;
+                d.end_block()?;
+                let g = d.group()?;
+                let mut marks = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let symbol = d.symbol()?;
+                    let price = d.u64()?;
+                    d.end_entry_block(start, &g)?;
+                    marks.push((symbol, price));
+                }
+                Fact::TradingDayStarted { day, marks }
             }
             other => return Err(DecodeError::UnknownTemplate(other)),
         };
@@ -550,6 +608,22 @@ mod tests {
                 order: Box::new(Fact::OrderAbandoned { order_ref: 77 }),
                 take_profit: 27_00,
                 stop_loss: 24_00,
+            },
+            Fact::LossLimitSet {
+                account: 2,
+                amount: 900_00,
+            },
+            Fact::RestrictionSet {
+                symbol: sym(),
+                restricted: true,
+            },
+            Fact::TradingDayStarted {
+                day: 3,
+                marks: vec![(sym(), 25_10)],
+            },
+            Fact::AccountStatusSet {
+                account: 2,
+                suspended: true,
             },
         ]
     }

@@ -104,7 +104,7 @@ SBE (schema 7, version 2) with SOFH framing on every connection. All integers ar
 
 | Family | Direction | Messages |
 |---|---|---|
-| client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Quote, SetMmp, Conditional, Oco, Bracket, CancelConditional, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, QueryAccounts |
+| client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Quote, SetMmp, Conditional, Oco, Bracket, CancelConditional, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, SetAccountStatus, SetRestricted, SetLossLimit, QueryAccounts |
 | member | provider → exchange | Logon (with `last_seq`), NewOrder (account ref + time in force), Cancel, CancelAll, Subscribe; ops: CreateMember, ListInstrument, Halt, Resume, QueryMembers |
 | server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, ConditionalUpdate, ContractNote, Ack, Reject, Heartbeat |
 
@@ -186,6 +186,20 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw bracket ACME buy
 # cond #5 armed sell 5 ACME when last >= 27.00 (bracket exit armed)
 # cond #6 armed sell 5 ACME when last <= 23.50 (bracket exit armed)
 ```
+
+## Broker Risk Controls
+
+Each provider guards its own accounts before anything reaches the exchange. Settings are journaled facts, so they survive a crash; throttling and duplicate checks are live gates that never reach the journal.
+
+| Control | Set by | What it does |
+|---|---|---|
+| **Account kill switch** | broker admin: `suspend-account <account>` / `reinstate-account` | cancels the account's exchange orders and armed conditionals; every new order, quote or conditional is refused |
+| **Restricted list** | broker admin: `restrict <SYMBOL> on\|off` | buys, buy-side quotes and buy conditionals are refused; closing sells stay allowed |
+| **Daily loss limit** | broker admin: `loss-limit <account> <amount>` | day P&L (realized at average cost, net of fees, plus open positions marked to the last trade) at or below `-amount` blocks new buys; exits stay allowed |
+| **Per-account throttle** | built in | order messages per second (burst): retail 10 (20), issuer 5 (10), prop 200 (400), quant 500 (1,000), HFT and LP 5,000 (10,000) |
+| **Duplicate check** | built in | retail, prop and issuer accounts cannot send the same symbol, side, price and quantity twice within one second |
+
+Day P&L resets when the exchange starts a new trading day: carried positions are re-based to the previous close, which the broker journals with the day change. `ome broker accounts` shows each account's day P&L, loss limit and suspension; `balance` shows the trader's own day P&L.
 
 ## Member Controls and Market Making
 
@@ -277,14 +291,14 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 156 tests
+cargo test --workspace     # 162 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, and a retail stop-loss fires on a real exchange trade and sells into the bid. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1f** ~~broker-held orders (stop, trailing stop, GTT, AMO, OCO, bracket)~~ done; broker risk controls (account kill switch, rate limits, daily loss limit) and institutional algorithms (TWAP, VWAP, POV)
+- **1f** ~~broker-held orders (stop, trailing stop, GTT, AMO, OCO, bracket)~~ and ~~broker risk controls~~ done; institutional algorithms (TWAP, VWAP, POV)
 - **1g** off-exchange execution: broker internalization, wholesaler with payment for order flow, dark pool
 - **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane

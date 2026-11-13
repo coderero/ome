@@ -486,6 +486,7 @@ pub struct AccountSnapshot {
     pub role: Role,
     pub cash: Balance,
     pub unsettled_cash: i64,
+    pub day_pnl: i64,
     pub positions: Vec<Position>,
 }
 
@@ -534,6 +535,9 @@ pub struct AccountInfo {
     pub role: Role,
     pub cash: Balance,
     pub open_orders: u32,
+    pub suspended: bool,
+    pub loss_limit: u64,
+    pub day_pnl: i64,
     pub username: String,
 }
 

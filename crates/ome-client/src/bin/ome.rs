@@ -26,6 +26,10 @@ const USAGE: &str = "usage:
       accounts  |  fees                                   (broker admin)
       create-account <name> <secret> <role> <cash>        role: retail quant hft prop lp issuer admin
       set-cash <account> <amount>  |  set-shares <account> <SYMBOL> <qty>
+      suspend-account <account>  |  reinstate-account <account>
+                                                          account kill switch: cancels orders and conditionals
+      restrict <SYMBOL> on|off                            restricted list: closing sells only
+      loss-limit <account> <amount>                       daily loss limit (0 removes); exits stay allowed
       balance                                             (trader)
       buy|sell <SYMBOL> <price|mkt> <qty> [options..]
                                                           options: gtc day ioc fok auction gtd:<seconds>
@@ -336,13 +340,20 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
         ["accounts"] => {
             for a in accounts(client)? {
                 println!(
-                    "{:>4}  {:<18} {:<7} cash {:>16}  reserved {:>14}  open orders {}",
+                    "{:>4}  {:<18} {:<7} cash {:>16}  reserved {:>14}  open orders {:>3}  day P&L {:>12}{}{}",
                     a.account_id,
                     a.username,
                     a.role.label(),
                     format_price(a.cash.available),
                     format_price(a.cash.reserved),
-                    a.open_orders
+                    a.open_orders,
+                    format_signed(a.day_pnl),
+                    if a.loss_limit > 0 {
+                        format!("  loss limit {}", format_price(a.loss_limit))
+                    } else {
+                        String::new()
+                    },
+                    if a.suspended { "  SUSPENDED" } else { "" }
                 );
             }
         }
@@ -366,6 +377,35 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 client.request(&ClientMessage::SetBalance {
                     account_id,
                     asset: Asset::Cash,
+                    amount: amount(value)?
+                })?
+            );
+        }
+        [verb @ ("suspend-account" | "reinstate-account"), account] => {
+            let account_id = resolve(client, account)?;
+            println!(
+                "{}",
+                client.request(&ClientMessage::SetAccountStatus {
+                    account_id,
+                    suspended: *verb == "suspend-account"
+                })?
+            );
+        }
+        ["restrict", sym, flag @ ("on" | "off")] => {
+            println!(
+                "{}",
+                client.request(&ClientMessage::SetRestricted {
+                    symbol: symbol(sym)?,
+                    restricted: *flag == "on"
+                })?
+            );
+        }
+        ["loss-limit", account, value] => {
+            let account_id = resolve(client, account)?;
+            println!(
+                "{}",
+                client.request(&ClientMessage::SetLossLimit {
+                    account_id,
                     amount: amount(value)?
                 })?
             );
@@ -397,6 +437,7 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 format_price(snapshot.cash.available),
                 format_price(snapshot.cash.reserved)
             );
+            println!("day P&L {}", format_signed(snapshot.day_pnl));
             if snapshot.unsettled_cash != 0 {
                 println!("unsettled cash {}", format_signed(snapshot.unsettled_cash));
             }
@@ -478,8 +519,12 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             loop {
                 let r = match client.wait_for(wait, |m| {
                     matches!(m, ServerMessage::ContractNote(_))
+                        || matches!(m, ServerMessage::Reject { ref_template, .. } if *ref_template == ome_protocol::template::NEW_ORDER)
                         || matches!(m, ServerMessage::Execution(r) if r.client_order_id == client_order_id)
                 }) {
+                    Ok(ServerMessage::Reject { reason, .. }) => {
+                        return Err(ClientError::Rejected(reason).into());
+                    }
                     Ok(ServerMessage::ContractNote(note)) => {
                         print_note(&note);
                         continue;

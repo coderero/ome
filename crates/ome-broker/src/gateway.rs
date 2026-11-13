@@ -1,6 +1,7 @@
 use crate::broker::{Broker, Effect, Fact};
 use crate::journal::Record;
 use crate::market::MarketCache;
+use crate::risk::EntryGuard;
 use ome_client::LinkEvent;
 use ome_client::upstream::{LinkState, Upstream, UpstreamEvent};
 use ome_core::price::Price;
@@ -35,6 +36,7 @@ pub struct Gateway {
     clearing: Option<Upstream>,
     clock: Timestamp,
     last_heartbeat: Timestamp,
+    guard: EntryGuard,
 }
 
 impl Gateway {
@@ -55,6 +57,7 @@ impl Gateway {
             clearing,
             clock,
             last_heartbeat: clock,
+            guard: EntryGuard::default(),
         }
     }
 
@@ -237,7 +240,11 @@ impl Gateway {
                     let _ = self.record(Fact::Allocated(allocation), now);
                 }
             }
-            ServerMessage::InstrumentList(_) => {
+            ServerMessage::InstrumentList(ref list) => {
+                for info in list {
+                    self.broker
+                        .mark(info.symbol, info.last_price.unwrap_or(info.reference_price));
+                }
                 self.market.apply(&message);
                 let symbols: Vec<Symbol> = self.market.symbols().collect();
                 for symbol in symbols {
@@ -246,7 +253,9 @@ impl Gateway {
                 let list = ServerMessage::InstrumentList(self.market.instruments());
                 self.broadcast(&list);
             }
-            ServerMessage::Instrument(_) => {
+            ServerMessage::Instrument(ref info) => {
+                self.broker
+                    .mark(info.symbol, info.last_price.unwrap_or(info.reference_price));
                 if let Some(symbol) = self.market.apply(&message) {
                     self.send_exchange(&MemberMessage::Subscribe { symbol });
                 }
@@ -260,6 +269,7 @@ impl Gateway {
             ServerMessage::Trade(trade) => {
                 self.market.apply(&message);
                 if trade.trade_id != 0 {
+                    self.broker.mark(trade.symbol, trade.price);
                     self.send_to_subscribers(trade.symbol, &message);
                     self.evaluate_conditionals(trade.symbol, trade.price, now);
                 }
@@ -269,6 +279,9 @@ impl Gateway {
             }
             ServerMessage::MarketStatus(status) => {
                 self.market.apply(&message);
+                if let Some(fact) = self.broker.decide_trading_day(status.day, &self.market) {
+                    let _ = self.record(fact, now);
+                }
                 log(&format!(
                     "market {} (day {})",
                     status.phase.label(),
@@ -415,6 +428,43 @@ impl Gateway {
     ) {
         let ref_template = message.template_id();
         let admin = role == Role::BrokerAdmin;
+        let entry = matches!(
+            message,
+            ClientMessage::NewOrder { .. }
+                | ClientMessage::Cancel { .. }
+                | ClientMessage::CancelAll { .. }
+                | ClientMessage::Quote { .. }
+                | ClientMessage::SetMmp { .. }
+                | ClientMessage::Conditional { .. }
+                | ClientMessage::Oco { .. }
+                | ClientMessage::Bracket { .. }
+                | ClientMessage::CancelConditional { .. }
+        );
+        if entry
+            && !admin
+            && let Err(reason) = self.guard.admit(account, role, now)
+        {
+            return self.reject(id, ref_template, &reason);
+        }
+        if let ClientMessage::NewOrder {
+            symbol,
+            side,
+            kind,
+            qty,
+            ..
+        } = &message
+        {
+            let price = match kind {
+                ome_core::types::OrderKind::Limit(p) => *p,
+                ome_core::types::OrderKind::Market => 0,
+            };
+            if let Err(reason) =
+                self.guard
+                    .duplicate((account, *symbol, *side, price, *qty), role, now)
+            {
+                return self.reject(id, ref_template, &reason);
+            }
+        }
         match message {
             ClientMessage::Subscribe { symbol } => {
                 let snapshot = self.market.snapshot(symbol);
@@ -646,6 +696,47 @@ impl Gateway {
                     self.reject(id, ref_template, "exchange link is down, try again shortly");
                 }
             }
+            ClientMessage::SetAccountStatus {
+                account_id,
+                suspended,
+            } if admin => {
+                let decision = self.broker.decide_account_status(account_id, suspended);
+                let text = format!(
+                    "account {account_id} {}",
+                    if suspended {
+                        "suspended: open orders cancelled, conditionals removed"
+                    } else {
+                        "reinstated"
+                    }
+                );
+                self.record_and_ack(id, ref_template, decision, text, now);
+            }
+            ClientMessage::SetRestricted { symbol, restricted } if admin => {
+                let decision = self
+                    .broker
+                    .decide_restriction(symbol, restricted, &self.market);
+                let text = format!(
+                    "{symbol} {}",
+                    if restricted {
+                        "added to the restricted list (closing sells only)"
+                    } else {
+                        "removed from the restricted list"
+                    }
+                );
+                self.record_and_ack(id, ref_template, decision, text, now);
+            }
+            ClientMessage::SetLossLimit { account_id, amount } if admin => {
+                let decision = self.broker.decide_loss_limit(account_id, amount);
+                let text = if amount == 0 {
+                    format!("account {account_id} daily loss limit removed")
+                } else {
+                    format!(
+                        "account {account_id} daily loss limit set to {}",
+                        format_price(amount)
+                    )
+                };
+                self.record_and_ack(id, ref_template, decision, text, now);
+            }
             ClientMessage::CreateAccount {
                 role,
                 cash,
@@ -711,6 +802,26 @@ impl Gateway {
                 ref_template,
                 &format!("not permitted for {} accounts", role.label()),
             ),
+        }
+    }
+
+    fn record_and_ack(
+        &mut self,
+        id: SessionId,
+        ref_template: u16,
+        decision: Result<Fact, String>,
+        text: String,
+        now: Timestamp,
+    ) {
+        match decision {
+            Ok(fact) => match self.record(fact, now) {
+                Ok(_) => {
+                    log(&text);
+                    self.reply(id, ServerMessage::Ack { ref_template, text });
+                }
+                Err(_) => self.reject(id, ref_template, "journal unavailable"),
+            },
+            Err(reason) => self.reject(id, ref_template, &reason),
         }
     }
 

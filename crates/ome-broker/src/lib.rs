@@ -6,6 +6,7 @@ pub mod ledger;
 pub mod market;
 pub mod oms;
 pub mod profile;
+pub mod risk;
 
 use broker::Broker;
 use gateway::Gateway;

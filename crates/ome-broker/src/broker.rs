@@ -3,6 +3,7 @@ use crate::ledger::Ledger;
 use crate::market::MarketCache;
 use crate::oms::{BracketPlan, Conditional, Conditionals, exit_legs};
 use crate::profile::{Profile, Shape};
+use crate::risk::AccountRisk;
 use ome_core::price::Price;
 use ome_core::risk::RiskContext;
 use ome_core::symbol::Symbol;
@@ -79,6 +80,22 @@ pub enum Fact {
         take_profit: Price,
         stop_loss: Price,
     },
+    AccountStatusSet {
+        account: AccountId,
+        suspended: bool,
+    },
+    RestrictionSet {
+        symbol: Symbol,
+        restricted: bool,
+    },
+    LossLimitSet {
+        account: AccountId,
+        amount: u64,
+    },
+    TradingDayStarted {
+        day: u64,
+        marks: Vec<(Symbol, Price)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +152,8 @@ pub struct Broker {
     last_settlement_seq: u64,
     conditionals: Conditionals,
     brackets: BTreeMap<u64, BracketPlan>,
+    risk: AccountRisk,
+    marks: BTreeMap<Symbol, Price>,
 }
 
 impl Broker {
@@ -153,7 +172,64 @@ impl Broker {
             last_settlement_seq: 0,
             conditionals: Conditionals::default(),
             brackets: BTreeMap::new(),
+            risk: AccountRisk::default(),
+            marks: BTreeMap::new(),
         }
+    }
+
+    pub fn mark(&mut self, symbol: Symbol, price: Price) {
+        self.marks.insert(symbol, price);
+    }
+
+    pub fn risk(&self) -> &AccountRisk {
+        &self.risk
+    }
+
+    pub fn day_pnl(&self, account: AccountId) -> i64 {
+        self.risk
+            .day_pnl(account, |symbol| self.marks.get(&symbol).copied())
+    }
+
+    pub fn decide_account_status(
+        &self,
+        account: AccountId,
+        suspended: bool,
+    ) -> Result<Fact, String> {
+        match self.ledger.get(account) {
+            Some(a) if a.role.can_trade() => Ok(Fact::AccountStatusSet { account, suspended }),
+            Some(_) => Err(format!("account {account} does not trade")),
+            None => Err(format!("unknown account {account}")),
+        }
+    }
+
+    pub fn decide_restriction(
+        &self,
+        symbol: Symbol,
+        restricted: bool,
+        market: &MarketCache,
+    ) -> Result<Fact, String> {
+        if market.get(symbol).is_none() {
+            return Err(format!("unknown symbol {symbol}"));
+        }
+        Ok(Fact::RestrictionSet { symbol, restricted })
+    }
+
+    pub fn decide_loss_limit(&self, account: AccountId, amount: u64) -> Result<Fact, String> {
+        match self.ledger.get(account) {
+            Some(a) if a.role.can_trade() => Ok(Fact::LossLimitSet { account, amount }),
+            Some(_) => Err(format!("account {account} does not trade")),
+            None => Err(format!("unknown account {account}")),
+        }
+    }
+
+    pub fn decide_trading_day(&self, day: u64, market: &MarketCache) -> Option<Fact> {
+        (day > self.risk.day()).then(|| Fact::TradingDayStarted {
+            day,
+            marks: market
+                .symbols()
+                .filter_map(|symbol| mark_of(market, symbol).map(|p| (symbol, p)))
+                .collect(),
+        })
     }
 
     pub fn profile(&self) -> &Profile {
@@ -287,6 +363,12 @@ impl Broker {
         if let Err(reason) = Profile::permits(holder.role, kind, &options) {
             return Err(reject(reason));
         }
+        if let Err(reason) = self
+            .risk
+            .check(account, symbol, side, |s| mark_of(market, s))
+        {
+            return Err(reject(reason));
+        }
         if !market.is_trading(symbol) {
             return Err(reject(format!(
                 "{symbol} is halted: {}",
@@ -374,6 +456,8 @@ impl Broker {
             .get(account)
             .ok_or_else(|| format!("unknown account {account}"))?;
         Profile::permits_conditional(holder.role, trigger, shape)?;
+        self.risk
+            .check(account, symbol, side, |s| mark_of(market, s))?;
         let quote = market
             .get(symbol)
             .ok_or_else(|| format!("unknown symbol {symbol}"))?;
@@ -714,6 +798,13 @@ impl Broker {
         if !market.is_trading(symbol) {
             return Err(format!("{symbol} is not trading"));
         }
+        let side = if bid.is_empty() {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        self.risk
+            .check(account, symbol, side, |s| mark_of(market, s))?;
         if !bid.is_empty() && !ask.is_empty() && bid.price >= ask.price {
             return Err("quote bid must be below its ask".into());
         }
@@ -1062,6 +1153,42 @@ impl Broker {
                 }
                 effects
             }
+            Fact::AccountStatusSet { account, suspended } => {
+                self.risk.set_suspended(*account, *suspended);
+                if !*suspended {
+                    return vec![Effect::AccountChanged(*account)];
+                }
+                let ids: Vec<u64> = self
+                    .conditionals
+                    .for_account(*account)
+                    .map(|c| c.cond_id)
+                    .collect();
+                let mut effects: Vec<Effect> = ids
+                    .into_iter()
+                    .filter_map(|id| self.conditionals.remove(id))
+                    .map(|c| {
+                        conditional_update(&c, ConditionalStatus::Cancelled, "account suspended")
+                    })
+                    .collect();
+                effects.push(Effect::ToExchange(MemberMessage::CancelAll {
+                    account: Some(*account),
+                    symbol: None,
+                }));
+                effects.push(Effect::AccountChanged(*account));
+                effects
+            }
+            Fact::RestrictionSet { symbol, restricted } => {
+                self.risk.set_restricted(*symbol, *restricted);
+                vec![]
+            }
+            Fact::LossLimitSet { account, amount } => {
+                self.risk.set_loss_limit(*account, *amount);
+                vec![Effect::AccountChanged(*account)]
+            }
+            Fact::TradingDayStarted { day, marks } => {
+                self.risk.start_day(*day, marks);
+                vec![]
+            }
             Fact::OrderAbandoned { order_ref } => {
                 self.brackets.remove(order_ref);
                 let Some(meta) = self.orders.remove(order_ref) else {
@@ -1204,6 +1331,13 @@ impl Broker {
             };
             self.fee_totals.charges.add(charges);
             self.fee_totals.fills += 1;
+            self.risk.on_fill(
+                meta.account,
+                meta.symbol,
+                meta.side,
+                (report.last_price, qty),
+                charges.total(),
+            );
             let pending = self
                 .pending
                 .entry((report.cycle, meta.account))
@@ -1282,6 +1416,7 @@ impl Broker {
             role: account.role,
             cash: account.cash,
             unsettled_cash,
+            day_pnl: self.day_pnl(id),
             positions: account
                 .positions
                 .iter()
@@ -1307,6 +1442,9 @@ impl Broker {
                 role: a.role,
                 cash: a.cash,
                 open_orders: open.get(&a.id).copied().unwrap_or(0),
+                suspended: self.risk.is_suspended(a.id),
+                loss_limit: self.risk.loss_limit(a.id),
+                day_pnl: self.day_pnl(a.id),
                 username: a.username.clone(),
             })
             .collect()
@@ -1327,6 +1465,12 @@ impl Broker {
             })
             .collect()
     }
+}
+
+fn mark_of(market: &MarketCache, symbol: Symbol) -> Option<Price> {
+    market
+        .get(symbol)
+        .map(|q| q.info.last_price.unwrap_or(q.info.reference_price))
 }
 
 fn side_label(side: Side) -> &'static str {
@@ -2457,5 +2601,106 @@ pub mod tests {
             &market(),
         );
         assert!(trailing.unwrap_err().contains("trailing"));
+    }
+
+    #[test]
+    fn suspension_cancels_everything_and_loss_limit_follows_real_fills() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = holding(&mut broker, "alice", Role::Retail, 10);
+        let fact = broker
+            .decide_conditional(
+                alice,
+                1,
+                sym(),
+                Side::Sell,
+                10,
+                Trigger::Below(20_00),
+                OrderKind::Market,
+                OrderOptions::default(),
+                &market(),
+            )
+            .unwrap();
+        broker.apply(&fact);
+        let effects = broker.apply(&broker.decide_account_status(alice, true).unwrap());
+        assert_eq!(statuses(&effects), vec![(1, ConditionalStatus::Cancelled)]);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ToExchange(MemberMessage::CancelAll { account: Some(a), symbol: None }) if *a == alice
+        )));
+        let blocked = broker.decide_order(
+            alice,
+            2,
+            sym(),
+            Side::Sell,
+            OrderKind::Limit(25_00),
+            OrderOptions::default(),
+            1,
+            &market(),
+            0,
+        );
+        assert!(blocked.unwrap_err().reason.contains("suspended"));
+        broker.apply(&broker.decide_account_status(alice, false).unwrap());
+
+        broker.apply(&broker.decide_loss_limit(alice, 30_00).unwrap());
+        let buy = |broker: &Broker, id| {
+            broker.decide_order(
+                alice,
+                id,
+                sym(),
+                Side::Buy,
+                OrderKind::Limit(26_00),
+                OrderOptions::default(),
+                10,
+                &market(),
+                0,
+            )
+        };
+        broker.apply(&buy(&broker, 3).unwrap());
+        deliver(
+            &mut broker,
+            exchange_report(
+                80,
+                1,
+                alice,
+                Side::Buy,
+                OrderStatus::Filled,
+                (26_00, 10),
+                10,
+                10,
+                1,
+            ),
+        );
+        assert!(
+            buy(&broker, 4).is_ok(),
+            "marked at the 25.00 reference: down 10.00 plus fees"
+        );
+        broker.mark(sym(), 23_00);
+        assert!(broker.day_pnl(alice) < -30_00);
+        let mut lower = market();
+        lower.apply(&ServerMessage::Trade(ome_protocol::TradeEvent {
+            symbol: sym(),
+            trade_id: 1,
+            price: 23_00,
+            qty: 1,
+            aggressor: Side::Sell,
+            timestamp: 0,
+        }));
+        let refused = broker.decide_order(
+            alice,
+            5,
+            sym(),
+            Side::Buy,
+            OrderKind::Limit(23_00),
+            OrderOptions::default(),
+            1,
+            &lower,
+            0,
+        );
+        assert!(refused.unwrap_err().reason.contains("daily loss limit"));
+        assert_eq!(broker.account_list()[0].loss_limit, 30_00);
+
+        broker.apply(&broker.decide_trading_day(1, &lower).unwrap());
+        assert_eq!(broker.day_pnl(alice), 0);
+        assert!(broker.decide_trading_day(1, &lower).is_none());
     }
 }

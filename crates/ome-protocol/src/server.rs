@@ -142,7 +142,7 @@ impl ServerMessage {
             ServerMessage::Account(a) => {
                 e.u64(a.account_id).u8(a.role as u8);
                 put_balance(&mut e, &a.cash);
-                e.i64(a.unsettled_cash).end_block();
+                e.i64(a.unsettled_cash).i64(a.day_pnl).end_block();
                 let mut g = e.begin_group(a.positions.len());
                 for p in &a.positions {
                     e.begin_entry(&mut g);
@@ -308,7 +308,10 @@ impl ServerMessage {
                     e.begin_entry(&mut g);
                     e.u64(a.account_id).u8(a.role as u8);
                     put_balance(&mut e, &a.cash);
-                    e.u32(a.open_orders);
+                    e.u32(a.open_orders)
+                        .u8(a.suspended as u8)
+                        .u64(a.loss_limit)
+                        .i64(a.day_pnl);
                     e.end_entry_block(&mut g);
                     e.var(&a.username);
                 }
@@ -429,6 +432,7 @@ impl ServerMessage {
                 let role = role_from(d.u8()?)?;
                 let cash = get_balance(&mut d)?;
                 let unsettled_cash = d.i64()?;
+                let day_pnl = d.i64()?;
                 d.end_block()?;
                 let g = d.group()?;
                 let mut positions = Vec::with_capacity(g.count);
@@ -449,6 +453,7 @@ impl ServerMessage {
                     role,
                     cash,
                     unsettled_cash,
+                    day_pnl,
                     positions,
                 })
             }
@@ -726,12 +731,18 @@ impl ServerMessage {
                     let role = role_from(d.u8()?)?;
                     let cash = get_balance(&mut d)?;
                     let open_orders = d.u32()?;
+                    let suspended = d.u8()? != 0;
+                    let loss_limit = d.u64()?;
+                    let day_pnl = d.i64()?;
                     d.end_entry_block(start, &g)?;
                     list.push(AccountInfo {
                         account_id,
                         role,
                         cash,
                         open_orders,
+                        suspended,
+                        loss_limit,
+                        day_pnl,
                         username: d.var()?,
                     });
                 }
@@ -896,6 +907,7 @@ mod tests {
                     reserved: 5,
                 },
                 unsettled_cash: -300,
+                day_pnl: -42,
                 positions: vec![Position {
                     symbol: sym("ACME"),
                     balance: Balance {
@@ -1026,6 +1038,9 @@ mod tests {
                 role: Role::Quant,
                 cash: Balance::default(),
                 open_orders: 3,
+                suspended: true,
+                loss_limit: 1_000_00,
+                day_pnl: 77,
                 username: "two-sigma".into(),
             }]),
             ServerMessage::MemberList(vec![MemberInfo {
