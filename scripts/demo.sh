@@ -35,13 +35,18 @@ for p in "${providers[@]}"; do
 done
 
 (( fresh )) && scripts/seed.sh market
+if (( fresh )) && [[ "$OME_TRADING_DAY" != "off" ]]; then
+  # shellcheck disable=SC2086
+  exchange_cmd schedule $OME_TRADING_DAY
+fi
 scripts/bots.sh
 
 cat <<MSG
 
 market is live:
   exchange    $OME_EXCHANGE           ./target/release/ome exchange members | instruments | halt ACME news
-  clearing    $OME_CLEARING           ./target/release/ome clearing status   (cycle every $(( OME_CYCLE_MS / 1000 ))s, T+1)
+  clearing    $OME_CLEARING           ./target/release/ome clearing status   (one cycle per trading day, T+1)
+  sessions    trading day (pre-open open closing closed, seconds): $OME_TRADING_DAY   ome exchange status | session | schedule
   retail      $(provider_addr retail-co)   alice / alice-pw, bob / bob-pw
   prime       $(provider_addr prime-co)   fund / fund-pw (quant), issuers
   dma         $(provider_addr dma-co)   HFT desks

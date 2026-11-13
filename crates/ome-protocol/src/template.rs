@@ -30,6 +30,8 @@ pub const SETTLED: u16 = 81;
 pub const SET_CREDIT_LIMIT: u16 = 82;
 pub const DEPOSIT: u16 = 83;
 pub const QUERY_CLEARING: u16 = 84;
+pub const SET_SESSION: u16 = 85;
+pub const SET_SCHEDULE: u16 = 86;
 
 pub const LOGON_ACK: u16 = 100;
 pub const SERVER_HEARTBEAT: u16 = 101;
@@ -48,6 +50,8 @@ pub const INSTRUMENT: u16 = 121;
 pub const BOOK_SNAPSHOT: u16 = 122;
 pub const TRADE: u16 = 123;
 pub const CANDLE_SNAPSHOT: u16 = 124;
+pub const MARKET_STATUS: u16 = 125;
+pub const AUCTION_INFO: u16 = 126;
 pub const ACCOUNT_LIST: u16 = 130;
 pub const MEMBER_LIST: u16 = 131;
 pub const FEE_SUMMARY: u16 = 132;

@@ -144,6 +144,31 @@ ome broker --addr 127.0.0.1:7101 fees        # broker admin: revenue and taxes c
 ome exchange members                         # net exchange fees per member
 ```
 
+## Market Sessions and Auctions
+
+The exchange runs a trading day in four phases, either manually or on a repeating schedule set by exchange operations:
+
+| Phase | What happens |
+|---|---|
+| **pre-open** | orders are collected but **not matched**; the book may cross; subscribers get an indicative auction price, volume and imbalance |
+| **open** | the opening auction **uncrosses** at one price, then continuous matching |
+| **closing auction** | orders are collected again; the closing uncross sets the closing price |
+| **closed** | new orders are rejected (cancels still work); **DAY orders expire**; GTC orders stay |
+
+- **Auction price**: the price that executes the most volume; ties go to the smallest imbalance, then the price closest to the reference. Everything that crosses fills at that single price in time priority; self-matches cancel the newer order.
+- During auctions IOC limit orders are rejected, and market orders join as limits at the price-band edge.
+- Each new trading day resets the circuit-breaker reference to the previous close.
+- Orders carry a time in force: `gtc` (default for limits), `day`, or `ioc` (default for market orders).
+- The clearing house can follow the exchange calendar (`--cycle-ms 0`): each pre-open starts a new clearing cycle, so T+1 means the next trading day.
+- No schedule means the market is always open.
+
+```bash
+ome exchange status                         # market open · trading day 2 · next change in 8s
+ome exchange schedule 5 45 5 5              # pre-open 5s, open 45s, closing auction 5s, closed 5s
+ome exchange session close                  # manual control; `schedule off` to stop the schedule
+ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw buy ACME 23.00 3 day
+```
+
 ## Clearing and Settlement
 
 The clearing house (`ome-clearing`) is an exchange member of type `clearing`. It runs the market calendar and settles trades between members, like a central counterparty (CCP) plus a securities depository (CSD).
@@ -197,14 +222,13 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 117 tests
+cargo test --workspace     # 129 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1d** market sessions set by exchange operations: pre-open auction, open, close
 - **1e** PostgreSQL (accounts, trades, settlements) and Redis (market data)
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts
 - **3** local-LLM newsroom: company reports, IPO prospectuses, news and macro events

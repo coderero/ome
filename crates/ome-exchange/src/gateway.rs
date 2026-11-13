@@ -1,5 +1,6 @@
 use crate::exchange::{Command, Event, Exchange};
 use crate::journal::Record;
+use crate::session::Schedule;
 use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{Side, Timestamp};
@@ -145,6 +146,9 @@ impl Gateway {
             if let Some(book) = self.book_snapshot(symbol, now) {
                 self.send_to_subscribers(symbol, &ServerMessage::Book(book));
             }
+            if let Some(info) = self.exchange.auction_info(symbol) {
+                self.send_to_subscribers(symbol, &ServerMessage::AuctionInfo(info));
+            }
         }
         if now >= self.last_heartbeat + HEARTBEAT_MS {
             self.last_heartbeat = now;
@@ -214,6 +218,10 @@ impl Gateway {
             ServerMessage::ReplayComplete {
                 next_seq: replay.next_seq,
             },
+        );
+        self.reply(
+            id,
+            ServerMessage::MarketStatus(self.exchange.market_status()),
         );
         self.reply(
             id,
@@ -317,6 +325,24 @@ impl Gateway {
             },
             MemberMessage::Halt { symbol, reason } if admin => Command::Halt { symbol, reason },
             MemberMessage::Resume { symbol } if admin => Command::Resume { symbol },
+            MemberMessage::SetSession { phase } if admin => Command::SetPhase { phase },
+            MemberMessage::SetSchedule {
+                pre_open_ms,
+                continuous_ms,
+                closing_ms,
+                closed_ms,
+            } if admin => {
+                let schedule = Schedule {
+                    pre_open_ms,
+                    continuous_ms,
+                    closing_ms,
+                    closed_ms,
+                };
+                let total = pre_open_ms + continuous_ms + closing_ms + closed_ms;
+                Command::SetSchedule {
+                    schedule: (total > 0).then_some(schedule),
+                }
+            }
             MemberMessage::OpenCycle { cycle } if clearing => Command::OpenCycle { cycle },
             MemberMessage::Settled { cycle } if clearing => Command::Settled { cycle },
             MemberMessage::SetCreditLimit { member, limit } if clearing => {
@@ -382,6 +408,15 @@ impl Gateway {
                     }
                 }
                 Event::MemberCreated(_) => {}
+                Event::SessionChanged => {
+                    let status = self.exchange.market_status();
+                    log(&format!(
+                        "market {} (day {})",
+                        status.phase.label(),
+                        status.day
+                    ));
+                    self.broadcast(&ServerMessage::MarketStatus(status));
+                }
             }
         }
     }
@@ -553,6 +588,17 @@ fn describe_admin_action(command: &Command, events: &[Event]) -> Option<String> 
         ),
         Command::Halt { symbol, .. } => format!("{symbol} halted"),
         Command::Resume { symbol } => format!("{symbol} resumed"),
+        Command::SetPhase { phase } => format!("market moved to {}", phase.label()),
+        Command::SetSchedule { schedule: None } => {
+            "trading schedule cleared (manual sessions)".to_string()
+        }
+        Command::SetSchedule { schedule: Some(s) } => format!(
+            "trading schedule: pre-open {}s, open {}s, closing auction {}s, closed {}s",
+            s.pre_open_ms / 1_000,
+            s.continuous_ms / 1_000,
+            s.closing_ms / 1_000,
+            s.closed_ms / 1_000
+        ),
         Command::OpenCycle { cycle } => format!("clearing opened trade cycle {cycle}"),
         Command::Settled { cycle } => format!("clearing settled cycle {cycle}"),
         Command::SetCreditLimit { member, limit } => {

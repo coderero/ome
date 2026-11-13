@@ -72,6 +72,15 @@ pub enum MemberMessage {
         amount: i64,
     },
     QueryClearing,
+    SetSession {
+        phase: MarketPhase,
+    },
+    SetSchedule {
+        pre_open_ms: u64,
+        continuous_ms: u64,
+        closing_ms: u64,
+        closed_ms: u64,
+    },
 }
 
 impl MemberMessage {
@@ -95,6 +104,8 @@ impl MemberMessage {
             MemberMessage::SetCreditLimit { .. } => SET_CREDIT_LIMIT,
             MemberMessage::Deposit { .. } => DEPOSIT,
             MemberMessage::QueryClearing => QUERY_CLEARING,
+            MemberMessage::SetSession { .. } => SET_SESSION,
+            MemberMessage::SetSchedule { .. } => SET_SCHEDULE,
         }
     }
 
@@ -172,6 +183,21 @@ impl MemberMessage {
             MemberMessage::Deposit { member, amount } => {
                 e.u64(*member).i64(*amount).end_block();
             }
+            MemberMessage::SetSession { phase } => {
+                e.u8(*phase as u8).end_block();
+            }
+            MemberMessage::SetSchedule {
+                pre_open_ms,
+                continuous_ms,
+                closing_ms,
+                closed_ms,
+            } => {
+                e.u64(*pre_open_ms)
+                    .u64(*continuous_ms)
+                    .u64(*closing_ms)
+                    .u64(*closed_ms)
+                    .end_block();
+            }
         }
         e.finish()
     }
@@ -219,6 +245,21 @@ impl MemberMessage {
                 let limit = d.u64()?;
                 d.end_block()?;
                 MemberMessage::SetCreditLimit { member, limit }
+            }
+            SET_SESSION => {
+                let phase = phase_from(d.u8()?)?;
+                d.end_block()?;
+                MemberMessage::SetSession { phase }
+            }
+            SET_SCHEDULE => {
+                let message = MemberMessage::SetSchedule {
+                    pre_open_ms: d.u64()?,
+                    continuous_ms: d.u64()?,
+                    closing_ms: d.u64()?,
+                    closed_ms: d.u64()?,
+                };
+                d.end_block()?;
+                message
             }
             DEPOSIT => {
                 let member = d.u64()?;
@@ -387,6 +428,15 @@ pub mod tests {
                 amount: -500,
             },
             MemberMessage::QueryClearing,
+            MemberMessage::SetSession {
+                phase: MarketPhase::ClosingAuction,
+            },
+            MemberMessage::SetSchedule {
+                pre_open_ms: 5_000,
+                continuous_ms: 45_000,
+                closing_ms: 5_000,
+                closed_ms: 5_000,
+            },
         ]
     }
 

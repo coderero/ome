@@ -8,7 +8,7 @@ use ome_net::auth::{SecretHash, hash_secret, valid_username, verify};
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
 use ome_protocol::{
-    Decoder, MemberId, MemberInfo, MemberKind, MemberMessage, ServerMessage, template,
+    Decoder, MarketPhase, MemberId, MemberInfo, MemberKind, MemberMessage, ServerMessage, template,
 };
 use ome_store::Journal;
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,7 +101,7 @@ impl Gateway {
     pub fn tick(&mut self, now: Timestamp) {
         let now = self.advance(now);
         self.exchange.tick(now, self.clearing.last_exchange_seq());
-        if self.exchange.is_ready() {
+        if self.exchange.is_ready() && !self.clearing.follows_trading_days() {
             let due = *self.next_cycle_at.get_or_insert(now);
             if now >= due {
                 self.next_cycle_at = Some(now + self.clearing.config().cycle_ms);
@@ -156,6 +156,20 @@ impl Gateway {
                 }
             }
             UpstreamEvent::Message(ServerMessage::MemberList(list)) => self.exchange_members = list,
+            UpstreamEvent::Message(ServerMessage::MarketStatus(status))
+                if status.phase == MarketPhase::PreOpen =>
+            {
+                for fact in self.clearing.due_on_trading_day(status.day) {
+                    if let Fact::CycleOpened { cycle } = fact {
+                        log(&format!(
+                            "trading day {} started: opening clearing cycle {cycle}",
+                            status.day
+                        ));
+                    }
+                    let _ = self.record(fact, now);
+                }
+                self.exchange.send(&MemberMessage::QueryMembers);
+            }
             UpstreamEvent::Message(ServerMessage::Reject { reason, .. }) => {
                 log(&format!("exchange rejected a request: {reason}"))
             }

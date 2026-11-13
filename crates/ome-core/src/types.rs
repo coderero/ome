@@ -30,6 +30,7 @@ pub enum OrderKind {
 pub enum TimeInForce {
     Gtc,
     Ioc,
+    Day,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use ome_client::DEFAULT_EXCHANGE_ADDR;
 const USAGE: &str =
     "usage: ome-clearing --member NAME --member-secret SECRET [--listen ADDR] [--exchange ADDR]
                     [--journal PATH] [--ops-name NAME] [--ops-secret SECRET]
-                    [--cycle-ms MS] [--settlement-lag CYCLES] [--margin-bps BPS]";
+                    [--cycle-ms MS (0 = one cycle per exchange trading day)] [--settlement-lag CYCLES] [--margin-bps BPS]";
 
 fn parse_args() -> Result<ServiceConfig, String> {
     let mut config = ServiceConfig {
@@ -34,7 +34,10 @@ fn parse_args() -> Result<ServiceConfig, String> {
             "--ops-secret" => config.ops_secret = value()?,
             "--member" => config.member_name = value()?,
             "--member-secret" => config.member_secret = value()?,
-            "--cycle-ms" => config.clearing.cycle_ms = number(value()?)?.max(1_000),
+            "--cycle-ms" => {
+                let ms = number(value()?)?;
+                config.clearing.cycle_ms = if ms == 0 { 0 } else { ms.max(1_000) };
+            }
             "--settlement-lag" => config.clearing.settlement_lag = number(value()?)?,
             "--margin-bps" => config.clearing.margin_bps = number(value()?)?.max(1),
             _ => return Err(USAGE.into()),

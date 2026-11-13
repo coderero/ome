@@ -11,7 +11,8 @@ use ome_core::types::{
 use ome_net::auth::SecretHash;
 use ome_protocol::{
     AccountInfo, AccountSnapshot, Allocation, Asset, Charges, ContractNote, ExecutionReport,
-    FeeSummary, MemberMessage, OrderStatus, Position, Role, ServerMessage, SettlementReport,
+    FeeSummary, MarketPhase, MemberMessage, OrderStatus, Position, Role, ServerMessage,
+    SettlementReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -209,6 +210,7 @@ impl Broker {
         symbol: Symbol,
         side: Side,
         kind: OrderKind,
+        tif: TimeInForce,
         qty: Qty,
         market: &MarketCache,
         now: Timestamp,
@@ -243,6 +245,15 @@ impl Broker {
         let Some(quote) = market.get(symbol) else {
             return Err(reject(format!("unknown symbol {symbol}")));
         };
+        if market.phase() == MarketPhase::Closed {
+            return Err(reject("market is closed".to_string()));
+        }
+        if market.phase().is_call() && tif == TimeInForce::Ioc && kind != OrderKind::Market {
+            return Err(reject(format!(
+                "IOC orders are not accepted during the {}",
+                market.phase().label()
+            )));
+        }
         if !market.is_trading(symbol) {
             return Err(reject(format!(
                 "{symbol} is halted: {}",
@@ -268,7 +279,7 @@ impl Broker {
                     ome_core::price::format_price(high)
                 )));
             }
-            (OrderKind::Limit(p), _) => (p, TimeInForce::Gtc),
+            (OrderKind::Limit(p), _) => (p, tif),
             (OrderKind::Market, Side::Buy) => (high, TimeInForce::Ioc),
             (OrderKind::Market, Side::Sell) => (low, TimeInForce::Ioc),
         };
@@ -829,6 +840,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Market,
+                TimeInForce::Gtc,
                 10,
                 &market(),
                 0,
@@ -863,6 +875,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(26_00),
+                TimeInForce::Gtc,
                 10,
                 &market(),
                 0,
@@ -914,6 +927,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 10,
                 &m,
                 0
@@ -927,6 +941,7 @@ pub mod tests {
                 sym(),
                 Side::Sell,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 1,
                 &m,
                 0
@@ -940,6 +955,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(99_00),
+                TimeInForce::Gtc,
                 1,
                 &m,
                 0
@@ -953,6 +969,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 5_000,
                 &m,
                 0
@@ -1043,6 +1060,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 10,
                 &market(),
                 0,
@@ -1069,6 +1087,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 10,
                 &market(),
                 0,
@@ -1127,6 +1146,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_50),
+                TimeInForce::Gtc,
                 20,
                 &market(),
                 0,
@@ -1140,6 +1160,7 @@ pub mod tests {
                 sym(),
                 Side::Sell,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 20,
                 &market(),
                 0,
@@ -1212,6 +1233,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 1_000,
                 &market(),
                 0,
@@ -1253,6 +1275,7 @@ pub mod tests {
             sym(),
             Side::Buy,
             OrderKind::Limit(27_00),
+            TimeInForce::Gtc,
             1_000,
             &market(),
             0,
@@ -1271,6 +1294,7 @@ pub mod tests {
                 sym(),
                 Side::Buy,
                 OrderKind::Limit(25_00),
+                TimeInForce::Gtc,
                 10,
                 &market(),
                 0,
@@ -1320,5 +1344,69 @@ pub mod tests {
         );
         assert_eq!(broker.last_settlement_seq(), 2);
         assert!(!broker.is_new_settlement(2));
+    }
+
+    #[test]
+    fn session_rules_apply_at_the_broker_before_routing() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = open(&mut broker, "alice", Role::Retail, 10_000_00);
+        let mut m = market();
+        let status = |phase| {
+            ServerMessage::MarketStatus(ome_protocol::MarketStatus {
+                phase,
+                day: 1,
+                since: 0,
+                next_change_at: 0,
+            })
+        };
+
+        m.apply(&status(MarketPhase::Closed));
+        let closed = broker.decide_order(
+            alice,
+            1,
+            sym(),
+            Side::Buy,
+            OrderKind::Limit(25_00),
+            TimeInForce::Day,
+            1,
+            &m,
+            0,
+        );
+        assert!(closed.unwrap_err().reason.contains("market is closed"));
+
+        m.apply(&status(MarketPhase::PreOpen));
+        let ioc = broker.decide_order(
+            alice,
+            1,
+            sym(),
+            Side::Buy,
+            OrderKind::Limit(25_00),
+            TimeInForce::Ioc,
+            1,
+            &m,
+            0,
+        );
+        assert!(ioc.unwrap_err().reason.contains("IOC"));
+        let day = broker
+            .decide_order(
+                alice,
+                1,
+                sym(),
+                Side::Buy,
+                OrderKind::Limit(25_00),
+                TimeInForce::Day,
+                1,
+                &m,
+                0,
+            )
+            .unwrap();
+        let effects = broker.apply(&day);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ToExchange(MemberMessage::NewOrder {
+                tif: TimeInForce::Day,
+                ..
+            })
+        )));
     }
 }

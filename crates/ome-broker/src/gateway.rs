@@ -233,6 +233,16 @@ impl Gateway {
             ServerMessage::Candles(_) => {
                 self.market.apply(&message);
             }
+            ServerMessage::MarketStatus(status) => {
+                self.market.apply(&message);
+                log(&format!(
+                    "market {} (day {})",
+                    status.phase.label(),
+                    status.day
+                ));
+                self.broadcast(&message);
+            }
+            ServerMessage::AuctionInfo(info) => self.send_to_subscribers(info.symbol, &message),
             _ => {}
         }
         self.drop_slow_sessions();
@@ -326,6 +336,9 @@ impl Gateway {
             },
         );
         self.reply(id, ServerMessage::InstrumentList(self.market.instruments()));
+        if let Some(status) = self.market.status() {
+            self.reply(id, ServerMessage::MarketStatus(status));
+        }
         if role.can_trade() {
             if let Some(snapshot) = self.broker.account_snapshot(account_id) {
                 self.reply(id, ServerMessage::Account(snapshot));
@@ -385,6 +398,7 @@ impl Gateway {
                 symbol,
                 side,
                 kind,
+                tif,
                 qty,
             } if !admin => {
                 let decision = if self.exchange.is_ready() {
@@ -394,6 +408,7 @@ impl Gateway {
                         symbol,
                         side,
                         kind,
+                        tif,
                         qty,
                         &self.market,
                         now,
@@ -407,6 +422,7 @@ impl Gateway {
                             symbol,
                             side,
                             kind,
+                            tif,
                             qty,
                             &self.market,
                             now,

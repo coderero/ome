@@ -9,6 +9,13 @@ pub struct Level {
     pub orders: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Indication {
+    pub price: Price,
+    pub volume: Qty,
+    pub imbalance: i64,
+}
+
 #[derive(Debug, Default)]
 pub struct Execution {
     pub trades: Vec<Trade>,
@@ -93,7 +100,7 @@ impl OrderBook {
 
         if incoming.qty > 0 {
             match tif {
-                TimeInForce::Gtc => {
+                TimeInForce::Gtc | TimeInForce::Day => {
                     execution.rested = incoming.qty;
                     self.index
                         .insert(incoming.id, (incoming.side, incoming.price));
@@ -106,6 +113,123 @@ impl OrderBook {
             }
         }
         execution
+    }
+
+    pub fn rest(&mut self, order: Order) {
+        self.index.insert(order.id, (order.side, order.price));
+        self.levels_mut(order.side)
+            .entry(order.price)
+            .or_default()
+            .push_back(order);
+    }
+
+    pub fn indicative(&self, reference: Price) -> Option<Indication> {
+        let (best_bid, best_ask) = (self.best_bid()?, self.best_ask()?);
+        if best_bid < best_ask {
+            return None;
+        }
+        let candidates: std::collections::BTreeSet<Price> = self
+            .bids
+            .range(best_ask..=best_bid)
+            .chain(self.asks.range(best_ask..=best_bid))
+            .map(|(p, _)| *p)
+            .collect();
+        let volume = |levels: &BTreeMap<Price, VecDeque<Order>>,
+                      range: (std::ops::Bound<Price>, std::ops::Bound<Price>)|
+         -> Qty {
+            levels
+                .range(range)
+                .flat_map(|(_, q)| q.iter())
+                .map(|o| o.qty)
+                .sum()
+        };
+        candidates
+            .into_iter()
+            .map(|price| {
+                use std::ops::Bound::{Included, Unbounded};
+                let buy = volume(&self.bids, (Included(price), Unbounded));
+                let sell = volume(&self.asks, (Unbounded, Included(price)));
+                Indication {
+                    price,
+                    volume: buy.min(sell),
+                    imbalance: buy as i64 - sell as i64,
+                }
+            })
+            .min_by_key(|i| {
+                (
+                    std::cmp::Reverse(i.volume),
+                    i.imbalance.unsigned_abs(),
+                    i.price.abs_diff(reference),
+                    i.price,
+                )
+            })
+            .filter(|i| i.volume > 0)
+    }
+
+    pub fn uncross(&mut self, price: Price, timestamp: crate::types::Timestamp) -> Execution {
+        let mut execution = Execution::default();
+        while let (Some(mut bid_level), Some(mut ask_level)) =
+            (self.bids.last_entry(), self.asks.first_entry())
+        {
+            if *bid_level.key() < price || *ask_level.key() > price {
+                break;
+            }
+            let (bids, asks) = (bid_level.get_mut(), ask_level.get_mut());
+            let (Some(bid), Some(ask)) = (bids.front_mut(), asks.front_mut()) else {
+                break;
+            };
+            if bid.account == ask.account {
+                let newer = if bid.id > ask.id {
+                    bids.pop_front()
+                } else {
+                    asks.pop_front()
+                };
+                if let Some(cancelled) = newer {
+                    self.index.remove(&cancelled.id);
+                    execution.self_trade_cancelled.push(cancelled);
+                }
+            } else {
+                let qty = bid.qty.min(ask.qty);
+                bid.qty -= qty;
+                ask.qty -= qty;
+                let (maker, taker, taker_side) = if bid.id < ask.id {
+                    (&*bid, &*ask, Side::Sell)
+                } else {
+                    (&*ask, &*bid, Side::Buy)
+                };
+                execution.trades.push(Trade {
+                    maker_order: maker.id,
+                    taker_order: taker.id,
+                    maker_account: maker.account,
+                    taker_account: taker.account,
+                    taker_side,
+                    price,
+                    qty,
+                    timestamp,
+                });
+                if bid.qty == 0 {
+                    let id = bid.id;
+                    bids.pop_front();
+                    self.index.remove(&id);
+                }
+                if ask.qty == 0 {
+                    let id = ask.id;
+                    asks.pop_front();
+                    self.index.remove(&id);
+                }
+            }
+            if bids.is_empty() {
+                bid_level.remove();
+            }
+            if asks.is_empty() {
+                ask_level.remove();
+            }
+        }
+        execution
+    }
+
+    pub fn orders(&self) -> impl Iterator<Item = &Order> {
+        self.bids.values().chain(self.asks.values()).flatten()
     }
 
     pub fn cancel(&mut self, id: OrderId) -> Option<Order> {
@@ -416,5 +540,82 @@ mod tests {
 
         assert_eq!(book.orders_of(3).count(), 2);
         assert_eq!(book.orders_of(4).count(), 1);
+    }
+
+    fn rested(
+        book: &mut OrderBook,
+        account: AccountId,
+        side: Side,
+        price: Price,
+        qty: Qty,
+    ) -> OrderId {
+        let o = order_for(account, side, price, qty);
+        let id = o.id;
+        book.rest(o);
+        id
+    }
+
+    #[test]
+    fn resting_orders_may_cross_without_trading() {
+        let mut book = OrderBook::new();
+        rested(&mut book, 1, Side::Buy, 10_100, 5);
+        rested(&mut book, 2, Side::Sell, 9_900, 5);
+        assert_eq!(
+            (book.best_bid(), book.best_ask()),
+            (Some(10_100), Some(9_900))
+        );
+        assert_eq!(book.order_count(), 2);
+    }
+
+    #[test]
+    fn indicative_price_maximizes_volume_then_minimizes_imbalance() {
+        let mut book = OrderBook::new();
+        rested(&mut book, 1, Side::Buy, 10_200, 10);
+        rested(&mut book, 1, Side::Buy, 10_000, 10);
+        rested(&mut book, 2, Side::Sell, 9_900, 5);
+        rested(&mut book, 2, Side::Sell, 10_100, 10);
+        let i = book.indicative(10_000).unwrap();
+        assert_eq!((i.price, i.volume, i.imbalance), (10_100, 10, -5));
+
+        let mut tie = OrderBook::new();
+        rested(&mut tie, 1, Side::Buy, 10_200, 5);
+        rested(&mut tie, 2, Side::Sell, 9_800, 5);
+        assert_eq!(tie.indicative(10_000).unwrap().price, 9_800);
+        assert_eq!(tie.indicative(10_200).unwrap().price, 10_200);
+
+        let mut apart = OrderBook::new();
+        rested(&mut apart, 1, Side::Buy, 9_900, 5);
+        rested(&mut apart, 2, Side::Sell, 10_000, 5);
+        assert!(apart.indicative(10_000).is_none());
+    }
+
+    #[test]
+    fn uncross_fills_everything_crossing_at_one_price_in_time_priority() {
+        let mut book = OrderBook::new();
+        let early = rested(&mut book, 1, Side::Buy, 10_200, 6);
+        let late = rested(&mut book, 3, Side::Buy, 10_200, 6);
+        rested(&mut book, 2, Side::Sell, 9_900, 8);
+        rested(&mut book, 2, Side::Sell, 10_300, 8);
+
+        let price = book.indicative(10_000).unwrap().price;
+        let execution = book.uncross(price, 5);
+
+        assert!(execution.trades.iter().all(|t| t.price == price));
+        let filled: Qty = execution.trades.iter().map(|t| t.qty).sum();
+        assert_eq!(filled, 8);
+        assert_eq!(execution.trades[0].maker_order, early);
+        assert_eq!(book.get(late).unwrap().qty, 4);
+        assert!(book.best_bid().unwrap() < book.best_ask().unwrap());
+    }
+
+    #[test]
+    fn uncross_cancels_the_newer_order_of_a_self_match() {
+        let mut book = OrderBook::new();
+        let old = rested(&mut book, 7, Side::Sell, 10_000, 5);
+        let new = rested(&mut book, 7, Side::Buy, 10_000, 5);
+        let execution = book.uncross(10_000, 0);
+        assert!(execution.trades.is_empty());
+        assert_eq!(execution.self_trade_cancelled[0].id, new);
+        assert!(book.get(old).is_some());
     }
 }

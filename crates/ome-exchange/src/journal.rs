@@ -1,8 +1,9 @@
 use crate::exchange::Command;
+use crate::session::Schedule;
 use ome_core::types::Timestamp;
 use ome_protocol::{
-    DecodeError, Decoder, Encoder, get_order_kind, member_kind_from, put_order_kind, side_from_u8,
-    side_to_u8, tif_from_u8, tif_to_u8,
+    DecodeError, Decoder, Encoder, get_order_kind, member_kind_from, phase_from, put_order_kind,
+    side_from_u8, side_to_u8, tif_from_u8, tif_to_u8,
 };
 use ome_store::Entry;
 
@@ -17,6 +18,8 @@ mod template {
     pub const OPEN_CYCLE: u16 = 207;
     pub const SETTLED: u16 = 208;
     pub const SET_CREDIT_LIMIT: u16 = 209;
+    pub const SET_PHASE: u16 = 210;
+    pub const SET_SCHEDULE: u16 = 211;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +41,8 @@ impl Entry for Record {
             Command::OpenCycle { .. } => template::OPEN_CYCLE,
             Command::Settled { .. } => template::SETTLED,
             Command::SetCreditLimit { .. } => template::SET_CREDIT_LIMIT,
+            Command::SetPhase { .. } => template::SET_PHASE,
+            Command::SetSchedule { .. } => template::SET_SCHEDULE,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -103,6 +108,23 @@ impl Entry for Record {
             }
             Command::SetCreditLimit { member, limit } => {
                 e.u64(*member).u64(*limit).end_block();
+            }
+            Command::SetPhase { phase } => {
+                e.u8(*phase as u8).end_block();
+            }
+            Command::SetSchedule { schedule } => {
+                let s = schedule.unwrap_or(Schedule {
+                    pre_open_ms: 0,
+                    continuous_ms: 0,
+                    closing_ms: 0,
+                    closed_ms: 0,
+                });
+                e.u8(schedule.is_some() as u8)
+                    .u64(s.pre_open_ms)
+                    .u64(s.continuous_ms)
+                    .u64(s.closing_ms)
+                    .u64(s.closed_ms)
+                    .end_block();
             }
         }
         e.finish()
@@ -205,6 +227,24 @@ impl Entry for Record {
                 d.end_block()?;
                 Command::SetCreditLimit { member, limit }
             }
+            template::SET_PHASE => {
+                let phase = phase_from(d.u8()?)?;
+                d.end_block()?;
+                Command::SetPhase { phase }
+            }
+            template::SET_SCHEDULE => {
+                let enabled = d.u8()? != 0;
+                let schedule = Schedule {
+                    pre_open_ms: d.u64()?,
+                    continuous_ms: d.u64()?,
+                    closing_ms: d.u64()?,
+                    closed_ms: d.u64()?,
+                };
+                d.end_block()?;
+                Command::SetSchedule {
+                    schedule: enabled.then_some(schedule),
+                }
+            }
             other => return Err(DecodeError::UnknownTemplate(other)),
         };
         Ok(Record { timestamp, command })
@@ -287,6 +327,24 @@ mod tests {
             account: Some(1),
             symbol: None,
         });
+        commands.push(Command::SetSchedule {
+            schedule: Some(Schedule {
+                pre_open_ms: 5,
+                continuous_ms: 40,
+                closing_ms: 5,
+                closed_ms: 10,
+            }),
+        });
+        commands.push(Command::SetPhase {
+            phase: ome_protocol::MarketPhase::Closed,
+        });
+        commands.push(Command::SetPhase {
+            phase: ome_protocol::MarketPhase::PreOpen,
+        });
+        commands.push(Command::SetPhase {
+            phase: ome_protocol::MarketPhase::Open,
+        });
+        commands.push(Command::SetSchedule { schedule: None });
         commands.push(Command::OpenCycle { cycle: 1 });
         commands.push(Command::SetCreditLimit {
             member: 2,

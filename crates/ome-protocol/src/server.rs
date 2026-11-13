@@ -39,6 +39,8 @@ pub enum ServerMessage {
     ClearedTrade(ClearedTrade),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
+    MarketStatus(MarketStatus),
+    AuctionInfo(AuctionInfo),
     InstrumentList(Vec<InstrumentInfo>),
     Instrument(InstrumentInfo),
     Book(BookSnapshot),
@@ -65,6 +67,8 @@ impl ServerMessage {
             ServerMessage::ClearedTrade(_) => CLEARED_TRADE,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
+            ServerMessage::MarketStatus(_) => MARKET_STATUS,
+            ServerMessage::AuctionInfo(_) => AUCTION_INFO,
             ServerMessage::InstrumentList(_) => INSTRUMENT_LIST,
             ServerMessage::Instrument(_) => INSTRUMENT,
             ServerMessage::Book(_) => BOOK_SNAPSHOT,
@@ -216,6 +220,20 @@ impl ServerMessage {
                     e.end_entry_block(&mut g);
                     e.var(&m.name);
                 }
+            }
+            ServerMessage::MarketStatus(m) => {
+                e.u8(m.phase as u8)
+                    .u64(m.day)
+                    .u64(m.since)
+                    .u64(m.next_change_at)
+                    .end_block();
+            }
+            ServerMessage::AuctionInfo(a) => {
+                e.symbol(Some(a.symbol))
+                    .u64(a.price)
+                    .u64(a.volume)
+                    .i64(a.imbalance)
+                    .end_block();
             }
             ServerMessage::FeeSummary(f) => {
                 put_charges(&mut e, &f.charges);
@@ -542,6 +560,26 @@ impl ServerMessage {
                     timestamp,
                 })
             }
+            MARKET_STATUS => {
+                let status = MarketStatus {
+                    phase: phase_from(d.u8()?)?,
+                    day: d.u64()?,
+                    since: d.u64()?,
+                    next_change_at: d.u64()?,
+                };
+                d.end_block()?;
+                ServerMessage::MarketStatus(status)
+            }
+            AUCTION_INFO => {
+                let info = AuctionInfo {
+                    symbol: d.symbol()?,
+                    price: d.u64()?,
+                    volume: d.u64()?,
+                    imbalance: d.i64()?,
+                };
+                d.end_block()?;
+                ServerMessage::AuctionInfo(info)
+            }
             FEE_SUMMARY => {
                 let charges = get_charges(&mut d)?;
                 let fills = d.u64()?;
@@ -755,6 +793,18 @@ mod tests {
             },
             ServerMessage::ReplayComplete { next_seq: 51 },
             ServerMessage::Heartbeat { server_time: 5 },
+            ServerMessage::MarketStatus(MarketStatus {
+                phase: MarketPhase::PreOpen,
+                day: 3,
+                since: 100,
+                next_change_at: 5_100,
+            }),
+            ServerMessage::AuctionInfo(AuctionInfo {
+                symbol: sym("ACME"),
+                price: 2_510,
+                volume: 400,
+                imbalance: -120,
+            }),
             ServerMessage::Reject {
                 ref_template: HALT,
                 reason: "no".into(),

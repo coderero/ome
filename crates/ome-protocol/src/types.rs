@@ -157,6 +157,69 @@ impl InstrumentStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketPhase {
+    Closed = 1,
+    PreOpen = 2,
+    Open = 3,
+    ClosingAuction = 4,
+}
+
+impl MarketPhase {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => MarketPhase::Closed,
+            2 => MarketPhase::PreOpen,
+            3 => MarketPhase::Open,
+            4 => MarketPhase::ClosingAuction,
+            _ => return None,
+        })
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text.to_ascii_lowercase().as_str() {
+            "close" | "closed" => MarketPhase::Closed,
+            "preopen" | "pre-open" => MarketPhase::PreOpen,
+            "open" => MarketPhase::Open,
+            "auction" | "closing" | "closing-auction" => MarketPhase::ClosingAuction,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MarketPhase::Closed => "closed",
+            MarketPhase::PreOpen => "pre-open",
+            MarketPhase::Open => "open",
+            MarketPhase::ClosingAuction => "closing auction",
+        }
+    }
+
+    pub fn is_call(self) -> bool {
+        matches!(self, MarketPhase::PreOpen | MarketPhase::ClosingAuction)
+    }
+}
+
+pub fn phase_from(v: u8) -> Result<MarketPhase, DecodeError> {
+    MarketPhase::from_u8(v).ok_or(DecodeError::Invalid("market phase"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketStatus {
+    pub phase: MarketPhase,
+    pub day: u64,
+    pub since: Timestamp,
+    pub next_change_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuctionInfo {
+    pub symbol: Symbol,
+    pub price: Price,
+    pub volume: Qty,
+    pub imbalance: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Asset {
     Cash,
@@ -407,6 +470,7 @@ pub fn tif_to_u8(tif: TimeInForce) -> u8 {
     match tif {
         TimeInForce::Gtc => 1,
         TimeInForce::Ioc => 2,
+        TimeInForce::Day => 3,
     }
 }
 
@@ -414,6 +478,7 @@ pub fn tif_from_u8(v: u8) -> Result<TimeInForce, DecodeError> {
     match v {
         1 => Ok(TimeInForce::Gtc),
         2 => Ok(TimeInForce::Ioc),
+        3 => Ok(TimeInForce::Day),
         _ => Err(DecodeError::Invalid("time in force")),
     }
 }

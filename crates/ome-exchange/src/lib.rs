@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod instrument;
 pub mod journal;
 pub mod members;
+pub mod session;
 
 use exchange::{Exchange, ExchangeConfig};
 use gateway::Gateway;

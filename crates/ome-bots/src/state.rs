@@ -1,7 +1,7 @@
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{OrderId, Qty, Side, Timestamp};
-use ome_protocol::{InstrumentInfo, InstrumentStatus, ServerMessage};
+use ome_protocol::{InstrumentInfo, InstrumentStatus, MarketPhase, ServerMessage};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 const PRICE_HISTORY: usize = 600;
@@ -19,6 +19,8 @@ pub struct BotState {
     pub symbol: Symbol,
     pub now: Timestamp,
     pub trading: bool,
+    pub instrument_trading: bool,
+    pub market_open: bool,
     pub reference_price: Price,
     pub last_price: Option<Price>,
     pub best_bid: Option<Price>,
@@ -39,6 +41,8 @@ impl BotState {
             symbol,
             now: 0,
             trading: false,
+            instrument_trading: false,
+            market_open: true,
             reference_price: 0,
             last_price: None,
             best_bid: None,
@@ -77,6 +81,10 @@ impl BotState {
             }
             ServerMessage::Instrument(info) if info.symbol == self.symbol => {
                 self.apply_instrument(info)
+            }
+            ServerMessage::MarketStatus(status) => {
+                self.market_open = status.phase != MarketPhase::Closed;
+                self.trading = self.instrument_trading && self.market_open;
             }
             ServerMessage::Book(book) if book.symbol == self.symbol => {
                 self.best_bid = book.bids.first().map(|l| l.price);
@@ -131,7 +139,8 @@ impl BotState {
     }
 
     fn apply_instrument(&mut self, info: &InstrumentInfo) {
-        self.trading = info.status == InstrumentStatus::Trading;
+        self.instrument_trading = info.status == InstrumentStatus::Trading;
+        self.trading = self.instrument_trading && self.market_open;
         self.reference_price = info.reference_price;
         if info.last_price.is_some() {
             self.last_price = info.last_price;

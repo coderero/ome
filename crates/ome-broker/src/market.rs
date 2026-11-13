@@ -4,7 +4,8 @@ use ome_core::risk::PriceBand;
 use ome_core::symbol::Symbol;
 use ome_core::types::Timestamp;
 use ome_protocol::{
-    BookSnapshot, CandleSnapshot, InstrumentInfo, InstrumentStatus, ServerMessage, TradeEvent,
+    BookSnapshot, CandleSnapshot, InstrumentInfo, InstrumentStatus, MarketPhase, MarketStatus,
+    ServerMessage, TradeEvent,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -21,6 +22,7 @@ pub struct Quote {
 #[derive(Default)]
 pub struct MarketCache {
     quotes: BTreeMap<Symbol, Quote>,
+    status: Option<MarketStatus>,
 }
 
 impl MarketCache {
@@ -33,6 +35,10 @@ impl MarketCache {
                 None
             }
             ServerMessage::Instrument(info) => self.upsert(info),
+            ServerMessage::MarketStatus(status) => {
+                self.status = Some(*status);
+                None
+            }
             ServerMessage::Book(book) => {
                 if let Some(quote) = self.quotes.get_mut(&book.symbol) {
                     quote.book = Some(book.clone());
@@ -114,6 +120,14 @@ impl MarketCache {
             PriceBand { bps: info.band_bps }
                 .limits(info.last_price.unwrap_or(info.reference_price)),
         )
+    }
+
+    pub fn phase(&self) -> MarketPhase {
+        self.status.map_or(MarketPhase::Open, |s| s.phase)
+    }
+
+    pub fn status(&self) -> Option<MarketStatus> {
+        self.status
     }
 
     pub fn is_trading(&self, symbol: Symbol) -> bool {

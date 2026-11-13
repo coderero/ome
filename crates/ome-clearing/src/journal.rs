@@ -10,6 +10,7 @@ mod template {
     pub const ALLOCATION_CLEARED: u16 = 403;
     pub const CYCLE_OPENED: u16 = 404;
     pub const CYCLE_SETTLED: u16 = 405;
+    pub const TRADING_DAY_STARTED: u16 = 406;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,7 @@ impl Entry for Record {
             Fact::AllocationCleared(_) => template::ALLOCATION_CLEARED,
             Fact::CycleOpened { .. } => template::CYCLE_OPENED,
             Fact::CycleSettled { .. } => template::CYCLE_SETTLED,
+            Fact::TradingDayStarted { .. } => template::TRADING_DAY_STARTED,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -51,6 +53,9 @@ impl Entry for Record {
             }
             Fact::CycleOpened { cycle } | Fact::CycleSettled { cycle } => {
                 e.u64(*cycle).end_block();
+            }
+            Fact::TradingDayStarted { day } => {
+                e.u64(*day).end_block();
             }
         }
         e.finish()
@@ -99,6 +104,11 @@ impl Entry for Record {
                 let cycle = d.u64()?;
                 d.end_block()?;
                 Fact::CycleSettled { cycle }
+            }
+            template::TRADING_DAY_STARTED => {
+                let day = d.u64()?;
+                d.end_block()?;
+                Fact::TradingDayStarted { day }
             }
             other => return Err(DecodeError::UnknownTemplate(other)),
         };
@@ -151,6 +161,7 @@ mod tests {
                 member: 2,
                 amount: -1_000_00,
             },
+            Fact::TradingDayStarted { day: 4 },
         ]
     }
 

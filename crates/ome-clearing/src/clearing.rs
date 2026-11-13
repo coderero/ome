@@ -47,6 +47,9 @@ pub enum Fact {
     CycleSettled {
         cycle: u64,
     },
+    TradingDayStarted {
+        day: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +85,7 @@ pub struct Clearing {
     next_to_settle: u64,
     fee_pool: i64,
     last_exchange_seq: u64,
+    trading_day: u64,
     credit_limits: BTreeMap<MemberId, u64>,
     feeds: Feeds,
 }
@@ -97,6 +101,7 @@ impl Clearing {
             next_to_settle: 0,
             fee_pool: 0,
             last_exchange_seq: 0,
+            trading_day: 0,
             credit_limits: BTreeMap::new(),
             feeds,
         }
@@ -148,6 +153,19 @@ impl Clearing {
             return 0;
         }
         (cash as u128 * BPS / self.config.margin_bps as u128).min(u64::MAX as u128) as u64
+    }
+
+    pub fn follows_trading_days(&self) -> bool {
+        self.config.cycle_ms == 0
+    }
+
+    pub fn due_on_trading_day(&self, day: u64) -> Vec<Fact> {
+        if !self.follows_trading_days() || day <= self.trading_day {
+            return Vec::new();
+        }
+        let mut facts = vec![Fact::TradingDayStarted { day }];
+        facts.extend(self.due_on_open());
+        facts
     }
 
     pub fn due_on_open(&self) -> Vec<Fact> {
@@ -285,6 +303,10 @@ impl Clearing {
                 })]
             }
             Fact::CycleSettled { cycle } => self.settle(*cycle),
+            Fact::TradingDayStarted { day } => {
+                self.trading_day = self.trading_day.max(*day);
+                vec![]
+            }
         }
     }
 
@@ -540,5 +562,39 @@ pub mod tests {
             member: 2,
             limit: 10_000_000_00
         }));
+    }
+
+    #[test]
+    fn session_mode_opens_one_cycle_per_trading_day() {
+        let mut c = Clearing::new(ClearingConfig {
+            cycle_ms: 0,
+            ..ClearingConfig::default()
+        });
+        assert!(c.follows_trading_days());
+        let facts = c.due_on_trading_day(1);
+        assert_eq!(
+            facts[..2],
+            [
+                Fact::TradingDayStarted { day: 1 },
+                Fact::CycleOpened { cycle: 1 }
+            ]
+        );
+        for fact in &facts {
+            c.apply(fact);
+        }
+        assert!(
+            c.due_on_trading_day(1).is_empty(),
+            "the same day never opens twice"
+        );
+        assert_eq!(
+            c.due_on_trading_day(2)[..3],
+            [
+                Fact::TradingDayStarted { day: 2 },
+                Fact::CycleOpened { cycle: 2 },
+                Fact::CycleSettled { cycle: 0 }
+            ]
+        );
+        let timed = Clearing::new(ClearingConfig::default());
+        assert!(timed.due_on_trading_day(5).is_empty());
     }
 }

@@ -1,10 +1,10 @@
 use ome_client::{Client, ClientError, DEFAULT_BROKER_ADDR, DEFAULT_EXCHANGE_ADDR};
 use ome_core::price::{format_price, parse_amount, parse_price};
 use ome_core::symbol::Symbol;
-use ome_core::types::{AccountId, OrderKind, Side};
+use ome_core::types::{AccountId, OrderKind, Side, TimeInForce};
 use ome_protocol::{
-    AccountInfo, Asset, ClientMessage, InstrumentInfo, MemberInfo, MemberKind, MemberMessage,
-    OrderStatus, Role, ServerMessage,
+    AccountInfo, Asset, ClientMessage, InstrumentInfo, MarketPhase, MemberInfo, MemberKind,
+    MemberMessage, OrderStatus, Role, ServerMessage,
 };
 use std::time::Duration;
 
@@ -15,6 +15,9 @@ const USAGE: &str = "usage:
       ipo <SYMBOL> <price> <shares> <underwriter> <issuer-account> <name..>
                                                           list a company; underwriter is a member name
       halt <SYMBOL> [reason..]  |  resume <SYMBOL>
+      status                                              market phase and trading day
+      session <preopen|open|auction|close>                change the market phase now
+      schedule <preopen> <open> <closing> <closed>        repeating trading day in seconds; `schedule off`
       instruments  |  watch <SYMBOL>
 
   ome broker [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
@@ -22,7 +25,8 @@ const USAGE: &str = "usage:
       create-account <name> <secret> <role> <cash>        role: retail quant hft prop lp issuer admin
       set-cash <account> <amount>  |  set-shares <account> <SYMBOL> <qty>
       balance                                             (trader)
-      buy|sell <SYMBOL> <price|mkt> <qty>
+      buy|sell <SYMBOL> <price|mkt> <qty> [gtc|day|ioc]
+      market                                              market phase and trading day
       cancel <order_id>  |  cancel-all [SYMBOL]
       instruments  |  watch <SYMBOL>
 
@@ -220,6 +224,36 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
                 })?
             );
         }
+        ["status"] => print_status(client)?,
+        ["session", phase] => {
+            let phase =
+                MarketPhase::parse(phase).ok_or("phase must be preopen, open, auction or close")?;
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::SetSession { phase })?
+            );
+        }
+        ["schedule", "off"] => println!(
+            "{}",
+            client.request_member(&MemberMessage::SetSchedule {
+                pre_open_ms: 0,
+                continuous_ms: 0,
+                closing_ms: 0,
+                closed_ms: 0,
+            })?
+        ),
+        ["schedule", pre_open, open, closing, closed] => {
+            let ms = |text: &str| number(text).map(|s| s * 1_000);
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::SetSchedule {
+                    pre_open_ms: ms(pre_open)?,
+                    continuous_ms: ms(open)?,
+                    closing_ms: ms(closing)?,
+                    closed_ms: ms(closed)?,
+                })?
+            );
+        }
         ["resume", sym] => println!(
             "{}",
             client.request_member(&MemberMessage::Resume {
@@ -339,7 +373,17 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 );
             }
         }
-        [side @ ("buy" | "sell"), sym, px, qty] => {
+        ["market"] => print_status(client)?,
+        [side @ ("buy" | "sell"), sym, px, qty, tif @ ..] => {
+            let tif = match tif.first().map(|t| t.to_ascii_lowercase()) {
+                None => None,
+                Some(t) if t == "gtc" => Some(TimeInForce::Gtc),
+                Some(t) if t == "day" => Some(TimeInForce::Day),
+                Some(t) if t == "ioc" => Some(TimeInForce::Ioc),
+                Some(t) => {
+                    return Err(format!("time in force must be gtc, day or ioc, not '{t}'").into());
+                }
+            };
             let side = if *side == "buy" {
                 Side::Buy
             } else {
@@ -350,7 +394,10 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             } else {
                 OrderKind::Limit(price(px)?)
             };
-            let client_order_id = client.send_order(symbol(sym)?, side, kind, number(qty)?)?;
+            let client_order_id = match tif {
+                Some(tif) => client.send_order_with(symbol(sym)?, side, kind, tif, number(qty)?)?,
+                None => client.send_order(symbol(sym)?, side, kind, number(qty)?)?,
+            };
             let first_wait = Duration::from_secs(5);
             let mut wait = first_wait;
             loop {
@@ -551,6 +598,36 @@ fn print_instrument(i: &InstrumentInfo) {
     );
 }
 
+fn print_status(client: &mut Client) -> Result<()> {
+    let ServerMessage::MarketStatus(m) = client.wait_for(Duration::from_secs(5), |m| {
+        matches!(m, ServerMessage::MarketStatus(_))
+    })?
+    else {
+        unreachable!()
+    };
+    let next = if m.next_change_at == 0 {
+        "manual".to_string()
+    } else {
+        format!(
+            "next change in {}s",
+            m.next_change_at.saturating_sub(ome_net_now()) / 1_000
+        )
+    };
+    println!(
+        "market {} · trading day {} · {next}",
+        m.phase.label(),
+        m.day
+    );
+    Ok(())
+}
+
+fn ome_net_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn watch(client: &mut Client) -> Result<()> {
     loop {
         match client.recv_timeout(Duration::from_secs(10))? {
@@ -568,6 +645,16 @@ fn watch(client: &mut Client) -> Result<()> {
             Some(ServerMessage::Instrument(i)) if !i.halt_reason.is_empty() => {
                 println!("{} HALTED: {}", i.symbol, i.halt_reason)
             }
+            Some(ServerMessage::MarketStatus(m)) => {
+                println!("market {} (day {})", m.phase.label(), m.day)
+            }
+            Some(ServerMessage::AuctionInfo(a)) if a.volume > 0 => println!(
+                "{} auction indicates {} x {} (imbalance {})",
+                a.symbol,
+                format_price(a.price),
+                a.volume,
+                a.imbalance
+            ),
             _ => {}
         }
     }
