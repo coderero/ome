@@ -1,0 +1,16 @@
+[package]
+name = "ome-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ome-core.workspace = true
+ome-protocol.workspace = true
+ome-net.workspace = true
+ome-client.workspace = true
+postgres = "0.19"
+redis = { version = "1.8", default-features = false }
+
+[lints]
+workspace = true

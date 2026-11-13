@@ -6,7 +6,7 @@ use ome_venue::{VenueConfig, start};
 const USAGE: &str = "usage: ome-venue --kind wholesaler|ats --member NAME --member-secret SECRET
                  [--listen ADDR] [--exchange ADDR] [--journal PATH] [--ops-name NAME] [--ops-secret SECRET]
                  wholesaler: [--improvement-bps BPS] [--pfof PER-SHARE (hundredths of a tick)]
-                             [--max-order QTY] [--inventory-limit QTY] [--hedge-threshold QTY]";
+                             [--max-order QTY] [--inventory-limit QTY] [--hedge-threshold QTY] [--accept-pct PCT]";
 
 fn parse_args() -> Result<VenueConfig, String> {
     let mut config = VenueConfig {
@@ -50,6 +50,7 @@ fn parse_args() -> Result<VenueConfig, String> {
             "--max-order" => config.wholesaler.max_order = number(value()?)?,
             "--inventory-limit" => config.wholesaler.inventory_limit = number(value()?)?,
             "--hedge-threshold" => config.wholesaler.hedge_threshold = number(value()?)?,
+            "--accept-pct" => config.wholesaler.accept_pct = number(value()?)?.min(100),
             _ => return Err(USAGE.into()),
         }
     }

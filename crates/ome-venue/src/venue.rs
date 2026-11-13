@@ -228,6 +228,9 @@ impl VenueState {
         if !quotes.tradable(symbol) {
             return decline(format!("{symbol} is not in continuous trading"));
         }
+        if !wholesaler::wants(&self.config, member_order_id) {
+            return decline("routed to the lit market".into());
+        }
         match wholesaler::quote(
             &self.config,
             &self.book,
@@ -755,7 +758,13 @@ mod tests {
     }
 
     fn registered(kind: Venue) -> VenueState {
-        let mut venue = VenueState::new(kind, WholesalerConfig::default());
+        let mut venue = VenueState::new(
+            kind,
+            WholesalerConfig {
+                accept_pct: 100,
+                ..WholesalerConfig::default()
+            },
+        );
         let members = [("retail-co", 2), ("prime-co", 3)].map(|(name, id)| MemberInfo {
             member_id: id,
             kind: MemberKind::Broker,

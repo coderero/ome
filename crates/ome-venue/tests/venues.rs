@@ -35,7 +35,10 @@ fn venue(kind: Venue, exchange: SocketAddr, member: &str) -> SocketAddr {
         exchange_addr: exchange.to_string(),
         member_name: member.into(),
         member_secret: "pw".into(),
-        wholesaler: WholesalerConfig::default(),
+        wholesaler: WholesalerConfig {
+            accept_pct: 100,
+            ..WholesalerConfig::default()
+        },
     })
     .unwrap()
     .0

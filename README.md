@@ -7,8 +7,11 @@ Every price, balance and trade comes from real orders matching in the engine. No
 ## Quick Start
 
 ```bash
-scripts/demo.sh --fresh       # build; start exchange + 4 providers; seed accounts and 3 IPOs; start 24 bots
+scripts/demo.sh --fresh       # build; start exchange, clearing, 2 venues, 4 providers; seed 3 IPOs; start bots
 scripts/stop.sh
+
+scripts/db.sh up              # PostgreSQL + Redis in Docker
+OME_RECORD=1 scripts/demo.sh --fresh   # also record the market into them
 ```
 
 ```bash
@@ -70,9 +73,12 @@ crates/
 ├── ome-exchange   exchange service (lib + `ome-exchange` binary)
 ├── ome-clearing   clearing house (lib + `ome-clearing` binary)
 ├── ome-broker     provider service with retail / prime / dma / lp profiles (lib + `ome-broker`)
+├── ome-venue      off-exchange venues: wholesaler and dark pool (lib + `ome-venue`)
+├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
 └── ome-bots       agents: market maker, momentum, mean reversion, noise
-scripts/  env.sh · demo.sh · seed.sh · bots.sh · stop.sh
+scripts/  env.sh · demo.sh · seed.sh · bots.sh · stop.sh · db.sh
+docker-compose.yml   PostgreSQL 16 + Redis 7 for the recorder
 ```
 
 Each service is a library with a thin binary. That lets the end-to-end tests start a real exchange and real brokers in-process on random ports.
@@ -199,7 +205,7 @@ Every internal cross is reported to the exchange with a `TradeReport` and printe
 
 Two off-exchange venues run as their own service, `ome-venue`, each an exchange member with its own journal. Brokers connect to them with the member protocol, so routing has the same sequencing, replay and gap detection as the exchange link.
 
-- **Wholesaler** (`--kind wholesaler`, port 7301, member `wholesale-co`). The retail broker sends marketable retail orders that did not cross internally to the wholesaler before the exchange. The wholesaler fills the whole order from its own inventory at the exchange quote improved by 20% of the spread, and pays the broker **payment for order flow** (0.2 tick per share by default, kept by the broker, not passed to the client). It declines orders that are too large, would breach its inventory limit, or have a limit it cannot meet; the broker then routes the order to the exchange at once. It hedges inventory past 500 shares on the exchange and flattens everything in the last seconds before the close.
+- **Wholesaler** (`--kind wholesaler`, port 7301, member `wholesale-co`). The retail broker sends marketable retail orders that did not cross internally to the wholesaler before the exchange. The wholesaler takes about 80% of that flow (`--accept-pct`) and sends the rest on to the lit market. It fills each order it takes completely from its own inventory at the exchange quote improved by 20% of the spread, and pays the broker **payment for order flow** (0.2 tick per share by default, kept by the broker, not passed to the client). It declines orders that are too large, would breach its inventory limit, or have a limit it cannot meet; the broker then routes the order to the exchange at once. It hedges inventory past 500 shares on the exchange and flattens everything in the last seconds before the close.
 - **Dark pool** (`--kind ats`, port 7302, member `ats-co`). Quant and prop accounts at the prime broker send non-displayed midpoint orders with `ome broker dark <SYM> <side> <qty> [limit] [min:<qty>]`. Orders match at the exchange midpoint, first-come first-served, only between different accounts and only for at least each order's minimum quantity. They expire at the close.
 
 Every venue fill is printed on the tape with its venue and is cleared T+1 between the two members, like an exchange trade. `ome venue --addr <addr> status` shows fills, routing members, inventory and PFOF; `ome broker fees` gives the broker's 606-style routing report:
@@ -322,6 +328,23 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 #   ACME   10 (reserved 0, unsettled 10)
 ```
 
+## Storage: PostgreSQL and Redis
+
+The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house and the venues as ops and to every provider as broker admin. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
+
+| Store | Holds | Keys / tables |
+|---|---|---|
+| **PostgreSQL** (record) | every trade (lit and off-exchange, with venue), instruments, market stats, session changes, exchange members, clearing positions, settled cycles, client accounts per broker, 606 routing stats per broker, venue status and inventory | `trades`, `instruments`, `market_stats`, `sessions`, `members`, `clearing_members`, `settlement_cycles`, `accounts`, `broker_routing`, `venues`, `venue_inventory` |
+| **Redis** (live) | last price, full book as JSON, market stats, a capped trade stream per symbol, a pub/sub trade channel, market phase | `ome:last:SYM`, `ome:book:SYM`, `ome:stats:SYM`, `ome:trades:SYM` (stream), `ome:trades` (channel), `ome:market`, `ome:instrument:SYM`, `ome:symbols` |
+
+Prices and cash are stored as integer ticks (0.01), like everywhere else in the system. If a database goes away, the recorder keeps a bounded backlog (200,000 records) and writes it when the database is back. Restarting PostgreSQL in the middle of a session loses nothing.
+
+```bash
+scripts/db.sh psql -c "select venue, count(*), sum(qty) from trades group by venue"
+scripts/db.sh redis GET ome:book:ACME
+scripts/db.sh redis SUBSCRIBE ome:trades
+```
+
 ## Reliability
 
 - **Clearing house**: an event-sourced journal of facts (registrations, deposits, cleared trades, cycles); settlement is recomputed deterministically on replay, including each member's report feed.
@@ -354,7 +377,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 180 tests
+cargo test --workspace     # 186 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -363,7 +386,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 
 - **1f** ~~broker-held orders, broker risk controls, algorithmic orders (TWAP, VWAP, POV, iceberg slicer)~~ done
 - **1g** ~~off-exchange execution: internalization, tape reporting, wholesaler with PFOF, dark pool, market stats, designated market makers~~ done
-- **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)
+- **1h** ~~PostgreSQL (accounts, trades, settlements) and Redis (market data)~~ done
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane
 - **3** local-LLM newsroom: company reports, IPO prospectuses, news and macro events
 - **4** GPUI desktop apps, one per party (the terminal UI was retired)

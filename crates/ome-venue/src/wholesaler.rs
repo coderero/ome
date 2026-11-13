@@ -10,6 +10,7 @@ pub struct WholesalerConfig {
     pub max_order: Qty,
     pub inventory_limit: Qty,
     pub hedge_threshold: Qty,
+    pub accept_pct: u64,
 }
 
 impl Default for WholesalerConfig {
@@ -20,6 +21,7 @@ impl Default for WholesalerConfig {
             max_order: 5_000,
             inventory_limit: 20_000,
             hedge_threshold: 500,
+            accept_pct: 80,
         }
     }
 }
@@ -37,6 +39,10 @@ pub fn fill_price(side: Side, (bid, ask): (Price, Price), improvement_bps: u64) 
         Side::Buy => ask - improvement,
         Side::Sell => bid + improvement,
     }
+}
+
+pub fn wants(config: &WholesalerConfig, order_ref: u64) -> bool {
+    order_ref.wrapping_mul(2_654_435_761) % 100 < config.accept_pct
 }
 
 pub fn pfof(qty: Qty, per_share: u64) -> u64 {
@@ -137,6 +143,18 @@ mod tests {
         book.inventory.insert(acme(), -19_950);
         assert!(q(&book, Side::Buy, OrderKind::Market, 100).is_err());
         assert!(q(&book, Side::Sell, OrderKind::Market, 100).is_ok());
+    }
+
+    #[test]
+    fn the_wholesaler_takes_roughly_its_configured_share_of_flow() {
+        let config = WholesalerConfig::default();
+        let taken = (1..=1_000).filter(|r| wants(&config, *r)).count();
+        assert!((700..=900).contains(&taken), "{taken}");
+        let all = WholesalerConfig {
+            accept_pct: 100,
+            ..config
+        };
+        assert!((1..=100).all(|r| wants(&all, r)));
     }
 
     #[test]

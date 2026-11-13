@@ -55,6 +55,21 @@ if (( fresh )) && [[ "$OME_TRADING_DAY" != "off" ]]; then
 fi
 scripts/bots.sh
 
+if [[ "$OME_RECORD" == "1" ]]; then
+  recorder_args=(--postgres "$OME_POSTGRES" --redis "$OME_REDIS" --exchange "$OME_EXCHANGE"
+    --exchange-secret "$OME_EXCHANGE_SECRET" --clearing "$OME_CLEARING" --clearing-secret "$OME_CLEARING_SECRET"
+    --broker-secret "$OME_BROKER_SECRET" --venue-secret "$OME_VENUE_SECRET")
+  for p in "${providers[@]}"; do
+    read -r name _ _ port <<<"$p"
+    recorder_args+=(--broker "$name=$OME_HOST:$port")
+  done
+  for v in "${venues[@]}"; do
+    read -r name _ _ port <<<"$v"
+    recorder_args+=(--venue "$name=$OME_HOST:$port")
+  done
+  start_bg recorder "$BIN/ome-recorder" "${recorder_args[@]}"
+fi
+
 cat <<MSG
 
 market is live:
@@ -70,5 +85,6 @@ market is live:
 examples:
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw balance
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw buy ACME mkt 5
+recording:   OME_RECORD=1 scripts/demo.sh records into PostgreSQL and Redis (scripts/db.sh up first)
 stop everything:  scripts/stop.sh
 MSG
