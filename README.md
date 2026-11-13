@@ -76,8 +76,8 @@ crates/
 ├── ome-venue      off-exchange venues: wholesaler and dark pool (lib + `ome-venue`)
 ├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
-└── ome-bots       agents: market maker, momentum, mean reversion, noise
-scripts/  env.sh · demo.sh · seed.sh · bots.sh · stop.sh · db.sh
+└── ome-agents     trading firms from config/roster.conf: HFT, DMM, quant, pension, prop, retail personas
+scripts/  env.sh · demo.sh · seed.sh · agents.sh · stop.sh · db.sh
 docker-compose.yml   PostgreSQL 16 + Redis 7 for the recorder
 ```
 
@@ -377,7 +377,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 186 tests
+cargo test --workspace     # 195 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.

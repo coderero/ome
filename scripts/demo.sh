@@ -5,7 +5,7 @@ source scripts/env.sh
 
 if [[ "${1:-}" == "--fresh" ]]; then
   scripts/stop.sh || true
-  rm -f "$OME_DATA"/*.journal "$OME_DATA/bots.conf"
+  rm -f "$OME_DATA"/*.journal
 fi
 
 cargo build --release --workspace --quiet
@@ -53,7 +53,7 @@ if (( fresh )) && [[ "$OME_TRADING_DAY" != "off" ]]; then
   # shellcheck disable=SC2086
   exchange_cmd schedule $OME_TRADING_DAY
 fi
-scripts/bots.sh
+scripts/agents.sh
 
 if [[ "$OME_RECORD" == "1" ]]; then
   recorder_args=(--postgres "$OME_POSTGRES" --redis "$OME_REDIS" --exchange "$OME_EXCHANGE"

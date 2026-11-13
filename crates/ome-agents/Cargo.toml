@@ -1,5 +1,5 @@
 [package]
-name = "ome-bots"
+name = "ome-agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,11 @@ ome-core.workspace = true
 ome-protocol.workspace = true
 ome-client.workspace = true
 rand.workspace = true
+ome-net.workspace = true
+
+[dev-dependencies]
+ome-exchange.workspace = true
+ome-broker.workspace = true
 
 [lints]
 workspace = true
