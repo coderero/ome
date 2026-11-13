@@ -1,3 +1,5 @@
+pub mod upstream;
+
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, OrderKind, Qty, Side};
 use ome_protocol::framing::{frame, read_frame};

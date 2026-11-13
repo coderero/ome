@@ -172,6 +172,7 @@ pub mod tests {
             last_price: 0,
             last_qty: 0,
             fees: 0,
+            cycle: 0,
             timestamp: 5,
             reason: String::new(),
         })

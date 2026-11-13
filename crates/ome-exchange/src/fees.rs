@@ -34,7 +34,7 @@ impl FeeSchedule {
     pub fn fee(&self, kind: MemberKind, maker: bool, qty: Qty) -> i64 {
         let rate = match kind {
             MemberKind::LiquidityProvider => self.liquidity_provider,
-            MemberKind::Broker | MemberKind::Admin => self.broker,
+            MemberKind::Broker | MemberKind::Admin | MemberKind::Clearing => self.broker,
         };
         let per_share = if maker {
             rate.maker_per_share

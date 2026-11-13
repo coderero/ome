@@ -17,10 +17,17 @@ start_bg exchange "$BIN/ome-exchange" --listen "$OME_EXCHANGE" --journal "$OME_D
 wait_for exchange_cmd instruments
 (( fresh )) && scripts/seed.sh members
 
+start_bg clearing "$BIN/ome-clearing" --listen "$OME_CLEARING" --exchange "$OME_EXCHANGE" --member ccp \
+  --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/clearing.journal" --ops-secret "$OME_CLEARING_SECRET" \
+  --cycle-ms "$OME_CYCLE_MS"
+wait_for clearing_cmd status
+(( fresh )) && scripts/seed.sh clearing
+
 for p in "${providers[@]}"; do
   read -r name kind member port <<<"$p"
   start_bg "$name" "$BIN/ome-broker" --profile "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
-    --member "$name" --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/$name.journal" --admin-secret "$OME_BROKER_SECRET"
+    --member "$name" --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/$name.journal" --admin-secret "$OME_BROKER_SECRET" \
+    --clearing "$OME_CLEARING"
 done
 for p in "${providers[@]}"; do
   read -r name _ _ _ <<<"$p"
@@ -34,6 +41,7 @@ cat <<MSG
 
 market is live:
   exchange    $OME_EXCHANGE           ./target/release/ome exchange members | instruments | halt ACME news
+  clearing    $OME_CLEARING           ./target/release/ome clearing status   (cycle every $(( OME_CYCLE_MS / 1000 ))s, T+1)
   retail      $(provider_addr retail-co)   alice / alice-pw, bob / bob-pw
   prime       $(provider_addr prime-co)   fund / fund-pw (quant), issuers
   dma         $(provider_addr dma-co)   HFT desks

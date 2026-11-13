@@ -97,10 +97,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ome-clearing"
+version = "0.5.0"
+dependencies = [
+ "ome-broker",
+ "ome-client",
+ "ome-core",
+ "ome-exchange",
+ "ome-net",
+ "ome-protocol",
+ "ome-store",
+]
+
+[[package]]
 name = "ome-client"
 version = "0.5.0"
 dependencies = [
  "ome-core",
+ "ome-net",
  "ome-protocol",
 ]
 

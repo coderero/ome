@@ -26,12 +26,18 @@ const USAGE: &str = "usage:
       cancel <order_id>  |  cancel-all [SYMBOL]
       instruments  |  watch <SYMBOL>
 
+  ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
+      status                                              cycles, collateral, margin, credit, fails
+      register <member-name> <secret>                     make an exchange member a clearing member
+      deposit <member> <amount>  |  withdraw <member> <amount>
+
 defaults: OME_EXCHANGE / OME_MEMBER / OME_MEMBER_SECRET and OME_BROKER / OME_USER / OME_SECRET
 <account> may be an id or a username";
 
 enum Target {
     Exchange,
     Broker,
+    Clearing,
 }
 
 struct Options {
@@ -54,6 +60,13 @@ fn parse_options() -> std::result::Result<Options, String> {
             addr: env("OME_EXCHANGE", DEFAULT_EXCHANGE_ADDR),
             user: env("OME_MEMBER", "ops"),
             secret: env("OME_MEMBER_SECRET", "ops"),
+            command: Vec::new(),
+        },
+        Some("clearing") => Options {
+            target: Target::Clearing,
+            addr: env("OME_CLEARING", "127.0.0.1:7200"),
+            user: env("OME_CLEARING_OPS", "ops"),
+            secret: env("OME_CLEARING_SECRET", "ops"),
             command: Vec::new(),
         },
         Some("broker") => Options {
@@ -99,6 +112,9 @@ fn main() {
         Target::Broker => Client::connect_and_logon(&options.addr, &options.user, &options.secret)
             .map_err(Into::into)
             .and_then(|(mut client, _)| broker(&mut client, &args)),
+        Target::Clearing => Client::connect_member(&options.addr, &options.user, &options.secret)
+            .map_err(Into::into)
+            .and_then(|(mut client, _)| clearing(&mut client, &args)),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -134,13 +150,19 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
         ["members"] => {
             for m in members(client)? {
                 println!(
-                    "{:>4}  {:<20} {:<20} {}  open orders {:<6} net fees {}",
+                    "{:>4}  {:<20} {:<20} {}  open orders {:<6} net fees {:<10} exposure {:<14} credit {}",
                     m.member_id,
                     m.name,
                     m.kind.label(),
                     if m.connected { "online " } else { "offline" },
                     m.open_orders,
-                    format_signed(m.net_fees)
+                    format_signed(m.net_fees),
+                    format_price(m.exposure),
+                    if m.credit_limit == u64::MAX {
+                        "unlimited".to_string()
+                    } else {
+                        format_price(m.credit_limit)
+                    }
                 );
             }
         }
@@ -307,10 +329,13 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 format_price(snapshot.cash.available),
                 format_price(snapshot.cash.reserved)
             );
+            if snapshot.unsettled_cash != 0 {
+                println!("unsettled cash {}", format_signed(snapshot.unsettled_cash));
+            }
             for p in snapshot.positions {
                 println!(
-                    "  {:<8} {:>10} (reserved {})",
-                    p.symbol, p.balance.available, p.balance.reserved
+                    "  {:<8} {:>10} (reserved {}, unsettled {})",
+                    p.symbol, p.balance.available, p.balance.reserved, p.unsettled
                 );
             }
         }
@@ -425,6 +450,77 @@ fn print_note(note: &ome_protocol::ContractNote) {
         format_signed(c.total()),
         format_signed(note.net_amount)
     );
+}
+
+fn clearing(client: &mut Client, args: &[&str]) -> Result<()> {
+    match args {
+        ["status"] => {
+            let s = clearing_status(client)?;
+            println!(
+                "cycle {} · settled through {} · exchange fees collected {}",
+                s.cycle,
+                s.settled_cycle,
+                format_signed(s.fee_pool)
+            );
+            for m in s.members {
+                println!(
+                    "{:>4}  {:<16} collateral {:>16}  margin {:>14}  unsettled {:>16}  credit {:>18}  fails {}",
+                    m.member_id,
+                    m.name,
+                    format_signed(m.collateral),
+                    format_price(m.margin_required),
+                    format_price(m.unsettled_gross),
+                    format_price(m.credit_limit),
+                    m.fails
+                );
+            }
+        }
+        ["register", name, secret] => {
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::CreateMember {
+                    kind: MemberKind::Broker,
+                    name: name.to_string(),
+                    secret: secret.to_string(),
+                })?
+            );
+        }
+        [verb @ ("deposit" | "withdraw"), member, value] => {
+            let member = match member.parse() {
+                Ok(id) => id,
+                Err(_) => clearing_status(client)?
+                    .members
+                    .into_iter()
+                    .find(|m| m.name == *member)
+                    .map(|m| m.member_id)
+                    .ok_or(format!("no clearing member named '{member}'"))?,
+            };
+            let amount = amount(value)? as i64;
+            let amount = if *verb == "deposit" { amount } else { -amount };
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::Deposit { member, amount })?
+            );
+        }
+        _ => usage()?,
+    }
+    Ok(())
+}
+
+fn clearing_status(
+    client: &mut Client,
+) -> std::result::Result<ome_protocol::ClearingStatus, ClientError> {
+    client.send_member(&MemberMessage::QueryClearing)?;
+    match client.wait_for(Duration::from_secs(5), |m| {
+        matches!(
+            m,
+            ServerMessage::ClearingStatus(_) | ServerMessage::Reject { .. }
+        )
+    })? {
+        ServerMessage::ClearingStatus(s) => Ok(s),
+        ServerMessage::Reject { reason, .. } => Err(ClientError::Rejected(reason)),
+        _ => unreachable!(),
+    }
 }
 
 fn print_instruments(client: &mut Client) -> Result<()> {

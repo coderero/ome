@@ -7,16 +7,16 @@ pub mod market;
 pub mod profile;
 
 use broker::Broker;
-use gateway::{Connector, Gateway, MemberCredentials, Uplink};
+use gateway::Gateway;
 use journal::Record;
-use ome_client::{Link, LinkEvent};
+use ome_client::LinkEvent;
+use ome_client::upstream::{MemberCredentials, TcpConnector, Upstream};
 use ome_net::{Inbound, listen, log, now_ms};
-use ome_protocol::MemberMessage;
 use ome_store::Journal;
 use profile::{Profile, ProfileKind};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -32,11 +32,13 @@ pub struct BrokerConfig {
     pub exchange_addr: String,
     pub member_name: String,
     pub member_secret: String,
+    pub clearing_addr: Option<String>,
 }
 
 pub enum BrokerInbound {
     Client(Inbound),
     Exchange { generation: u64, event: LinkEvent },
+    Clearing { generation: u64, event: LinkEvent },
 }
 
 impl From<Inbound> for BrokerInbound {
@@ -45,25 +47,12 @@ impl From<Inbound> for BrokerInbound {
     }
 }
 
-impl Uplink for Link {
-    fn send(&self, message: &MemberMessage) -> bool {
-        Link::send(self, message.encode())
-    }
+fn exchange_event(generation: u64, event: LinkEvent) -> BrokerInbound {
+    BrokerInbound::Exchange { generation, event }
 }
 
-struct TcpConnector {
-    addr: String,
-    events: Sender<BrokerInbound>,
-}
-
-impl Connector for TcpConnector {
-    fn connect(&mut self, generation: u64) -> Option<Box<dyn Uplink>> {
-        Link::connect(&self.addr, self.events.clone(), move |event| {
-            BrokerInbound::Exchange { generation, event }
-        })
-        .ok()
-        .map(|link| Box::new(link) as Box<dyn Uplink>)
-    }
+fn clearing_event(generation: u64, event: LinkEvent) -> BrokerInbound {
+    BrokerInbound::Clearing { generation, event }
 }
 
 pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
@@ -90,15 +79,27 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
     };
 
     let (tx, rx) = mpsc::channel::<BrokerInbound>();
-    let connector = TcpConnector {
-        addr: config.exchange_addr.clone(),
-        events: tx.clone(),
-    };
-    let credentials = MemberCredentials {
+    let credentials = || MemberCredentials {
         name: config.member_name.clone(),
         secret: config.member_secret.clone(),
     };
-    let mut gateway = Gateway::new(broker, journal, Box::new(connector), credentials, last_ts);
+    let exchange = Upstream::new(
+        "exchange",
+        Box::new(TcpConnector::new(
+            config.exchange_addr.clone(),
+            tx.clone(),
+            exchange_event,
+        )),
+        credentials(),
+    );
+    let clearing = config.clearing_addr.clone().map(|addr| {
+        Upstream::new(
+            "clearing",
+            Box::new(TcpConnector::new(addr, tx.clone(), clearing_event)),
+            credentials(),
+        )
+    });
+    let mut gateway = Gateway::new(broker, journal, exchange, clearing, last_ts);
     gateway.ensure_admin(&config.admin_name, &config.admin_secret, now_ms())?;
     gateway.flush().map_err(|e| e.to_string())?;
 
@@ -148,6 +149,9 @@ fn handle(gateway: &mut Gateway, inbound: BrokerInbound) {
         BrokerInbound::Client(Inbound::Disconnected(id)) => gateway.disconnect(id),
         BrokerInbound::Exchange { generation, event } => {
             gateway.on_exchange(generation, event, now_ms())
+        }
+        BrokerInbound::Clearing { generation, event } => {
+            gateway.on_clearing(generation, event, now_ms())
         }
     }
 }

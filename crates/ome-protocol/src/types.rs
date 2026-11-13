@@ -68,6 +68,7 @@ pub enum MemberKind {
     Admin = 1,
     Broker = 2,
     LiquidityProvider = 3,
+    Clearing = 4,
 }
 
 impl MemberKind {
@@ -76,6 +77,7 @@ impl MemberKind {
             1 => Some(MemberKind::Admin),
             2 => Some(MemberKind::Broker),
             3 => Some(MemberKind::LiquidityProvider),
+            4 => Some(MemberKind::Clearing),
             _ => None,
         }
     }
@@ -85,6 +87,7 @@ impl MemberKind {
             "admin" => Some(MemberKind::Admin),
             "broker" => Some(MemberKind::Broker),
             "lp" | "liquidity-provider" => Some(MemberKind::LiquidityProvider),
+            "clearing" => Some(MemberKind::Clearing),
             _ => None,
         }
     }
@@ -94,6 +97,7 @@ impl MemberKind {
             MemberKind::Admin => "admin",
             MemberKind::Broker => "broker",
             MemberKind::LiquidityProvider => "liquidity-provider",
+            MemberKind::Clearing => "clearing",
         }
     }
 }
@@ -175,6 +179,7 @@ pub struct ExecutionReport {
     pub last_price: Price,
     pub last_qty: Qty,
     pub fees: i64,
+    pub cycle: u64,
     pub timestamp: Timestamp,
     pub reason: String,
 }
@@ -229,15 +234,72 @@ pub struct FeeSummary {
 pub struct Allocation {
     pub seq: u64,
     pub allocation_id: u64,
+    pub member: MemberId,
     pub symbol: Symbol,
     pub account: AccountId,
     pub shares: Qty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearedTrade {
+    pub seq: u64,
+    pub trade_id: u64,
+    pub cycle: u64,
+    pub symbol: Symbol,
+    pub price: Price,
+    pub qty: Qty,
+    pub buy_member: MemberId,
+    pub buy_account: AccountId,
+    pub buy_fee: i64,
+    pub sell_member: MemberId,
+    pub sell_account: AccountId,
+    pub sell_fee: i64,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledPosition {
+    pub symbol: Symbol,
+    pub delivered: i64,
+    pub holding: i64,
+    pub failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementReport {
+    pub seq: u64,
+    pub cycle: u64,
+    pub member: MemberId,
+    pub cash: i64,
+    pub collateral: i64,
+    pub margin_required: u64,
+    pub positions: Vec<SettledPosition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearingMemberInfo {
+    pub member_id: MemberId,
+    pub collateral: i64,
+    pub margin_required: u64,
+    pub unsettled_gross: u64,
+    pub credit_limit: u64,
+    pub fails: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearingStatus {
+    pub cycle: u64,
+    pub settled_cycle: u64,
+    pub fee_pool: i64,
+    pub members: Vec<ClearingMemberInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
     pub symbol: Symbol,
     pub balance: Balance,
+    pub unsettled: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +307,7 @@ pub struct AccountSnapshot {
     pub account_id: AccountId,
     pub role: Role,
     pub cash: Balance,
+    pub unsettled_cash: i64,
     pub positions: Vec<Position>,
 }
 
@@ -303,6 +366,8 @@ pub struct MemberInfo {
     pub connected: bool,
     pub open_orders: u32,
     pub net_fees: i64,
+    pub credit_limit: u64,
+    pub exposure: u64,
     pub name: String,
 }
 

@@ -243,6 +243,8 @@ impl Gateway {
     ) {
         let ref_template = message.template_id();
         let admin = kind == MemberKind::Admin;
+        let clearing = kind == MemberKind::Clearing;
+        let trader = !admin && !clearing;
         let command = match message {
             MemberMessage::Subscribe { symbol } => return self.subscribe(id, symbol, now),
             MemberMessage::Unsubscribe { symbol } => {
@@ -257,7 +259,7 @@ impl Gateway {
                     ServerMessage::InstrumentList(self.exchange.instrument_list()),
                 );
             }
-            MemberMessage::QueryMembers if admin => {
+            MemberMessage::QueryMembers if admin || clearing => {
                 return self.reply(id, ServerMessage::MemberList(self.member_list()));
             }
             MemberMessage::NewOrder {
@@ -268,7 +270,7 @@ impl Gateway {
                 kind,
                 tif,
                 qty,
-            } if !admin => Command::NewOrder {
+            } if trader => Command::NewOrder {
                 member,
                 member_order_id,
                 account,
@@ -278,8 +280,8 @@ impl Gateway {
                 tif,
                 qty,
             },
-            MemberMessage::Cancel { order_id } if !admin => Command::Cancel { member, order_id },
-            MemberMessage::CancelAll { account, symbol } if !admin => Command::CancelAll {
+            MemberMessage::Cancel { order_id } if trader => Command::Cancel { member, order_id },
+            MemberMessage::CancelAll { account, symbol } if trader => Command::CancelAll {
                 member,
                 account,
                 symbol,
@@ -315,6 +317,11 @@ impl Gateway {
             },
             MemberMessage::Halt { symbol, reason } if admin => Command::Halt { symbol, reason },
             MemberMessage::Resume { symbol } if admin => Command::Resume { symbol },
+            MemberMessage::OpenCycle { cycle } if clearing => Command::OpenCycle { cycle },
+            MemberMessage::Settled { cycle } if clearing => Command::Settled { cycle },
+            MemberMessage::SetCreditLimit { member, limit } if clearing => {
+                Command::SetCreditLimit { member, limit }
+            }
             _ => {
                 return self.reject(
                     id,
@@ -546,6 +553,18 @@ fn describe_admin_action(command: &Command, events: &[Event]) -> Option<String> 
         ),
         Command::Halt { symbol, .. } => format!("{symbol} halted"),
         Command::Resume { symbol } => format!("{symbol} resumed"),
+        Command::OpenCycle { cycle } => format!("clearing opened trade cycle {cycle}"),
+        Command::Settled { cycle } => format!("clearing settled cycle {cycle}"),
+        Command::SetCreditLimit { member, limit } => {
+            if *limit == u64::MAX {
+                format!("member {member} credit limit removed")
+            } else {
+                format!(
+                    "member {member} credit limit set to {}",
+                    format_price(*limit)
+                )
+            }
+        }
         _ => return None,
     })
 }

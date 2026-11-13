@@ -57,6 +57,21 @@ pub enum MemberMessage {
         symbol: Symbol,
     },
     QueryMembers,
+    OpenCycle {
+        cycle: u64,
+    },
+    Settled {
+        cycle: u64,
+    },
+    SetCreditLimit {
+        member: MemberId,
+        limit: u64,
+    },
+    Deposit {
+        member: MemberId,
+        amount: i64,
+    },
+    QueryClearing,
 }
 
 impl MemberMessage {
@@ -75,6 +90,11 @@ impl MemberMessage {
             MemberMessage::Halt { .. } => HALT,
             MemberMessage::Resume { .. } => RESUME,
             MemberMessage::QueryMembers => QUERY_MEMBERS,
+            MemberMessage::OpenCycle { .. } => OPEN_CYCLE,
+            MemberMessage::Settled { .. } => SETTLED,
+            MemberMessage::SetCreditLimit { .. } => SET_CREDIT_LIMIT,
+            MemberMessage::Deposit { .. } => DEPOSIT,
+            MemberMessage::QueryClearing => QUERY_CLEARING,
         }
     }
 
@@ -90,7 +110,8 @@ impl MemberMessage {
             }
             MemberMessage::Heartbeat
             | MemberMessage::QueryInstruments
-            | MemberMessage::QueryMembers => {
+            | MemberMessage::QueryMembers
+            | MemberMessage::QueryClearing => {
                 e.end_block();
             }
             MemberMessage::NewOrder {
@@ -142,6 +163,15 @@ impl MemberMessage {
             MemberMessage::Halt { symbol, reason } => {
                 e.symbol(Some(*symbol)).end_block().var(reason);
             }
+            MemberMessage::OpenCycle { cycle } | MemberMessage::Settled { cycle } => {
+                e.u64(*cycle).end_block();
+            }
+            MemberMessage::SetCreditLimit { member, limit } => {
+                e.u64(*member).u64(*limit).end_block();
+            }
+            MemberMessage::Deposit { member, amount } => {
+                e.u64(*member).i64(*amount).end_block();
+            }
         }
         e.finish()
     }
@@ -169,6 +199,32 @@ impl MemberMessage {
             QUERY_MEMBERS => {
                 d.end_block()?;
                 MemberMessage::QueryMembers
+            }
+            QUERY_CLEARING => {
+                d.end_block()?;
+                MemberMessage::QueryClearing
+            }
+            OPEN_CYCLE => {
+                let cycle = d.u64()?;
+                d.end_block()?;
+                MemberMessage::OpenCycle { cycle }
+            }
+            SETTLED => {
+                let cycle = d.u64()?;
+                d.end_block()?;
+                MemberMessage::Settled { cycle }
+            }
+            SET_CREDIT_LIMIT => {
+                let member = d.u64()?;
+                let limit = d.u64()?;
+                d.end_block()?;
+                MemberMessage::SetCreditLimit { member, limit }
+            }
+            DEPOSIT => {
+                let member = d.u64()?;
+                let amount = d.i64()?;
+                d.end_block()?;
+                MemberMessage::Deposit { member, amount }
             }
             MEMBER_NEW_ORDER => {
                 let member_order_id = d.u64()?;
@@ -320,6 +376,17 @@ pub mod tests {
             },
             MemberMessage::Resume { symbol: sym("ZEN") },
             MemberMessage::QueryMembers,
+            MemberMessage::OpenCycle { cycle: 3 },
+            MemberMessage::Settled { cycle: 2 },
+            MemberMessage::SetCreditLimit {
+                member: 2,
+                limit: u64::MAX,
+            },
+            MemberMessage::Deposit {
+                member: 2,
+                amount: -500,
+            },
+            MemberMessage::QueryClearing,
         ]
     }
 

@@ -14,6 +14,7 @@ mod template {
     pub const EXCHANGE_REPORT: u16 = 303;
     pub const ALLOCATED: u16 = 304;
     pub const ORDER_ABANDONED: u16 = 305;
+    pub const SETTLEMENT_RECEIVED: u16 = 306;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,7 @@ impl Entry for Record {
             Fact::ExchangeReport { .. } => template::EXCHANGE_REPORT,
             Fact::Allocated(_) => template::ALLOCATED,
             Fact::OrderAbandoned { .. } => template::ORDER_ABANDONED,
+            Fact::SettlementReceived(_) => template::SETTLEMENT_RECEIVED,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -92,6 +94,10 @@ impl Entry for Record {
             }
             Fact::OrderAbandoned { order_ref } => {
                 e.u64(*order_ref).end_block();
+            }
+            Fact::SettlementReceived(report) => {
+                e.end_block()
+                    .var_bytes(&ServerMessage::SettlementReport(report.clone()).encode());
             }
         }
         e.finish()
@@ -169,6 +175,13 @@ impl Entry for Record {
                 d.end_block()?;
                 Fact::OrderAbandoned { order_ref }
             }
+            template::SETTLEMENT_RECEIVED => {
+                d.end_block()?;
+                match ServerMessage::decode(d.var_bytes()?)? {
+                    ServerMessage::SettlementReport(report) => Fact::SettlementReceived(report),
+                    _ => return Err(DecodeError::Invalid("embedded settlement report")),
+                }
+            }
             other => return Err(DecodeError::UnknownTemplate(other)),
         };
         Ok(Record { timestamp, fact })
@@ -207,6 +220,7 @@ mod tests {
                 last_price: last.0,
                 last_qty: last.1,
                 fees: 0,
+                cycle: 1,
                 timestamp: 3,
                 reason: String::new(),
             },
@@ -230,6 +244,7 @@ mod tests {
                 amount: 30,
             },
             Fact::Allocated(Allocation {
+                member: 3,
                 seq: 1,
                 allocation_id: 1,
                 symbol: sym(),
@@ -263,6 +278,15 @@ mod tests {
                 fee_reserve: 0,
             },
             Fact::OrderAbandoned { order_ref: 2 },
+            Fact::SettlementReceived(ome_protocol::SettlementReport {
+                seq: 1,
+                cycle: 1,
+                member: 3,
+                cash: -99_60,
+                collateral: 1_000_000_00,
+                margin_required: 0,
+                positions: vec![],
+            }),
         ]
     }
 

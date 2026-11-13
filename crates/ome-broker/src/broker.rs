@@ -11,7 +11,7 @@ use ome_core::types::{
 use ome_net::auth::SecretHash;
 use ome_protocol::{
     AccountInfo, AccountSnapshot, Allocation, Asset, Charges, ContractNote, ExecutionReport,
-    FeeSummary, MemberMessage, OrderStatus, Position, Role, ServerMessage,
+    FeeSummary, MemberMessage, OrderStatus, Position, Role, ServerMessage, SettlementReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -50,6 +50,7 @@ pub enum Fact {
     OrderAbandoned {
         order_ref: u64,
     },
+    SettlementReceived(SettlementReport),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,12 @@ pub enum Effect {
         message: ServerMessage,
     },
     ToExchange(MemberMessage),
+}
+
+#[derive(Default)]
+struct Pending {
+    cash: i64,
+    shares: BTreeMap<Symbol, i64>,
 }
 
 struct OrderMeta {
@@ -87,6 +94,8 @@ pub struct Broker {
     allocations: BTreeSet<u64>,
     next_order_ref: u64,
     last_seq: u64,
+    pending: BTreeMap<(u64, AccountId), Pending>,
+    last_settlement_seq: u64,
 }
 
 impl Broker {
@@ -101,6 +110,8 @@ impl Broker {
             allocations: BTreeSet::new(),
             next_order_ref: 1,
             last_seq: 0,
+            pending: BTreeMap::new(),
+            last_settlement_seq: 0,
         }
     }
 
@@ -122,6 +133,28 @@ impl Broker {
 
     pub fn is_new(&self, seq: u64) -> bool {
         seq > self.last_seq
+    }
+
+    pub fn last_settlement_seq(&self) -> u64 {
+        self.last_settlement_seq
+    }
+
+    pub fn is_new_settlement(&self, seq: u64) -> bool {
+        seq > self.last_settlement_seq
+    }
+
+    fn unsettled(&self, account: AccountId) -> (i64, BTreeMap<Symbol, i64>) {
+        let mut cash = 0;
+        let mut shares: BTreeMap<Symbol, i64> = BTreeMap::new();
+        for ((_, holder), pending) in &self.pending {
+            if *holder == account {
+                cash += pending.cash;
+                for (symbol, qty) in &pending.shares {
+                    *shares.entry(*symbol).or_default() += qty;
+                }
+            }
+        }
+        (cash, shares)
     }
 
     pub fn decide_open_account(
@@ -199,6 +232,7 @@ impl Broker {
                 last_price: 0,
                 last_qty: 0,
                 fees: 0,
+                cycle: 0,
                 timestamp: now,
                 reason,
             })
@@ -394,6 +428,20 @@ impl Broker {
                     Err(_) => vec![],
                 }
             }
+            Fact::SettlementReceived(report) => {
+                self.last_settlement_seq = self.last_settlement_seq.max(report.seq);
+                let settled: Vec<(u64, AccountId)> = self
+                    .pending
+                    .range(..=(report.cycle, AccountId::MAX))
+                    .map(|(key, _)| *key)
+                    .collect();
+                let mut accounts = BTreeSet::new();
+                for key in settled {
+                    self.pending.remove(&key);
+                    accounts.insert(key.1);
+                }
+                accounts.into_iter().map(Effect::AccountChanged).collect()
+            }
             Fact::OrderAbandoned { order_ref } => {
                 let Some(meta) = self.orders.remove(order_ref) else {
                     return vec![];
@@ -528,6 +576,16 @@ impl Broker {
             };
             self.fee_totals.charges.add(charges);
             self.fee_totals.fills += 1;
+            let pending = self
+                .pending
+                .entry((report.cycle, meta.account))
+                .or_default();
+            pending.cash += net_amount;
+            let signed = match meta.side {
+                Side::Buy => qty as i64,
+                Side::Sell => -(qty as i64),
+            };
+            *pending.shares.entry(meta.symbol).or_default() += signed;
             effects.push(Effect::ToAccount {
                 account: meta.account,
                 message: ServerMessage::ContractNote(ContractNote {
@@ -545,7 +603,7 @@ impl Broker {
         }
 
         let account = meta.account;
-        let client = client_report(
+        let mut client = client_report(
             report.order_id,
             meta,
             report.status,
@@ -553,6 +611,7 @@ impl Broker {
             report.timestamp,
             &report.reason,
         );
+        client.cycle = report.cycle;
         if !report.status.is_open()
             && let Some(meta) = self.orders.remove(&order_ref)
         {
@@ -582,18 +641,21 @@ impl Broker {
 
     pub fn account_snapshot(&self, id: AccountId) -> Option<AccountSnapshot> {
         let account = self.ledger.get(id)?;
+        let (unsettled_cash, unsettled_shares) = self.unsettled(id);
         Some(AccountSnapshot {
             account_id: id,
             role: account.role,
             cash: account.cash,
+            unsettled_cash,
             positions: account
                 .positions
                 .iter()
-                .filter(|(_, b)| b.total() > 0)
                 .map(|(symbol, balance)| Position {
                     symbol: *symbol,
                     balance: *balance,
+                    unsettled: unsettled_shares.get(symbol).copied().unwrap_or(0),
                 })
+                .filter(|p| p.balance.total() > 0 || p.unsettled != 0)
                 .collect(),
         })
     }
@@ -659,6 +721,7 @@ fn client_report(
         last_price: last.0,
         last_qty: last.1,
         fees: last.2,
+        cycle: 0,
         timestamp,
         reason: reason.to_string(),
     }
@@ -729,6 +792,7 @@ pub mod tests {
             last_price: fill.0,
             last_qty: fill.1,
             fees: 0,
+            cycle: 1,
             timestamp: 1,
             reason: String::new(),
         }
@@ -902,6 +966,7 @@ pub mod tests {
         let mut broker = Broker::new(Profile::new(ProfileKind::Prime));
         let issuer = open(&mut broker, "acme_ir", Role::Issuer, 0);
         broker.apply(&Fact::Allocated(Allocation {
+            member: 3,
             seq: 1,
             allocation_id: 1,
             symbol: sym(),
@@ -953,6 +1018,7 @@ pub mod tests {
         assert_eq!(a.position(sym()).reserved, 60);
 
         broker.apply(&Fact::Allocated(Allocation {
+            member: 3,
             seq: 4,
             allocation_id: 1,
             symbol: sym(),
@@ -1192,5 +1258,67 @@ pub mod tests {
             0,
         );
         assert!(big.is_ok());
+    }
+
+    #[test]
+    fn fills_stay_unsettled_until_clearing_reports_their_cycle() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = open(&mut broker, "alice", Role::Retail, 10_000_00);
+        let fact = broker
+            .decide_order(
+                alice,
+                1,
+                sym(),
+                Side::Buy,
+                OrderKind::Limit(25_00),
+                10,
+                &market(),
+                0,
+            )
+            .unwrap();
+        broker.apply(&fact);
+        let report = exchange_report(
+            90,
+            1,
+            alice,
+            Side::Buy,
+            OrderStatus::Filled,
+            (25_00, 10),
+            10,
+            10,
+            1,
+        );
+        let paid = 250_00 + broker.charges_for(&report).total();
+        deliver(&mut broker, report);
+
+        let snapshot = broker.account_snapshot(alice).unwrap();
+        assert_eq!(snapshot.unsettled_cash, -paid);
+        assert_eq!(snapshot.positions[0].unsettled, 10);
+
+        let settlement = |seq, cycle| {
+            Fact::SettlementReceived(SettlementReport {
+                seq,
+                cycle,
+                member: 2,
+                cash: 0,
+                collateral: 0,
+                margin_required: 0,
+                positions: vec![],
+            })
+        };
+        broker.apply(&settlement(1, 0));
+        assert_eq!(
+            broker.account_snapshot(alice).unwrap().unsettled_cash,
+            -paid
+        );
+        let effects = broker.apply(&settlement(2, 1));
+        assert_eq!(effects, vec![Effect::AccountChanged(alice)]);
+        let snapshot = broker.account_snapshot(alice).unwrap();
+        assert_eq!(
+            (snapshot.unsettled_cash, snapshot.positions[0].unsettled),
+            (0, 0)
+        );
+        assert_eq!(broker.last_settlement_seq(), 2);
+        assert!(!broker.is_new_settlement(2));
     }
 }

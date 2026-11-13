@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod feed;
 
 use ome_protocol::framing::read_frame;
 use std::io::{BufReader, BufWriter, Write};

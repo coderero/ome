@@ -36,6 +36,9 @@ pub enum ServerMessage {
     Allocation(Allocation),
     ContractNote(ContractNote),
     FeeSummary(FeeSummary),
+    ClearedTrade(ClearedTrade),
+    SettlementReport(SettlementReport),
+    ClearingStatus(ClearingStatus),
     InstrumentList(Vec<InstrumentInfo>),
     Instrument(InstrumentInfo),
     Book(BookSnapshot),
@@ -59,6 +62,9 @@ impl ServerMessage {
             ServerMessage::Allocation(_) => ALLOCATION,
             ServerMessage::ContractNote(_) => CONTRACT_NOTE,
             ServerMessage::FeeSummary(_) => FEE_SUMMARY,
+            ServerMessage::ClearedTrade(_) => CLEARED_TRADE,
+            ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
+            ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::InstrumentList(_) => INSTRUMENT_LIST,
             ServerMessage::Instrument(_) => INSTRUMENT,
             ServerMessage::Book(_) => BOOK_SNAPSHOT,
@@ -122,6 +128,7 @@ impl ServerMessage {
                     .u64(r.last_price)
                     .u64(r.last_qty)
                     .i64(r.fees)
+                    .u64(r.cycle)
                     .u64(r.timestamp)
                     .end_block()
                     .var(&r.reason);
@@ -129,18 +136,20 @@ impl ServerMessage {
             ServerMessage::Account(a) => {
                 e.u64(a.account_id).u8(a.role as u8);
                 put_balance(&mut e, &a.cash);
-                e.end_block();
+                e.i64(a.unsettled_cash).end_block();
                 let mut g = e.begin_group(a.positions.len());
                 for p in &a.positions {
                     e.begin_entry(&mut g);
                     e.symbol(Some(p.symbol));
                     put_balance(&mut e, &p.balance);
+                    e.i64(p.unsettled);
                     e.end_entry_block(&mut g);
                 }
             }
             ServerMessage::Allocation(a) => {
                 e.u64(a.seq)
                     .u64(a.allocation_id)
+                    .u64(a.member)
                     .symbol(Some(a.symbol))
                     .u64(a.account)
                     .u64(a.shares)
@@ -155,6 +164,58 @@ impl ServerMessage {
                     .u64(n.price);
                 put_charges(&mut e, &n.charges);
                 e.i64(n.net_amount).u64(n.timestamp).end_block();
+            }
+            ServerMessage::ClearedTrade(t) => {
+                e.u64(t.seq)
+                    .u64(t.trade_id)
+                    .u64(t.cycle)
+                    .symbol(Some(t.symbol))
+                    .u64(t.price)
+                    .u64(t.qty)
+                    .u64(t.buy_member)
+                    .u64(t.buy_account)
+                    .i64(t.buy_fee)
+                    .u64(t.sell_member)
+                    .u64(t.sell_account)
+                    .i64(t.sell_fee)
+                    .u64(t.timestamp)
+                    .end_block();
+            }
+            ServerMessage::SettlementReport(r) => {
+                e.u64(r.seq)
+                    .u64(r.cycle)
+                    .u64(r.member)
+                    .i64(r.cash)
+                    .i64(r.collateral)
+                    .u64(r.margin_required)
+                    .end_block();
+                let mut g = e.begin_group(r.positions.len());
+                for p in &r.positions {
+                    e.begin_entry(&mut g);
+                    e.symbol(Some(p.symbol))
+                        .i64(p.delivered)
+                        .i64(p.holding)
+                        .u8(p.failed as u8);
+                    e.end_entry_block(&mut g);
+                }
+            }
+            ServerMessage::ClearingStatus(c) => {
+                e.u64(c.cycle)
+                    .u64(c.settled_cycle)
+                    .i64(c.fee_pool)
+                    .end_block();
+                let mut g = e.begin_group(c.members.len());
+                for m in &c.members {
+                    e.begin_entry(&mut g);
+                    e.u64(m.member_id)
+                        .i64(m.collateral)
+                        .u64(m.margin_required)
+                        .u64(m.unsettled_gross)
+                        .u64(m.credit_limit)
+                        .u32(m.fails);
+                    e.end_entry_block(&mut g);
+                    e.var(&m.name);
+                }
             }
             ServerMessage::FeeSummary(f) => {
                 put_charges(&mut e, &f.charges);
@@ -230,7 +291,9 @@ impl ServerMessage {
                         .u8(m.kind as u8)
                         .u8(m.connected as u8)
                         .u32(m.open_orders)
-                        .i64(m.net_fees);
+                        .i64(m.net_fees)
+                        .u64(m.credit_limit)
+                        .u64(m.exposure);
                     e.end_entry_block(&mut g);
                     e.var(&m.name);
                 }
@@ -305,6 +368,7 @@ impl ServerMessage {
                 let last_price = d.u64()?;
                 let last_qty = d.u64()?;
                 let fees = d.i64()?;
+                let cycle = d.u64()?;
                 let timestamp = d.u64()?;
                 d.end_block()?;
                 ServerMessage::Execution(ExecutionReport {
@@ -322,6 +386,7 @@ impl ServerMessage {
                     last_price,
                     last_qty,
                     fees,
+                    cycle,
                     timestamp,
                     reason: d.var()?,
                 })
@@ -330,6 +395,7 @@ impl ServerMessage {
                 let account_id = d.u64()?;
                 let role = role_from(d.u8()?)?;
                 let cash = get_balance(&mut d)?;
+                let unsettled_cash = d.i64()?;
                 d.end_block()?;
                 let g = d.group()?;
                 let mut positions = Vec::with_capacity(g.count);
@@ -337,19 +403,26 @@ impl ServerMessage {
                     let start = d.entry_start();
                     let symbol = d.symbol()?;
                     let balance = get_balance(&mut d)?;
+                    let unsettled = d.i64()?;
                     d.end_entry_block(start, &g)?;
-                    positions.push(Position { symbol, balance });
+                    positions.push(Position {
+                        symbol,
+                        balance,
+                        unsettled,
+                    });
                 }
                 ServerMessage::Account(AccountSnapshot {
                     account_id,
                     role,
                     cash,
+                    unsettled_cash,
                     positions,
                 })
             }
             ALLOCATION => {
                 let seq = d.u64()?;
                 let allocation_id = d.u64()?;
+                let member = d.u64()?;
                 let symbol = d.symbol()?;
                 let account = d.u64()?;
                 let shares = d.u64()?;
@@ -357,9 +430,93 @@ impl ServerMessage {
                 ServerMessage::Allocation(Allocation {
                     seq,
                     allocation_id,
+                    member,
                     symbol,
                     account,
                     shares,
+                })
+            }
+            CLEARED_TRADE => {
+                let trade = ClearedTrade {
+                    seq: d.u64()?,
+                    trade_id: d.u64()?,
+                    cycle: d.u64()?,
+                    symbol: d.symbol()?,
+                    price: d.u64()?,
+                    qty: d.u64()?,
+                    buy_member: d.u64()?,
+                    buy_account: d.u64()?,
+                    buy_fee: d.i64()?,
+                    sell_member: d.u64()?,
+                    sell_account: d.u64()?,
+                    sell_fee: d.i64()?,
+                    timestamp: d.u64()?,
+                };
+                d.end_block()?;
+                ServerMessage::ClearedTrade(trade)
+            }
+            SETTLEMENT_REPORT => {
+                let seq = d.u64()?;
+                let cycle = d.u64()?;
+                let member = d.u64()?;
+                let cash = d.i64()?;
+                let collateral = d.i64()?;
+                let margin_required = d.u64()?;
+                d.end_block()?;
+                let g = d.group()?;
+                let mut positions = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let position = SettledPosition {
+                        symbol: d.symbol()?,
+                        delivered: d.i64()?,
+                        holding: d.i64()?,
+                        failed: d.u8()? != 0,
+                    };
+                    d.end_entry_block(start, &g)?;
+                    positions.push(position);
+                }
+                ServerMessage::SettlementReport(SettlementReport {
+                    seq,
+                    cycle,
+                    member,
+                    cash,
+                    collateral,
+                    margin_required,
+                    positions,
+                })
+            }
+            CLEARING_STATUS => {
+                let cycle = d.u64()?;
+                let settled_cycle = d.u64()?;
+                let fee_pool = d.i64()?;
+                d.end_block()?;
+                let g = d.group()?;
+                let mut members = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let member_id = d.u64()?;
+                    let collateral = d.i64()?;
+                    let margin_required = d.u64()?;
+                    let unsettled_gross = d.u64()?;
+                    let credit_limit = d.u64()?;
+                    let fails = d.u32()?;
+                    d.end_entry_block(start, &g)?;
+                    members.push(ClearingMemberInfo {
+                        member_id,
+                        collateral,
+                        margin_required,
+                        unsettled_gross,
+                        credit_limit,
+                        fails,
+                        name: d.var()?,
+                    });
+                }
+                ServerMessage::ClearingStatus(ClearingStatus {
+                    cycle,
+                    settled_cycle,
+                    fee_pool,
+                    members,
                 })
             }
             CONTRACT_NOTE => {
@@ -513,6 +670,8 @@ impl ServerMessage {
                     let connected = d.u8()? != 0;
                     let open_orders = d.u32()?;
                     let net_fees = d.i64()?;
+                    let credit_limit = d.u64()?;
+                    let exposure = d.u64()?;
                     d.end_entry_block(start, &g)?;
                     list.push(MemberInfo {
                         member_id,
@@ -520,6 +679,8 @@ impl ServerMessage {
                         connected,
                         open_orders,
                         net_fees,
+                        credit_limit,
+                        exposure,
                         name: d.var()?,
                     });
                 }
@@ -617,6 +778,7 @@ mod tests {
                 last_price: 2_510,
                 last_qty: 4,
                 fees: 33,
+                cycle: 7,
                 timestamp: 1_700_000_000_000,
                 reason: String::new(),
             }),
@@ -627,12 +789,57 @@ mod tests {
                     available: 10,
                     reserved: 5,
                 },
+                unsettled_cash: -300,
                 positions: vec![Position {
                     symbol: sym("ACME"),
                     balance: Balance {
                         available: 1,
                         reserved: 2,
                     },
+                    unsettled: 5,
+                }],
+            }),
+            ServerMessage::ClearedTrade(ClearedTrade {
+                seq: 9,
+                trade_id: 44,
+                cycle: 3,
+                symbol: sym("ACME"),
+                price: 2_500,
+                qty: 10,
+                buy_member: 2,
+                buy_account: 7,
+                buy_fee: 3,
+                sell_member: 3,
+                sell_account: 1,
+                sell_fee: -2,
+                timestamp: 11,
+            }),
+            ServerMessage::SettlementReport(SettlementReport {
+                seq: 4,
+                cycle: 3,
+                member: 2,
+                cash: -25_003,
+                collateral: 1_000_000,
+                margin_required: 2_500,
+                positions: vec![SettledPosition {
+                    symbol: sym("ACME"),
+                    delivered: 10,
+                    holding: 10,
+                    failed: false,
+                }],
+            }),
+            ServerMessage::ClearingStatus(ClearingStatus {
+                cycle: 4,
+                settled_cycle: 3,
+                fee_pool: 12,
+                members: vec![ClearingMemberInfo {
+                    member_id: 2,
+                    collateral: 1_000_000,
+                    margin_required: 2_500,
+                    unsettled_gross: 25_000,
+                    credit_limit: 10_000_000,
+                    fails: 0,
+                    name: "retail-co".into(),
                 }],
             }),
             ServerMessage::ContractNote(ContractNote {
@@ -663,6 +870,7 @@ mod tests {
             ServerMessage::Allocation(Allocation {
                 seq: 3,
                 allocation_id: 1,
+                member: 2,
                 symbol: sym("ZEN"),
                 account: 9,
                 shares: 50_000,
@@ -720,6 +928,8 @@ mod tests {
                 connected: true,
                 open_orders: 40,
                 net_fees: -1_250,
+                credit_limit: u64::MAX,
+                exposure: 5_000,
                 name: "lp-desk".into(),
             }]),
         ]

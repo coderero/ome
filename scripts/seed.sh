@@ -4,9 +4,20 @@ cd "$(dirname "$0")/.."
 source scripts/env.sh
 
 seed_members() {
+  exchange_cmd add-member ccp "$OME_MEMBER_SECRET" clearing
   for p in "${providers[@]}"; do
     read -r name _ member _ <<<"$p"
     exchange_cmd add-member "$name" "$OME_MEMBER_SECRET" "$member"
+  done
+}
+
+registered() { clearing_cmd status | grep -q " $1 "; }
+
+seed_clearing() {
+  for p in "${providers[@]}"; do
+    read -r name _ _ _ <<<"$p"
+    wait_for clearing_cmd register "$name" "$OME_MEMBER_SECRET" || registered "$name"
+    clearing_cmd deposit "$name" "$OME_COLLATERAL"
   done
 }
 
@@ -72,6 +83,7 @@ seed_market() {
 
 case "${1:-}" in
   members) seed_members ;;
+  clearing) seed_clearing ;;
   market) seed_market ;;
-  *) echo "usage: scripts/seed.sh members|market" >&2; exit 2 ;;
+  *) echo "usage: scripts/seed.sh members|clearing|market" >&2; exit 2 ;;
 esac

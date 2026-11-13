@@ -3,7 +3,7 @@ use ome_broker::{BrokerConfig, start};
 use ome_client::DEFAULT_EXCHANGE_ADDR;
 
 const USAGE: &str = "usage: ome-broker --profile retail|prime|dma|lp --member NAME --member-secret SECRET
-                  [--listen ADDR] [--exchange ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
+                  [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
 
 fn parse_args() -> Result<BrokerConfig, String> {
     let mut config = BrokerConfig {
@@ -16,6 +16,7 @@ fn parse_args() -> Result<BrokerConfig, String> {
             .unwrap_or_else(|_| DEFAULT_EXCHANGE_ADDR.into()),
         member_name: String::new(),
         member_secret: String::new(),
+        clearing_addr: std::env::var("OME_CLEARING").ok(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -32,6 +33,7 @@ fn parse_args() -> Result<BrokerConfig, String> {
             "--admin-secret" => config.admin_secret = value()?,
             "--member" => config.member_name = value()?,
             "--member-secret" => config.member_secret = value()?,
+            "--clearing" => config.clearing_addr = Some(value()?),
             _ => return Err(USAGE.into()),
         }
     }

@@ -8,11 +8,12 @@ use ome_core::types::{
     AccountId, Order, OrderId, OrderKind, OrderRequest, Qty, Side, TimeInForce, Timestamp, Trade,
 };
 use ome_net::auth::SecretHash;
+use ome_net::feed::{Feeds, Replay};
 use ome_protocol::{
-    Allocation, ExecutionReport, InstrumentInfo, MemberId, MemberInfo, MemberKind, OrderStatus,
-    ServerMessage, TradeEvent,
+    Allocation, ClearedTrade, ExecutionReport, InstrumentInfo, MemberId, MemberInfo, MemberKind,
+    OrderStatus, ServerMessage, TradeEvent,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 const ACCOUNT_BITS: u32 = 40;
@@ -89,6 +90,16 @@ pub enum Command {
         account: Option<AccountId>,
         symbol: Option<Symbol>,
     },
+    OpenCycle {
+        cycle: u64,
+    },
+    Settled {
+        cycle: u64,
+    },
+    SetCreditLimit {
+        member: MemberId,
+        limit: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,25 +160,17 @@ struct OrderMeta {
     filled: Qty,
 }
 
-#[derive(Default)]
-struct MemberFeed {
-    next_seq: u64,
-    retained: VecDeque<ServerMessage>,
-}
-
-pub struct Replay {
-    pub messages: Vec<ServerMessage>,
-    pub next_seq: u64,
-    pub gap: bool,
-}
-
 pub struct Exchange {
     config: ExchangeConfig,
     members: Members,
     instruments: BTreeMap<Symbol, Instrument>,
     orders: HashMap<OrderId, OrderMeta>,
-    feeds: HashMap<MemberId, MemberFeed>,
+    feeds: Feeds,
     member_fees: HashMap<MemberId, i64>,
+    credit_limits: HashMap<MemberId, u64>,
+    open_notional: HashMap<MemberId, u64>,
+    traded: HashMap<MemberId, BTreeMap<u64, u64>>,
+    cycle: u64,
     risk: RiskEngine,
     next_order_id: OrderId,
     next_trade_id: u64,
@@ -180,6 +183,7 @@ fn owner_key(member: MemberId, account: AccountId) -> u64 {
 
 impl Exchange {
     pub fn new(config: ExchangeConfig) -> Self {
+        let feeds = Feeds::new(config.feed_capacity);
         let risk = RiskEngine::new()
             .with(PositiveQuantity)
             .with(MaxQuantity(config.max_order_qty))
@@ -191,8 +195,12 @@ impl Exchange {
             members: Members::default(),
             instruments: BTreeMap::new(),
             orders: HashMap::new(),
-            feeds: HashMap::new(),
+            feeds,
             member_fees: HashMap::new(),
+            credit_limits: HashMap::new(),
+            open_notional: HashMap::new(),
+            traded: HashMap::new(),
+            cycle: 0,
             risk,
             next_order_id: 1,
             next_trade_id: 1,
@@ -241,6 +249,23 @@ impl Exchange {
             ),
             Command::Halt { symbol, reason } => self.halt(*symbol, reason.clone(), None),
             Command::Resume { symbol } => self.resume(*symbol),
+            Command::OpenCycle { cycle } => {
+                self.cycle = self.cycle.max(*cycle);
+                Ok(vec![])
+            }
+            Command::Settled { cycle } => {
+                for by_cycle in self.traded.values_mut() {
+                    by_cycle.retain(|c, _| c > cycle);
+                }
+                Ok(vec![])
+            }
+            Command::SetCreditLimit { member, limit } => {
+                if self.members.get(*member).is_none() {
+                    return Err(ExchangeError::UnknownMember(*member));
+                }
+                self.credit_limits.insert(*member, *limit);
+                Ok(vec![])
+            }
             Command::NewOrder {
                 member,
                 member_order_id,
@@ -284,24 +309,7 @@ impl Exchange {
     }
 
     pub fn replay(&self, member: MemberId, after_seq: u64) -> Replay {
-        let Some(feed) = self.feeds.get(&member) else {
-            return Replay {
-                messages: Vec::new(),
-                next_seq: 1,
-                gap: false,
-            };
-        };
-        let oldest = feed.next_seq - feed.retained.len() as u64;
-        Replay {
-            messages: feed
-                .retained
-                .iter()
-                .skip(after_seq.saturating_sub(oldest - 1) as usize)
-                .cloned()
-                .collect(),
-            next_seq: feed.next_seq,
-            gap: after_seq.saturating_add(1) < oldest,
-        }
+        self.feeds.replay(member, after_seq)
     }
 
     pub fn roll_candles(&mut self, now: Timestamp) {
@@ -336,36 +344,42 @@ impl Exchange {
                 connected: connected(m.id),
                 open_orders: open.get(&m.id).copied().unwrap_or(0),
                 net_fees: self.member_fees.get(&m.id).copied().unwrap_or(0),
+                credit_limit: self.credit_limits.get(&m.id).copied().unwrap_or(u64::MAX),
+                exposure: self.exposure(m.id),
                 name: m.name.clone(),
             })
+            .collect()
+    }
+
+    pub fn cycle(&self) -> u64 {
+        self.cycle
+    }
+
+    pub fn exposure(&self, member: MemberId) -> u64 {
+        let traded: u64 = self.traded.get(&member).map_or(0, |c| c.values().sum());
+        self.open_notional.get(&member).copied().unwrap_or(0) + traded
+    }
+
+    fn clearing_members(&self) -> Vec<MemberId> {
+        self.members
+            .iter()
+            .filter(|m| m.kind == MemberKind::Clearing)
+            .map(|m| m.id)
             .collect()
     }
 
     fn trading_member(&self, member: MemberId) -> Result<(), ExchangeError> {
         match self.members.get(member) {
             None => Err(ExchangeError::UnknownMember(member)),
-            Some(m) if m.kind == MemberKind::Admin => Err(ExchangeError::NotATradingMember(member)),
+            Some(m) if matches!(m.kind, MemberKind::Admin | MemberKind::Clearing) => {
+                Err(ExchangeError::NotATradingMember(member))
+            }
             Some(_) => Ok(()),
         }
     }
 
-    fn publish(&mut self, member: MemberId, mut message: ServerMessage) -> Event {
-        let capacity = self.config.feed_capacity;
-        let feed = self.feeds.entry(member).or_insert_with(|| MemberFeed {
-            next_seq: 1,
-            retained: VecDeque::new(),
-        });
-        let seq = feed.next_seq;
-        feed.next_seq += 1;
-        match &mut message {
-            ServerMessage::Execution(report) => report.seq = seq,
-            ServerMessage::Allocation(allocation) => allocation.seq = seq,
-            _ => {}
-        }
-        if feed.retained.len() == capacity {
-            feed.retained.pop_front();
-        }
-        feed.retained.push_back(message.clone());
+    fn publish(&mut self, member: MemberId, message: ServerMessage) -> Event {
+        let message = self.feeds.publish(member, message);
         Event::ToMember { member, message }
     }
 
@@ -398,6 +412,7 @@ impl Exchange {
             last_price: last.0,
             last_qty: last.1,
             fees: last.2,
+            cycle: self.cycle,
             timestamp: now,
             reason: reason.to_string(),
         };
@@ -450,19 +465,21 @@ impl Exchange {
 
         let allocation_id = self.next_allocation_id;
         self.next_allocation_id += 1;
+        let allocation = Allocation {
+            seq: 0,
+            allocation_id,
+            member: underwriter,
+            symbol,
+            account: issuer_account,
+            shares,
+        };
         let mut events = vec![
             Event::InstrumentChanged(symbol),
-            self.publish(
-                underwriter,
-                ServerMessage::Allocation(Allocation {
-                    seq: 0,
-                    allocation_id,
-                    symbol,
-                    account: issuer_account,
-                    shares,
-                }),
-            ),
+            self.publish(underwriter, ServerMessage::Allocation(allocation.clone())),
         ];
+        for clearing in self.clearing_members() {
+            events.push(self.publish(clearing, ServerMessage::Allocation(allocation.clone())));
+        }
         events.extend(self.place(
             underwriter,
             0,
@@ -547,6 +564,7 @@ impl Exchange {
                 last_price: 0,
                 last_qty: 0,
                 fees: 0,
+                cycle: this.cycle,
                 timestamp: now,
                 reason,
             };
@@ -580,6 +598,21 @@ impl Exchange {
             (OrderKind::Market, Side::Buy) => (high, TimeInForce::Ioc),
             (OrderKind::Market, Side::Sell) => (low, TimeInForce::Ioc),
         };
+        if let Some(&limit) = self.credit_limits.get(&member) {
+            let exposure = self.exposure(member);
+            let notional = price.saturating_mul(qty);
+            if exposure.saturating_add(notional) > limit {
+                return Ok(reject(
+                    self,
+                    format!(
+                        "member credit limit exceeded: exposure {} + order {} > limit {}",
+                        format_price(exposure),
+                        format_price(notional),
+                        format_price(limit)
+                    ),
+                ));
+            }
+        }
         Ok(self.place(
             member,
             member_order_id,
@@ -608,6 +641,7 @@ impl Exchange {
     ) -> Vec<Event> {
         let order_id = self.next_order_id;
         self.next_order_id += 1;
+        *self.open_notional.entry(member).or_default() += price.saturating_mul(qty);
         self.orders.insert(
             order_id,
             OrderMeta {
@@ -679,18 +713,30 @@ impl Exchange {
             aggressor: trade.taker_side,
             timestamp: now,
         }));
+        let mut legs = Vec::with_capacity(2);
         for (order_id, maker) in [(trade.maker_order, true), (trade.taker_order, false)] {
             let Some(meta) = self.orders.get_mut(&order_id) else {
                 continue;
             };
             meta.filled += trade.qty;
             let member = meta.member;
+            let (side, account, limit_price) = (meta.side, meta.account, meta.price);
+            if let Some(open) = self.open_notional.get_mut(&member) {
+                *open = open.saturating_sub(limit_price.saturating_mul(trade.qty));
+            }
+            *self
+                .traded
+                .entry(member)
+                .or_default()
+                .entry(self.cycle)
+                .or_default() += trade.price.saturating_mul(trade.qty);
             let kind = self
                 .members
                 .get(member)
                 .map_or(MemberKind::Broker, |m| m.kind);
             let fee = self.config.fees.fee(kind, maker, trade.qty);
             *self.member_fees.entry(member).or_default() += fee;
+            legs.push((side, member, account, fee));
             let Some(meta) = self.orders.get(&order_id) else {
                 continue;
             };
@@ -705,6 +751,27 @@ impl Exchange {
                 self.orders.remove(&order_id);
             }
         }
+        let leg = |side: Side| legs.iter().find(|l| l.0 == side).copied();
+        if let (Some(buy), Some(sell)) = (leg(Side::Buy), leg(Side::Sell)) {
+            let cleared = ClearedTrade {
+                seq: 0,
+                trade_id,
+                cycle: self.cycle,
+                symbol,
+                price: trade.price,
+                qty: trade.qty,
+                buy_member: buy.1,
+                buy_account: buy.2,
+                buy_fee: buy.3,
+                sell_member: sell.1,
+                sell_account: sell.2,
+                sell_fee: sell.3,
+                timestamp: now,
+            };
+            for clearing in self.clearing_members() {
+                events.push(self.publish(clearing, ServerMessage::ClearedTrade(cleared.clone())));
+            }
+        }
     }
 
     fn close(
@@ -715,7 +782,11 @@ impl Exchange {
         reason: &str,
     ) -> Option<Event> {
         let event = self.report(order_id, status, (0, 0, 0), now, reason);
-        self.orders.remove(&order_id);
+        if let Some(meta) = self.orders.remove(&order_id)
+            && let Some(open) = self.open_notional.get_mut(&meta.member)
+        {
+            *open = open.saturating_sub(meta.price.saturating_mul(meta.qty - meta.filled));
+        }
         event
     }
 
@@ -954,6 +1025,122 @@ mod tests {
                 .collect();
         assert!(fees.contains(&(m.broker, 30)));
         assert!(fees.contains(&(m.lp, -25)));
+    }
+
+    #[test]
+    fn trades_and_allocations_are_sent_to_clearing_with_the_cycle() {
+        let mut ex = Exchange::new(ExchangeConfig::default());
+        admit(&mut ex, "ops", MemberKind::Admin);
+        let broker = admit(&mut ex, "broker", MemberKind::Broker);
+        let lp = admit(&mut ex, "lp", MemberKind::LiquidityProvider);
+        let ccp = admit(&mut ex, "ccp", MemberKind::Clearing);
+        ex.execute(&Command::OpenCycle { cycle: 4 }, 0).unwrap();
+        ex.execute(
+            &Command::ListInstrument {
+                symbol: sym("ACME"),
+                name: String::new(),
+                ipo_price: 25_00,
+                shares: 100,
+                underwriter: broker,
+                issuer_account: 9,
+            },
+            0,
+        )
+        .unwrap();
+        let events = ex
+            .execute(
+                &Command::NewOrder {
+                    member: lp,
+                    member_order_id: 1,
+                    account: 4,
+                    symbol: sym("ACME"),
+                    side: Side::Buy,
+                    kind: OrderKind::Limit(25_00),
+                    tif: TimeInForce::Gtc,
+                    qty: 10,
+                },
+                1,
+            )
+            .unwrap();
+
+        assert!(reports_for(&events, lp).iter().all(|r| r.cycle == 4));
+        let feed = ex.replay(ccp, 0).messages;
+        assert!(
+            matches!(&feed[0], ServerMessage::Allocation(a) if a.member == broker && a.shares == 100)
+        );
+        let ServerMessage::ClearedTrade(t) = &feed[1] else {
+            panic!("expected cleared trade")
+        };
+        assert_eq!((t.cycle, t.qty, t.price), (4, 10, 25_00));
+        assert_eq!(
+            (t.buy_member, t.buy_account, t.sell_member, t.sell_account),
+            (lp, 4, broker, 9)
+        );
+        assert_eq!((t.buy_fee, t.sell_fee), (3, -2));
+        assert!(
+            ex.execute(
+                &Command::NewOrder {
+                    member: ccp,
+                    member_order_id: 0,
+                    account: 0,
+                    symbol: sym("ACME"),
+                    side: Side::Buy,
+                    kind: OrderKind::Market,
+                    tif: TimeInForce::Ioc,
+                    qty: 1,
+                },
+                2
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn credit_limits_cap_exposure_until_the_cycle_settles() {
+        let mut m = market();
+        let lp = m.lp;
+        m.ex.execute(&Command::OpenCycle { cycle: 1 }, 0).unwrap();
+        m.ex.execute(
+            &Command::SetCreditLimit {
+                member: lp,
+                limit: 600_00,
+            },
+            0,
+        )
+        .unwrap();
+
+        order(&mut m, lp, 4, Side::Buy, 25_00, 20);
+        assert_eq!(m.ex.exposure(lp), 500_00);
+        let events = order(&mut m, lp, 4, Side::Buy, 24_00, 5);
+        assert!(
+            reports_for(&events, lp)[0]
+                .reason
+                .contains("credit limit exceeded")
+        );
+
+        m.ex.execute(&Command::OpenCycle { cycle: 2 }, 0).unwrap();
+        m.ex.execute(&Command::Settled { cycle: 1 }, 0).unwrap();
+        assert_eq!(m.ex.exposure(lp), 0);
+        let events = order(&mut m, lp, 4, Side::Buy, 24_00, 5);
+        assert_eq!(reports_for(&events, lp)[0].status, OrderStatus::New);
+        assert_eq!(m.ex.exposure(lp), 120_00);
+
+        let id = reports_for(&events, lp)[0].order_id;
+        m.ex.execute(
+            &Command::Cancel {
+                member: lp,
+                order_id: id,
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(m.ex.exposure(lp), 0);
+        let info =
+            m.ex.member_list(|_| false)
+                .into_iter()
+                .find(|i| i.member_id == lp)
+                .unwrap();
+        assert_eq!(info.credit_limit, 600_00);
     }
 
     #[test]

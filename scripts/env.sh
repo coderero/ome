@@ -4,6 +4,10 @@ OME_EXCHANGE="${OME_EXCHANGE:-$OME_HOST:7000}"
 OME_EXCHANGE_SECRET="${OME_EXCHANGE_SECRET:-ops}"
 OME_BROKER_SECRET="${OME_BROKER_SECRET:-admin}"
 OME_MEMBER_SECRET="${OME_MEMBER_SECRET:-member-pw}"
+OME_CLEARING="${OME_CLEARING:-$OME_HOST:7200}"
+OME_CLEARING_SECRET="${OME_CLEARING_SECRET:-ops}"
+OME_CYCLE_MS="${OME_CYCLE_MS:-30000}"
+OME_COLLATERAL="${OME_COLLATERAL:-2000000}"
 BIN=./target/release
 
 providers=(
@@ -22,6 +26,7 @@ provider_addr() {
   return 1
 }
 
+clearing_cmd() { "$BIN/ome" clearing --addr "$OME_CLEARING" --user ops --secret "$OME_CLEARING_SECRET" "$@"; }
 exchange_cmd() { "$BIN/ome" exchange --addr "$OME_EXCHANGE" --member ops --secret "$OME_EXCHANGE_SECRET" "$@"; }
 broker_admin() { local addr; addr="$(provider_addr "$1")"; shift; "$BIN/ome" broker --addr "$addr" --user admin --secret "$OME_BROKER_SECRET" "$@"; }
 broker_as() { local addr; addr="$(provider_addr "$1")"; shift; local user="$1" secret="$2"; shift 2; "$BIN/ome" broker --addr "$addr" --user "$user" --secret "$secret" "$@"; }

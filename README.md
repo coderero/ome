@@ -34,8 +34,16 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
                                ▼
  ┌──────────────────────────── exchange :7000 ─────────────────────────────────┐
  │ members only (no client balances): matching, listings and IPOs, halts,      │
- │ 30% circuit breaker, price bands, per-member sequenced execution feeds      │
+ │ 30% circuit breaker, price bands, per-member sequenced execution feeds,     │
+ │ fees, member credit limits                                                  │
+ └──────────────┬──────────────────────────────────────────────▲───────────────┘
+                │ every trade + IPO allocation (sequenced)      │ cycles, settled, credit limits
+                ▼                                               │
+ ┌──────────────────────────── clearing house :7200 ───────────┴───────────────┐
+ │ central counterparty + depository: trade-day cycles, T+1 netting and        │
+ │ delivery-versus-payment between members, collateral, margin, fails          │
  └─────────────────────────────────────────────────────────────────────────────┘
+       settlement reports (sequenced) ──► providers mark client trades settled
 ```
 
 Responsibilities are split the way real markets split them:
@@ -45,6 +53,7 @@ Responsibilities are split the way real markets split them:
 | Order book, matching, price-time priority | exchange (`ome-core` engine) |
 | Listings, IPOs, halts, circuit breaker | exchange (admin = exchange operations member) |
 | Self-trade prevention | exchange, per beneficial account (member + account) |
+| Settlement between members, collateral, margin, member credit limits | clearing house |
 | Client accounts, cash and positions, buying power | provider |
 | Client roles and order limits | provider profile |
 | Who may open which account type | provider profile (retail broker can't open HFT accounts, etc.) |
@@ -59,6 +68,7 @@ crates/
 ├── ome-store      generic crash-safe journal (write-ahead log of SBE frames)
 ├── ome-net        TCP session server, outbound back-pressure, auth hashing, logging
 ├── ome-exchange   exchange service (lib + `ome-exchange` binary)
+├── ome-clearing   clearing house (lib + `ome-clearing` binary)
 ├── ome-broker     provider service with retail / prime / dma / lp profiles (lib + `ome-broker`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
 └── ome-bots       agents: market maker, momentum, mean reversion, noise
@@ -134,8 +144,30 @@ ome broker --addr 127.0.0.1:7101 fees        # broker admin: revenue and taxes c
 ome exchange members                         # net exchange fees per member
 ```
 
+## Clearing and Settlement
+
+The clearing house (`ome-clearing`) is an exchange member of type `clearing`. It runs the market calendar and settles trades between members, like a central counterparty (CCP) plus a securities depository (CSD).
+
+- **Trade-day cycles.** Clearing opens a new cycle every `--cycle-ms` (60 s by default, 30 s in the demo) and tells the exchange, which stamps every fill with the current cycle.
+- **Drop copy.** Every trade (buyer and seller member, accounts, fees) and every IPO allocation is sent to clearing on its own sequenced feed, with the same replay-on-reconnect as members.
+- **T+1 delivery versus payment.** Trades of cycle *T* settle when cycle *T+2* opens. Obligations are netted per member: net shares move between depository positions, and net cash (including exchange fees) moves between collateral accounts. Delivering shares a member doesn't hold is recorded as a **fail** and reported.
+- **Collateral and margin.** Members deposit collateral; the margin requirement is 10% of unsettled gross notional. A withdrawal that would leave collateral below the requirement is refused.
+- **Credit limits.** Clearing pushes each member's credit limit (collateral ÷ margin rate) to the exchange. The exchange tracks exposure (open order notional plus unsettled traded notional) and rejects orders that would exceed it. Exposure drops when clearing reports a cycle settled.
+- **Settlement reports.** Each member receives a sequenced report per settled cycle. Providers keep each client's fills as **unsettled** cash and shares until the report for their cycle arrives (trade-date accounting: buying power is not reduced). Balances show both.
+- **Conservation.** Members' collateral plus the clearing house's fee pool always equals total deposits (verified live to the cent).
+
+```bash
+ome clearing status                                   # cycles, collateral, margin, unsettled, credit, fails
+ome clearing register retail-co <secret>              # make an exchange member a clearing member
+ome clearing deposit retail-co 2000000
+ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
+# unsettled cash -250.17
+#   ACME   10 (reserved 0, unsettled 10)
+```
+
 ## Reliability
 
+- **Clearing house**: an event-sourced journal of facts (registrations, deposits, cleared trades, cycles); settlement is recomputed deterministically on replay, including each member's report feed.
 - **Exchange**: a write-ahead journal of commands. Replay is deterministic and rebuilds books, halts, order ids **and each member's sequenced feed**.
 - **Member recovery**: every execution report and IPO allocation sent to a member carries a per-member sequence number. A reconnecting provider sends `last_seq`, and the exchange resends everything after it, followed by `ReplayComplete`. Duplicates are ignored by sequence number. If the requested history is older than what the exchange kept, the gap is reported.
 - **Lost orders**: if a provider recorded an order but crashed before the exchange received it, the order is still pending after `ReplayComplete`. It is then abandoned and its reservation released.
@@ -165,14 +197,13 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 102 tests
+cargo test --workspace     # 117 tests
 ```
 
-Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider.
+Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1c** clearing house: T+1 netting and settlement between members
 - **1d** market sessions set by exchange operations: pre-open auction, open, close
 - **1e** PostgreSQL (accounts, trades, settlements) and Redis (market data)
 - **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts

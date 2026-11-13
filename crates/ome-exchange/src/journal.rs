@@ -14,6 +14,9 @@ mod template {
     pub const NEW_ORDER: u16 = 204;
     pub const CANCEL: u16 = 205;
     pub const CANCEL_ALL: u16 = 206;
+    pub const OPEN_CYCLE: u16 = 207;
+    pub const SETTLED: u16 = 208;
+    pub const SET_CREDIT_LIMIT: u16 = 209;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +35,9 @@ impl Entry for Record {
             Command::NewOrder { .. } => template::NEW_ORDER,
             Command::Cancel { .. } => template::CANCEL,
             Command::CancelAll { .. } => template::CANCEL_ALL,
+            Command::OpenCycle { .. } => template::OPEN_CYCLE,
+            Command::Settled { .. } => template::SETTLED,
+            Command::SetCreditLimit { .. } => template::SET_CREDIT_LIMIT,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -91,6 +97,12 @@ impl Entry for Record {
                     .u64(account.unwrap_or(0))
                     .symbol(*symbol)
                     .end_block();
+            }
+            Command::OpenCycle { cycle } | Command::Settled { cycle } => {
+                e.u64(*cycle).end_block();
+            }
+            Command::SetCreditLimit { member, limit } => {
+                e.u64(*member).u64(*limit).end_block();
             }
         }
         e.finish()
@@ -177,6 +189,22 @@ impl Entry for Record {
                     symbol,
                 }
             }
+            template::OPEN_CYCLE => {
+                let cycle = d.u64()?;
+                d.end_block()?;
+                Command::OpenCycle { cycle }
+            }
+            template::SETTLED => {
+                let cycle = d.u64()?;
+                d.end_block()?;
+                Command::Settled { cycle }
+            }
+            template::SET_CREDIT_LIMIT => {
+                let member = d.u64()?;
+                let limit = d.u64()?;
+                d.end_block()?;
+                Command::SetCreditLimit { member, limit }
+            }
             other => return Err(DecodeError::UnknownTemplate(other)),
         };
         Ok(Record { timestamp, command })
@@ -259,6 +287,12 @@ mod tests {
             account: Some(1),
             symbol: None,
         });
+        commands.push(Command::OpenCycle { cycle: 1 });
+        commands.push(Command::SetCreditLimit {
+            member: 2,
+            limit: 1_000_000_00,
+        });
+        commands.push(Command::Settled { cycle: 0 });
         commands.push(Command::Resume {
             symbol: sym("ACME"),
         });

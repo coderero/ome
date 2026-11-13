@@ -2,6 +2,7 @@ use crate::broker::{Broker, Effect, Fact};
 use crate::journal::Record;
 use crate::market::MarketCache;
 use ome_client::LinkEvent;
+use ome_client::upstream::{LinkState, Upstream, UpstreamEvent};
 use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, Timestamp};
@@ -15,30 +16,6 @@ use std::io;
 use std::sync::Arc;
 
 const HEARTBEAT_MS: Timestamp = 1_000;
-const RECONNECT_MS: Timestamp = 1_000;
-const REJECTED_LOGON_RETRY_MS: Timestamp = 5_000;
-
-pub trait Uplink: Send {
-    fn send(&self, message: &MemberMessage) -> bool;
-}
-
-pub trait Connector: Send {
-    fn connect(&mut self, generation: u64) -> Option<Box<dyn Uplink>>;
-}
-
-pub struct MemberCredentials {
-    pub name: String,
-    pub secret: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkState {
-    Down { retry_at: Timestamp },
-    LoggingOn,
-    Replaying,
-    Ready,
-}
-
 struct Session {
     outbox: Box<dyn Outbox>,
     login: Option<(AccountId, Role)>,
@@ -51,11 +28,8 @@ pub struct Gateway {
     journal: Option<Journal<Record>>,
     sessions: BTreeMap<SessionId, Session>,
     dropped: BTreeSet<SessionId>,
-    connector: Box<dyn Connector>,
-    credentials: MemberCredentials,
-    uplink: Option<Box<dyn Uplink>>,
-    link_state: LinkState,
-    generation: u64,
+    exchange: Upstream,
+    clearing: Option<Upstream>,
     clock: Timestamp,
     last_heartbeat: Timestamp,
 }
@@ -64,8 +38,8 @@ impl Gateway {
     pub fn new(
         broker: Broker,
         journal: Option<Journal<Record>>,
-        connector: Box<dyn Connector>,
-        credentials: MemberCredentials,
+        exchange: Upstream,
+        clearing: Option<Upstream>,
         clock: Timestamp,
     ) -> Self {
         Self {
@@ -74,11 +48,8 @@ impl Gateway {
             journal,
             sessions: BTreeMap::new(),
             dropped: BTreeSet::new(),
-            connector,
-            credentials,
-            uplink: None,
-            link_state: LinkState::Down { retry_at: 0 },
-            generation: 0,
+            exchange,
+            clearing,
             clock,
             last_heartbeat: clock,
         }
@@ -89,7 +60,7 @@ impl Gateway {
     }
 
     pub fn link_state(&self) -> LinkState {
-        self.link_state
+        self.exchange.state()
     }
 
     pub fn ensure_admin(&mut self, name: &str, secret: &str, now: Timestamp) -> Result<(), String> {
@@ -141,10 +112,9 @@ impl Gateway {
 
     pub fn tick(&mut self, now: Timestamp) {
         let now = self.advance(now);
-        if let LinkState::Down { retry_at } = self.link_state
-            && now >= retry_at
-        {
-            self.open_link(now);
+        self.exchange.tick(now, self.broker.last_seq());
+        if let Some(clearing) = &mut self.clearing {
+            clearing.tick(now, self.broker.last_settlement_seq());
         }
         self.market.roll(now);
         if now >= self.last_heartbeat + HEARTBEAT_MS {
@@ -158,94 +128,50 @@ impl Gateway {
         self.drop_slow_sessions();
     }
 
-    fn open_link(&mut self, now: Timestamp) {
-        self.generation += 1;
-        match self.connector.connect(self.generation) {
-            Some(uplink) => {
-                let logon = MemberMessage::Logon {
-                    name: self.credentials.name.clone(),
-                    secret: self.credentials.secret.clone(),
-                    last_seq: self.broker.last_seq(),
-                };
-                if uplink.send(&logon) {
-                    self.uplink = Some(uplink);
-                    self.link_state = LinkState::LoggingOn;
-                    return;
-                }
-                self.link_state = LinkState::Down {
-                    retry_at: now + RECONNECT_MS,
-                };
-            }
-            None => {
-                if self.generation % 10 == 1 {
-                    log("exchange unreachable, retrying");
-                }
-                self.link_state = LinkState::Down {
-                    retry_at: now + RECONNECT_MS,
-                };
-            }
-        }
-    }
-
-    fn link_down(&mut self, now: Timestamp, retry_in: Timestamp, why: &str) {
-        if !matches!(self.link_state, LinkState::Down { .. }) {
-            log(&format!("exchange link down: {why}"));
-        }
-        self.uplink = None;
-        self.link_state = LinkState::Down {
-            retry_at: now + retry_in,
-        };
-    }
-
     fn send_exchange(&mut self, message: &MemberMessage) -> bool {
-        self.uplink.as_ref().is_some_and(|u| u.send(message))
+        self.exchange.send(message)
+    }
+
+    pub fn on_clearing(&mut self, generation: u64, event: LinkEvent, now: Timestamp) {
+        let now = self.advance(now);
+        let Some(clearing) = &mut self.clearing else {
+            return;
+        };
+        match clearing.on_event(generation, event, now) {
+            Some(UpstreamEvent::LoggedOn { member_id, .. }) => log(&format!(
+                "logged on to clearing as member {member_id}, replaying settlements from seq {}",
+                self.broker.last_settlement_seq() + 1
+            )),
+            Some(UpstreamEvent::Ready { .. }) => log("clearing replay complete; ready"),
+            Some(UpstreamEvent::Message(ServerMessage::SettlementReport(report)))
+                if self.broker.is_new_settlement(report.seq) =>
+            {
+                log(&format!(
+                    "cycle {} settled: cash {}{}",
+                    report.cycle,
+                    if report.cash < 0 { "-" } else { "" },
+                    format_price(report.cash.unsigned_abs())
+                ));
+                let _ = self.record(Fact::SettlementReceived(report), now);
+            }
+            _ => {}
+        }
+        self.drop_slow_sessions();
     }
 
     pub fn on_exchange(&mut self, generation: u64, event: LinkEvent, now: Timestamp) {
         let now = self.advance(now);
-        if generation != self.generation {
-            return;
-        }
-        let message = match event {
-            LinkEvent::Closed => return self.link_down(now, RECONNECT_MS, "connection closed"),
-            LinkEvent::Message(message) => message,
-        };
-        match message {
-            ServerMessage::MemberLogonAck {
-                member_id, kind, ..
-            } => {
+        let message = match self.exchange.on_event(generation, event, now) {
+            None | Some(UpstreamEvent::Down) => return,
+            Some(UpstreamEvent::LoggedOn { member_id, kind }) => {
                 log(&format!(
                     "logged on to exchange as member {member_id} ({}), replaying from seq {}",
                     kind.label(),
                     self.broker.last_seq() + 1
                 ));
-                self.link_state = LinkState::Replaying;
+                return;
             }
-            ServerMessage::Reject {
-                ref_template: template::MEMBER_LOGON,
-                reason,
-            } if self.link_state == LinkState::LoggingOn => {
-                self.link_down(
-                    now,
-                    REJECTED_LOGON_RETRY_MS,
-                    &format!("logon rejected: {reason}"),
-                );
-            }
-            ServerMessage::Reject { reason, .. } => {
-                log(&format!("exchange rejected a request: {reason}"))
-            }
-            ServerMessage::Execution(report) => {
-                if self.broker.is_new(report.seq) {
-                    let charges = self.broker.charges_for(&report);
-                    let _ = self.record(Fact::ExchangeReport { report, charges }, now);
-                }
-            }
-            ServerMessage::Allocation(allocation) => {
-                if self.broker.is_new(allocation.seq) {
-                    let _ = self.record(Fact::Allocated(allocation), now);
-                }
-            }
-            ServerMessage::ReplayComplete { next_seq } => {
+            Some(UpstreamEvent::Ready { next_seq }) => {
                 let pending = self.broker.pending_orders();
                 if !pending.is_empty() {
                     log(&format!(
@@ -259,7 +185,24 @@ impl Gateway {
                 log(&format!(
                     "exchange replay complete, next seq {next_seq}; ready"
                 ));
-                self.link_state = LinkState::Ready;
+                return;
+            }
+            Some(UpstreamEvent::Message(message)) => message,
+        };
+        match message {
+            ServerMessage::Reject { reason, .. } => {
+                log(&format!("exchange rejected a request: {reason}"))
+            }
+            ServerMessage::Execution(report) => {
+                if self.broker.is_new(report.seq) {
+                    let charges = self.broker.charges_for(&report);
+                    let _ = self.record(Fact::ExchangeReport { report, charges }, now);
+                }
+            }
+            ServerMessage::Allocation(allocation) => {
+                if self.broker.is_new(allocation.seq) {
+                    let _ = self.record(Fact::Allocated(allocation), now);
+                }
             }
             ServerMessage::InstrumentList(_) => {
                 self.market.apply(&message);
@@ -444,7 +387,7 @@ impl Gateway {
                 kind,
                 qty,
             } if !admin => {
-                let decision = if self.link_state == LinkState::Ready {
+                let decision = if self.exchange.is_ready() {
                     self.broker.decide_order(
                         account,
                         client_order_id,
@@ -669,6 +612,7 @@ fn rejected(
         last_price: 0,
         last_qty: 0,
         fees: 0,
+        cycle: 0,
         timestamp: now,
         reason: String::new(),
     }

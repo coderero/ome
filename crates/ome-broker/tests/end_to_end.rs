@@ -32,6 +32,7 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str) -> SocketAdd
         exchange_addr: exchange.to_string(),
         member_name: member.into(),
         member_secret: "pw".into(),
+        clearing_addr: None,
     })
     .unwrap()
     .0
