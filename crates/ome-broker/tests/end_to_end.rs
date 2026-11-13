@@ -1,3 +1,4 @@
+use ome_broker::fees::FeeEngine;
 use ome_broker::profile::ProfileKind;
 use ome_broker::{BrokerConfig, start as start_broker};
 use ome_client::{Client, ClientError};
@@ -136,7 +137,13 @@ fn investor_buys_ipo_shares_through_a_retail_broker() {
         ServerMessage::Account(a) => a,
         _ => unreachable!(),
     };
-    assert_eq!(account.cash.available, 10_000_00 - 500_00);
+    let buyer_charges = FeeEngine::default().charges(Role::Retail, Side::Buy, 20_00, 25, 8, 0);
+    assert_eq!(filled.fees, buyer_charges.total());
+    assert_eq!(
+        account.cash.available as i64,
+        10_000_00 - 500_00 - buyer_charges.total()
+    );
+    assert_eq!(account.cash.reserved, 0);
     assert_eq!(account.positions[0].balance.available, 25);
 
     let (issuer_session, _) =
@@ -146,11 +153,17 @@ fn investor_buys_ipo_shares_through_a_retail_broker() {
             .recv_timeout(Duration::from_millis(200))
             .ok()?
         {
-            Some(ServerMessage::Account(a)) if a.cash.available == 500_00 => Some(a),
+            Some(ServerMessage::Account(a)) if a.cash.available > 0 => Some(a),
             _ => None,
         }
     });
     assert_eq!(issuer_account.positions[0].balance.reserved, 975);
+    let issuer_charges = FeeEngine::default().charges(Role::Issuer, Side::Sell, 20_00, 25, -4, 0);
+    assert_eq!(issuer_charges.commission, 10_00);
+    assert_eq!(
+        issuer_account.cash.available as i64,
+        500_00 - issuer_charges.total()
+    );
 }
 
 #[test]

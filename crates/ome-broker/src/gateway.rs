@@ -236,7 +236,8 @@ impl Gateway {
             }
             ServerMessage::Execution(report) => {
                 if self.broker.is_new(report.seq) {
-                    let _ = self.record(Fact::ExchangeReport(report), now);
+                    let charges = self.broker.charges_for(&report);
+                    let _ = self.record(Fact::ExchangeReport { report, charges }, now);
                 }
             }
             ServerMessage::Allocation(allocation) => {
@@ -429,6 +430,9 @@ impl Gateway {
                 if let Some(snapshot) = self.broker.account_snapshot(account) {
                     self.reply(id, ServerMessage::Account(snapshot));
                 }
+            }
+            ClientMessage::QueryFees if admin => {
+                self.reply(id, ServerMessage::FeeSummary(self.broker.fee_summary()))
             }
             ClientMessage::QueryAccounts if admin => {
                 self.reply(id, ServerMessage::AccountList(self.broker.account_list()))

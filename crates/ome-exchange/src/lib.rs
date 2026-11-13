@@ -1,4 +1,5 @@
 pub mod exchange;
+pub mod fees;
 pub mod gateway;
 pub mod instrument;
 pub mod journal;

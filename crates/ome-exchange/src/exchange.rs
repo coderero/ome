@@ -1,3 +1,4 @@
+use crate::fees::FeeSchedule;
 use crate::instrument::{Halt, Instrument};
 use crate::members::Members;
 use ome_core::price::{Price, format_price};
@@ -27,6 +28,7 @@ pub struct ExchangeConfig {
     pub tape_capacity: usize,
     pub depth_levels: usize,
     pub feed_capacity: usize,
+    pub fees: FeeSchedule,
 }
 
 impl Default for ExchangeConfig {
@@ -41,6 +43,7 @@ impl Default for ExchangeConfig {
             tape_capacity: 200,
             depth_levels: 12,
             feed_capacity: 100_000,
+            fees: FeeSchedule::default(),
         }
     }
 }
@@ -164,6 +167,7 @@ pub struct Exchange {
     instruments: BTreeMap<Symbol, Instrument>,
     orders: HashMap<OrderId, OrderMeta>,
     feeds: HashMap<MemberId, MemberFeed>,
+    member_fees: HashMap<MemberId, i64>,
     risk: RiskEngine,
     next_order_id: OrderId,
     next_trade_id: u64,
@@ -188,6 +192,7 @@ impl Exchange {
             instruments: BTreeMap::new(),
             orders: HashMap::new(),
             feeds: HashMap::new(),
+            member_fees: HashMap::new(),
             risk,
             next_order_id: 1,
             next_trade_id: 1,
@@ -330,6 +335,7 @@ impl Exchange {
                 kind: m.kind,
                 connected: connected(m.id),
                 open_orders: open.get(&m.id).copied().unwrap_or(0),
+                net_fees: self.member_fees.get(&m.id).copied().unwrap_or(0),
                 name: m.name.clone(),
             })
             .collect()
@@ -367,7 +373,7 @@ impl Exchange {
         &mut self,
         order_id: OrderId,
         status: OrderStatus,
-        last: (Price, Qty),
+        last: (Price, Qty, i64),
         now: Timestamp,
         reason: &str,
     ) -> Option<Event> {
@@ -391,7 +397,7 @@ impl Exchange {
             },
             last_price: last.0,
             last_qty: last.1,
-            fees: 0,
+            fees: last.2,
             timestamp: now,
             reason: reason.to_string(),
         };
@@ -616,7 +622,7 @@ impl Exchange {
             },
         );
         let mut events: Vec<Event> = self
-            .report(order_id, OrderStatus::New, (0, 0), now, "")
+            .report(order_id, OrderStatus::New, (0, 0, 0), now, "")
             .into_iter()
             .collect();
 
@@ -673,18 +679,28 @@ impl Exchange {
             aggressor: trade.taker_side,
             timestamp: now,
         }));
-        for order_id in [trade.maker_order, trade.taker_order] {
+        for (order_id, maker) in [(trade.maker_order, true), (trade.taker_order, false)] {
             let Some(meta) = self.orders.get_mut(&order_id) else {
                 continue;
             };
             meta.filled += trade.qty;
+            let member = meta.member;
+            let kind = self
+                .members
+                .get(member)
+                .map_or(MemberKind::Broker, |m| m.kind);
+            let fee = self.config.fees.fee(kind, maker, trade.qty);
+            *self.member_fees.entry(member).or_default() += fee;
+            let Some(meta) = self.orders.get(&order_id) else {
+                continue;
+            };
             let done = meta.filled == meta.qty;
             let status = if done {
                 OrderStatus::Filled
             } else {
                 OrderStatus::PartiallyFilled
             };
-            events.extend(self.report(order_id, status, (trade.price, trade.qty), now, ""));
+            events.extend(self.report(order_id, status, (trade.price, trade.qty, fee), now, ""));
             if done {
                 self.orders.remove(&order_id);
             }
@@ -698,7 +714,7 @@ impl Exchange {
         now: Timestamp,
         reason: &str,
     ) -> Option<Event> {
-        let event = self.report(order_id, status, (0, 0), now, reason);
+        let event = self.report(order_id, status, (0, 0, 0), now, reason);
         self.orders.remove(&order_id);
         event
     }
@@ -910,6 +926,34 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::Trade(t) if t.qty == 10 && t.price == 25_00))
         );
+    }
+
+    #[test]
+    fn takers_pay_fees_and_makers_earn_rebates() {
+        let mut m = market();
+        let lp = m.lp;
+        order(&mut m, lp, 4, Side::Sell, 24_90, 100);
+        let broker = m.broker;
+        let events = order(&mut m, broker, 7, Side::Buy, 24_90, 100);
+
+        let taker = reports_for(&events, m.broker)
+            .into_iter()
+            .find(|r| r.last_qty == 100)
+            .unwrap();
+        assert_eq!(taker.fees, 30);
+        let maker = reports_for(&events, m.lp)
+            .into_iter()
+            .find(|r| r.last_qty == 100)
+            .unwrap();
+        assert_eq!(maker.fees, -25);
+
+        let fees: Vec<(MemberId, i64)> =
+            m.ex.member_list(|_| false)
+                .iter()
+                .map(|i| (i.member_id, i.net_fees))
+                .collect();
+        assert!(fees.contains(&(m.broker, 30)));
+        assert!(fees.contains(&(m.lp, -25)));
     }
 
     #[test]

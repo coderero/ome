@@ -44,6 +44,7 @@ pub enum ClientMessage {
         amount: u64,
     },
     QueryAccounts,
+    QueryFees,
 }
 
 impl ClientMessage {
@@ -61,6 +62,7 @@ impl ClientMessage {
             ClientMessage::CreateAccount { .. } => CREATE_ACCOUNT,
             ClientMessage::SetBalance { .. } => SET_BALANCE,
             ClientMessage::QueryAccounts => QUERY_ACCOUNTS,
+            ClientMessage::QueryFees => QUERY_FEES,
         }
     }
 
@@ -73,7 +75,8 @@ impl ClientMessage {
             ClientMessage::Heartbeat
             | ClientMessage::QueryAccount
             | ClientMessage::QueryInstruments
-            | ClientMessage::QueryAccounts => {
+            | ClientMessage::QueryAccounts
+            | ClientMessage::QueryFees => {
                 e.end_block();
             }
             ClientMessage::NewOrder {
@@ -149,6 +152,10 @@ impl ClientMessage {
             QUERY_ACCOUNTS => {
                 d.end_block()?;
                 ClientMessage::QueryAccounts
+            }
+            QUERY_FEES => {
+                d.end_block()?;
+                ClientMessage::QueryFees
             }
             NEW_ORDER => {
                 let client_order_id = d.u64()?;
@@ -272,6 +279,7 @@ pub mod tests {
                 amount: 20,
             },
             ClientMessage::QueryAccounts,
+            ClientMessage::QueryFees,
         ]
     }
 

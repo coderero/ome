@@ -174,9 +174,55 @@ pub struct ExecutionReport {
     pub leaves: Qty,
     pub last_price: Price,
     pub last_qty: Qty,
-    pub fees: u64,
+    pub fees: i64,
     pub timestamp: Timestamp,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Charges {
+    pub commission: u64,
+    pub exchange_fee: i64,
+    pub transaction_tax: u64,
+    pub stamp_duty: u64,
+    pub regulatory_fee: u64,
+    pub gst: u64,
+}
+
+impl Charges {
+    pub fn total(&self) -> i64 {
+        (self.commission + self.transaction_tax + self.stamp_duty + self.regulatory_fee + self.gst)
+            as i64
+            + self.exchange_fee
+    }
+
+    pub fn add(&mut self, other: &Charges) {
+        self.commission += other.commission;
+        self.exchange_fee += other.exchange_fee;
+        self.transaction_tax += other.transaction_tax;
+        self.stamp_duty += other.stamp_duty;
+        self.regulatory_fee += other.regulatory_fee;
+        self.gst += other.gst;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractNote {
+    pub account: AccountId,
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: Qty,
+    pub price: Price,
+    pub charges: Charges,
+    pub net_amount: i64,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeeSummary {
+    pub charges: Charges,
+    pub fills: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +302,7 @@ pub struct MemberInfo {
     pub kind: MemberKind,
     pub connected: bool,
     pub open_orders: u32,
+    pub net_fees: i64,
     pub name: String,
 }
 
@@ -319,6 +366,26 @@ pub fn asset_symbol(asset: Asset) -> Option<Symbol> {
         Asset::Cash => None,
         Asset::Shares(symbol) => Some(symbol),
     }
+}
+
+pub fn put_charges(e: &mut Encoder, c: &Charges) {
+    e.u64(c.commission)
+        .i64(c.exchange_fee)
+        .u64(c.transaction_tax)
+        .u64(c.stamp_duty)
+        .u64(c.regulatory_fee)
+        .u64(c.gst);
+}
+
+pub fn get_charges(d: &mut Decoder) -> Result<Charges, DecodeError> {
+    Ok(Charges {
+        commission: d.u64()?,
+        exchange_fee: d.i64()?,
+        transaction_tax: d.u64()?,
+        stamp_duty: d.u64()?,
+        regulatory_fee: d.u64()?,
+        gst: d.u64()?,
+    })
 }
 
 pub fn put_balance(e: &mut Encoder, b: &Balance) {

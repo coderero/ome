@@ -34,6 +34,8 @@ pub enum ServerMessage {
     Execution(ExecutionReport),
     Account(AccountSnapshot),
     Allocation(Allocation),
+    ContractNote(ContractNote),
+    FeeSummary(FeeSummary),
     InstrumentList(Vec<InstrumentInfo>),
     Instrument(InstrumentInfo),
     Book(BookSnapshot),
@@ -55,6 +57,8 @@ impl ServerMessage {
             ServerMessage::Execution(_) => EXECUTION_REPORT,
             ServerMessage::Account(_) => ACCOUNT_SNAPSHOT,
             ServerMessage::Allocation(_) => ALLOCATION,
+            ServerMessage::ContractNote(_) => CONTRACT_NOTE,
+            ServerMessage::FeeSummary(_) => FEE_SUMMARY,
             ServerMessage::InstrumentList(_) => INSTRUMENT_LIST,
             ServerMessage::Instrument(_) => INSTRUMENT,
             ServerMessage::Book(_) => BOOK_SNAPSHOT,
@@ -117,7 +121,7 @@ impl ServerMessage {
                     .u64(r.leaves)
                     .u64(r.last_price)
                     .u64(r.last_qty)
-                    .u64(r.fees)
+                    .i64(r.fees)
                     .u64(r.timestamp)
                     .end_block()
                     .var(&r.reason);
@@ -141,6 +145,20 @@ impl ServerMessage {
                     .u64(a.account)
                     .u64(a.shares)
                     .end_block();
+            }
+            ServerMessage::ContractNote(n) => {
+                e.u64(n.account)
+                    .u64(n.order_id)
+                    .symbol(Some(n.symbol))
+                    .u8(side_to_u8(n.side))
+                    .u64(n.qty)
+                    .u64(n.price);
+                put_charges(&mut e, &n.charges);
+                e.i64(n.net_amount).u64(n.timestamp).end_block();
+            }
+            ServerMessage::FeeSummary(f) => {
+                put_charges(&mut e, &f.charges);
+                e.u64(f.fills).end_block();
             }
             ServerMessage::InstrumentList(list) => {
                 e.end_block();
@@ -211,7 +229,8 @@ impl ServerMessage {
                     e.u64(m.member_id)
                         .u8(m.kind as u8)
                         .u8(m.connected as u8)
-                        .u32(m.open_orders);
+                        .u32(m.open_orders)
+                        .i64(m.net_fees);
                     e.end_entry_block(&mut g);
                     e.var(&m.name);
                 }
@@ -285,7 +304,7 @@ impl ServerMessage {
                 let leaves = d.u64()?;
                 let last_price = d.u64()?;
                 let last_qty = d.u64()?;
-                let fees = d.u64()?;
+                let fees = d.i64()?;
                 let timestamp = d.u64()?;
                 d.end_block()?;
                 ServerMessage::Execution(ExecutionReport {
@@ -342,6 +361,35 @@ impl ServerMessage {
                     account,
                     shares,
                 })
+            }
+            CONTRACT_NOTE => {
+                let account = d.u64()?;
+                let order_id = d.u64()?;
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let price = d.u64()?;
+                let charges = get_charges(&mut d)?;
+                let net_amount = d.i64()?;
+                let timestamp = d.u64()?;
+                d.end_block()?;
+                ServerMessage::ContractNote(ContractNote {
+                    account,
+                    order_id,
+                    symbol,
+                    side,
+                    qty,
+                    price,
+                    charges,
+                    net_amount,
+                    timestamp,
+                })
+            }
+            FEE_SUMMARY => {
+                let charges = get_charges(&mut d)?;
+                let fills = d.u64()?;
+                d.end_block()?;
+                ServerMessage::FeeSummary(FeeSummary { charges, fills })
             }
             INSTRUMENT_LIST => {
                 d.end_block()?;
@@ -464,12 +512,14 @@ impl ServerMessage {
                     let kind = member_kind_from(d.u8()?)?;
                     let connected = d.u8()? != 0;
                     let open_orders = d.u32()?;
+                    let net_fees = d.i64()?;
                     d.end_entry_block(start, &g)?;
                     list.push(MemberInfo {
                         member_id,
                         kind,
                         connected,
                         open_orders,
+                        net_fees,
                         name: d.var()?,
                     });
                 }
@@ -585,6 +635,31 @@ mod tests {
                     },
                 }],
             }),
+            ServerMessage::ContractNote(ContractNote {
+                account: 4,
+                order_id: 9,
+                symbol: sym("ACME"),
+                side: Side::Buy,
+                qty: 10,
+                price: 2_500,
+                charges: Charges {
+                    commission: 8,
+                    exchange_fee: -2,
+                    transaction_tax: 0,
+                    stamp_duty: 4,
+                    regulatory_fee: 0,
+                    gst: 1,
+                },
+                net_amount: -25_011,
+                timestamp: 5,
+            }),
+            ServerMessage::FeeSummary(FeeSummary {
+                charges: Charges {
+                    commission: 100,
+                    ..Charges::default()
+                },
+                fills: 3,
+            }),
             ServerMessage::Allocation(Allocation {
                 seq: 3,
                 allocation_id: 1,
@@ -644,6 +719,7 @@ mod tests {
                 kind: MemberKind::LiquidityProvider,
                 connected: true,
                 open_orders: 40,
+                net_fees: -1_250,
                 name: "lp-desk".into(),
             }]),
         ]

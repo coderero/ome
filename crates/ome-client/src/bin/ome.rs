@@ -18,7 +18,7 @@ const USAGE: &str = "usage:
       instruments  |  watch <SYMBOL>
 
   ome broker [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
-      accounts                                            (broker admin)
+      accounts  |  fees                                   (broker admin)
       create-account <name> <secret> <role> <cash>        role: retail quant hft prop lp issuer admin
       set-cash <account> <amount>  |  set-shares <account> <SYMBOL> <qty>
       balance                                             (trader)
@@ -134,12 +134,13 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
         ["members"] => {
             for m in members(client)? {
                 println!(
-                    "{:>4}  {:<20} {:<20} {}  open orders {}",
+                    "{:>4}  {:<20} {:<20} {}  open orders {:<6} net fees {}",
                     m.member_id,
                     m.name,
                     m.kind.label(),
                     if m.connected { "online " } else { "offline" },
-                    m.open_orders
+                    m.open_orders,
+                    format_signed(m.net_fees)
                 );
             }
         }
@@ -220,6 +221,28 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
 
 fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
     match args {
+        ["fees"] => {
+            client.send(&ClientMessage::QueryFees)?;
+            let ServerMessage::FeeSummary(summary) =
+                client.wait_for(Duration::from_secs(5), |m| {
+                    matches!(
+                        m,
+                        ServerMessage::FeeSummary(_) | ServerMessage::Reject { .. }
+                    )
+                })?
+            else {
+                return Err("fees are only visible to the broker admin".into());
+            };
+            let c = summary.charges;
+            println!("fills            {}", summary.fills);
+            println!("brokerage        {}", format_price(c.commission));
+            println!("exchange fees    {}", format_signed(c.exchange_fee));
+            println!("transaction tax  {}", format_price(c.transaction_tax));
+            println!("stamp duty       {}", format_price(c.stamp_duty));
+            println!("regulatory fee   {}", format_price(c.regulatory_fee));
+            println!("GST              {}", format_price(c.gst));
+            println!("total charged    {}", format_signed(c.total()));
+        }
         ["accounts"] => {
             for a in accounts(client)? {
                 println!(
@@ -306,7 +329,14 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             let first_wait = Duration::from_secs(5);
             let mut wait = first_wait;
             loop {
-                let r = match client.wait_for(wait, |m| matches!(m, ServerMessage::Execution(r) if r.client_order_id == client_order_id)) {
+                let r = match client.wait_for(wait, |m| {
+                    matches!(m, ServerMessage::ContractNote(_))
+                        || matches!(m, ServerMessage::Execution(r) if r.client_order_id == client_order_id)
+                }) {
+                    Ok(ServerMessage::ContractNote(note)) => {
+                        print_note(&note);
+                        continue;
+                    }
                     Ok(ServerMessage::Execution(r)) => r,
                     Err(ClientError::Timeout) if wait < first_wait => {
                         println!("order is resting in the book");
@@ -371,6 +401,30 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
         _ => usage()?,
     }
     Ok(())
+}
+
+fn format_signed(amount: i64) -> String {
+    let text = format_price(amount.unsigned_abs());
+    if amount < 0 { format!("-{text}") } else { text }
+}
+
+fn print_note(note: &ome_protocol::ContractNote) {
+    let c = &note.charges;
+    println!(
+        "contract note: {} {} {} @ {} | brokerage {} exchange {} tax {} stamp {} reg {} GST {} | total {} | net {}",
+        note.side.label(),
+        note.qty,
+        note.symbol,
+        format_price(note.price),
+        format_price(c.commission),
+        format_signed(c.exchange_fee),
+        format_price(c.transaction_tax),
+        format_price(c.stamp_duty),
+        format_price(c.regulatory_fee),
+        format_price(c.gst),
+        format_signed(c.total()),
+        format_signed(note.net_amount)
+    );
 }
 
 fn print_instruments(client: &mut Client) -> Result<()> {

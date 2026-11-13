@@ -1,3 +1,4 @@
+use crate::fees::FeeEngine;
 use crate::ledger::Ledger;
 use crate::market::MarketCache;
 use crate::profile::Profile;
@@ -9,8 +10,8 @@ use ome_core::types::{
 };
 use ome_net::auth::SecretHash;
 use ome_protocol::{
-    AccountInfo, AccountSnapshot, Allocation, Asset, ExecutionReport, MemberMessage, OrderStatus,
-    Position, Role, ServerMessage,
+    AccountInfo, AccountSnapshot, Allocation, Asset, Charges, ContractNote, ExecutionReport,
+    FeeSummary, MemberMessage, OrderStatus, Position, Role, ServerMessage,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -39,8 +40,12 @@ pub enum Fact {
         tif: TimeInForce,
         qty: Qty,
         reserved: u64,
+        fee_reserve: u64,
     },
-    ExchangeReport(ExecutionReport),
+    ExchangeReport {
+        report: ExecutionReport,
+        charges: Charges,
+    },
     Allocated(Allocation),
     OrderAbandoned {
         order_ref: u64,
@@ -67,11 +72,15 @@ struct OrderMeta {
     qty: Qty,
     filled: Qty,
     reserved: u64,
+    fee_reserve: u64,
+    commission_paid: u64,
     exchange_id: Option<OrderId>,
 }
 
 pub struct Broker {
     profile: Profile,
+    fees: FeeEngine,
+    fee_totals: FeeSummary,
     ledger: Ledger,
     orders: BTreeMap<u64, OrderMeta>,
     by_exchange: HashMap<OrderId, u64>,
@@ -84,6 +93,8 @@ impl Broker {
     pub fn new(profile: Profile) -> Self {
         Self {
             profile,
+            fees: FeeEngine::default(),
+            fee_totals: FeeSummary::default(),
             ledger: Ledger::default(),
             orders: BTreeMap::new(),
             by_exchange: HashMap::new(),
@@ -99,6 +110,10 @@ impl Broker {
 
     pub fn ledger(&self) -> &Ledger {
         &self.ledger
+    }
+
+    pub fn fee_summary(&self) -> FeeSummary {
+        self.fee_totals
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -223,9 +238,11 @@ impl Broker {
             (OrderKind::Market, Side::Buy) => (high, TimeInForce::Ioc),
             (OrderKind::Market, Side::Sell) => (low, TimeInForce::Ioc),
         };
+        let fee_reserve = self.fees.reserve(holder.role, side, price, qty);
         let reserved = match side {
             Side::Buy => {
-                let needed = price.saturating_mul(qty);
+                let notional = price.saturating_mul(qty);
+                let needed = notional.saturating_add(fee_reserve);
                 if holder.cash.available < needed {
                     return Err(reject(format!(
                         "insufficient cash: need {}, available {}",
@@ -233,7 +250,7 @@ impl Broker {
                         ome_core::price::format_price(holder.cash.available)
                     )));
                 }
-                needed
+                notional
             }
             Side::Sell => {
                 let available = holder.position(symbol).available;
@@ -255,6 +272,7 @@ impl Broker {
             tif,
             qty,
             reserved,
+            fee_reserve,
         })
     }
 
@@ -316,9 +334,13 @@ impl Broker {
                 tif,
                 qty,
                 reserved,
+                fee_reserve,
             } => {
                 let reserved_ok = match side {
-                    Side::Buy => self.ledger.reserve_cash(*account, *reserved).is_ok(),
+                    Side::Buy => self
+                        .ledger
+                        .reserve_cash(*account, reserved + fee_reserve)
+                        .is_ok(),
                     Side::Sell => self.ledger.reserve_shares(*account, *symbol, *qty).is_ok(),
                 };
                 self.next_order_ref = self.next_order_ref.max(order_ref + 1);
@@ -336,6 +358,8 @@ impl Broker {
                         qty: *qty,
                         filled: 0,
                         reserved: *reserved,
+                        fee_reserve: *fee_reserve,
+                        commission_paid: 0,
                         exchange_id: None,
                     },
                 );
@@ -352,9 +376,9 @@ impl Broker {
                     }),
                 ]
             }
-            Fact::ExchangeReport(report) => {
+            Fact::ExchangeReport { report, charges } => {
                 self.last_seq = self.last_seq.max(report.seq);
-                self.apply_report(report)
+                self.apply_report(report, charges)
             }
             Fact::Allocated(allocation) => {
                 self.last_seq = self.last_seq.max(allocation.seq);
@@ -379,8 +403,7 @@ impl Broker {
                     0,
                     &meta,
                     OrderStatus::Rejected,
-                    0,
-                    0,
+                    (0, 0, 0),
                     0,
                     "order lost while the exchange link was down",
                 );
@@ -395,7 +418,35 @@ impl Broker {
         }
     }
 
-    fn apply_report(&mut self, report: &ExecutionReport) -> Vec<Effect> {
+    fn order_ref_of(&self, report: &ExecutionReport) -> Option<u64> {
+        if report.client_order_id != 0 {
+            Some(report.client_order_id)
+        } else {
+            self.by_exchange.get(&report.order_id).copied()
+        }
+    }
+
+    pub fn charges_for(&self, report: &ExecutionReport) -> Charges {
+        if report.last_qty == 0 {
+            return Charges::default();
+        }
+        let Some(meta) = self.order_ref_of(report).and_then(|r| self.orders.get(&r)) else {
+            return Charges::default();
+        };
+        let Some(holder) = self.ledger.get(meta.account) else {
+            return Charges::default();
+        };
+        self.fees.charges(
+            holder.role,
+            meta.side,
+            report.last_price,
+            report.last_qty,
+            report.fees,
+            meta.commission_paid,
+        )
+    }
+
+    fn apply_report(&mut self, report: &ExecutionReport, charges: &Charges) -> Vec<Effect> {
         let order_ref = if report.client_order_id != 0 {
             report.client_order_id
         } else if let Some(r) = self.by_exchange.get(&report.order_id) {
@@ -423,6 +474,8 @@ impl Broker {
                     qty: report.qty,
                     filled: 0,
                     reserved: report.qty,
+                    fee_reserve: 0,
+                    commission_paid: 0,
                     exchange_id: None,
                 },
             );
@@ -436,29 +489,59 @@ impl Broker {
             self.by_exchange.insert(report.order_id, order_ref);
         }
 
+        let mut effects = Vec::new();
         if report.last_qty > 0 {
             let qty = report.last_qty;
-            let cost = report.last_price * qty;
+            let cost = (report.last_price * qty) as i64;
+            let remaining = meta.qty - meta.filled;
             meta.filled += qty;
-            match meta.side {
+            meta.commission_paid += charges.commission;
+            let net_amount = match meta.side {
                 Side::Buy => {
                     let consumed = (meta.price * qty).min(meta.reserved);
+                    let fee_part = if remaining == 0 {
+                        meta.fee_reserve
+                    } else {
+                        (meta.fee_reserve as u128 * qty.min(remaining) as u128 / remaining as u128)
+                            as u64
+                    };
                     meta.reserved -= consumed;
+                    meta.fee_reserve -= fee_part;
+                    let paid = cost + charges.total();
                     self.ledger.settle_buy(
                         meta.account,
                         meta.symbol,
-                        consumed,
-                        cost.min(consumed),
+                        consumed + fee_part,
+                        paid,
                         qty,
                     );
+                    -paid
                 }
                 Side::Sell => {
                     let consumed = qty.min(meta.reserved);
                     meta.reserved -= consumed;
+                    let proceeds = cost - charges.total();
                     self.ledger
-                        .settle_sell(meta.account, meta.symbol, consumed, cost);
+                        .settle_sell(meta.account, meta.symbol, consumed, proceeds);
+                    proceeds
                 }
-            }
+            };
+            self.fee_totals.charges.add(charges);
+            self.fee_totals.fills += 1;
+            effects.push(Effect::ToAccount {
+                account: meta.account,
+                message: ServerMessage::ContractNote(ContractNote {
+                    account: meta.account,
+                    order_id: report.order_id,
+                    symbol: meta.symbol,
+                    side: meta.side,
+                    qty,
+                    price: report.last_price,
+                    charges: *charges,
+                    net_amount,
+                    timestamp: report.timestamp,
+                }),
+            });
         }
 
         let account = meta.account;
@@ -466,8 +549,7 @@ impl Broker {
             report.order_id,
             meta,
             report.status,
-            report.last_price,
-            report.last_qty,
+            (report.last_price, report.last_qty, charges.total()),
             report.timestamp,
             &report.reason,
         );
@@ -479,18 +561,19 @@ impl Broker {
                 self.by_exchange.remove(&id);
             }
         }
-        vec![
-            Effect::AccountChanged(account),
-            Effect::ToAccount {
-                account,
-                message: ServerMessage::Execution(client),
-            },
-        ]
+        effects.push(Effect::AccountChanged(account));
+        effects.push(Effect::ToAccount {
+            account,
+            message: ServerMessage::Execution(client),
+        });
+        effects
     }
 
     fn release(&mut self, meta: &OrderMeta) {
         match meta.side {
-            Side::Buy => self.ledger.release_cash(meta.account, meta.reserved),
+            Side::Buy => self
+                .ledger
+                .release_cash(meta.account, meta.reserved + meta.fee_reserve),
             Side::Sell => self
                 .ledger
                 .release_shares(meta.account, meta.symbol, meta.reserved),
@@ -543,7 +626,7 @@ impl Broker {
                     OrderStatus::New
                 };
                 m.exchange_id
-                    .map(|id| client_report(id, m, status, 0, 0, now, ""))
+                    .map(|id| client_report(id, m, status, (0, 0, 0), now, ""))
             })
             .collect()
     }
@@ -553,8 +636,7 @@ fn client_report(
     order_id: OrderId,
     meta: &OrderMeta,
     status: OrderStatus,
-    last_price: Price,
-    last_qty: Qty,
+    last: (Price, Qty, i64),
     timestamp: Timestamp,
     reason: &str,
 ) -> ExecutionReport {
@@ -574,9 +656,9 @@ fn client_report(
         } else {
             0
         },
-        last_price,
-        last_qty,
-        fees: 0,
+        last_price: last.0,
+        last_qty: last.1,
+        fees: last.2,
         timestamp,
         reason: reason.to_string(),
     }
@@ -631,8 +713,8 @@ pub mod tests {
         filled: Qty,
         qty: Qty,
         seq: u64,
-    ) -> Fact {
-        Fact::ExchangeReport(ExecutionReport {
+    ) -> ExecutionReport {
+        ExecutionReport {
             seq,
             order_id,
             client_order_id: order_ref,
@@ -649,7 +731,12 @@ pub mod tests {
             fees: 0,
             timestamp: 1,
             reason: String::new(),
-        })
+        }
+    }
+
+    pub fn deliver(broker: &mut Broker, report: ExecutionReport) -> Vec<Effect> {
+        let charges = broker.charges_for(&report);
+        broker.apply(&Fact::ExchangeReport { report, charges })
     }
 
     #[test]
@@ -687,7 +774,7 @@ pub mod tests {
 
         assert_eq!(
             broker.ledger().get(alice).unwrap().cash.reserved,
-            27_50 * 10
+            27_50 * 10 + FeeEngine::default().reserve(Role::Retail, Side::Buy, 27_50, 10)
         );
         assert!(effects.iter().any(|e| matches!(
             e,
@@ -718,31 +805,31 @@ pub mod tests {
             )
             .unwrap();
         broker.apply(&fact);
-        broker.apply(&exchange_report(
-            900,
-            1,
-            alice,
-            Side::Buy,
-            OrderStatus::New,
-            (0, 0),
-            0,
-            10,
-            1,
-        ));
-        let effects = broker.apply(&exchange_report(
-            900,
-            1,
-            alice,
-            Side::Buy,
-            OrderStatus::Filled,
-            (25_00, 10),
-            10,
-            10,
-            2,
-        ));
+        deliver(
+            &mut broker,
+            exchange_report(900, 1, alice, Side::Buy, OrderStatus::New, (0, 0), 0, 10, 1),
+        );
+        let effects = deliver(
+            &mut broker,
+            exchange_report(
+                900,
+                1,
+                alice,
+                Side::Buy,
+                OrderStatus::Filled,
+                (25_00, 10),
+                10,
+                10,
+                2,
+            ),
+        );
 
         let a = broker.ledger().get(alice).unwrap();
-        assert_eq!(a.cash.available, 10_000_00 - 250_00);
+        let charges = FeeEngine::default().charges(Role::Retail, Side::Buy, 25_00, 10, 0, 0);
+        assert_eq!(
+            a.cash.available as i64,
+            10_000_00 - 250_00 - charges.total()
+        );
         assert_eq!(a.cash.reserved, 0);
         assert_eq!(a.position(sym()).available, 10);
         assert!(effects.iter().any(|e| matches!(e, Effect::ToAccount { message: ServerMessage::Execution(r), .. } if r.client_order_id == 5 && r.order_id == 900)));
@@ -821,17 +908,20 @@ pub mod tests {
             account: issuer,
             shares: 100,
         }));
-        broker.apply(&exchange_report(
-            5,
-            0,
-            issuer,
-            Side::Sell,
-            OrderStatus::New,
-            (0, 0),
-            0,
-            100,
-            2,
-        ));
+        deliver(
+            &mut broker,
+            exchange_report(
+                5,
+                0,
+                issuer,
+                Side::Sell,
+                OrderStatus::New,
+                (0, 0),
+                0,
+                100,
+                2,
+            ),
+        );
         assert_eq!(
             broker
                 .ledger()
@@ -842,19 +932,24 @@ pub mod tests {
             100
         );
 
-        broker.apply(&exchange_report(
-            5,
-            0,
-            issuer,
-            Side::Sell,
-            OrderStatus::PartiallyFilled,
-            (25_00, 40),
-            40,
-            100,
-            3,
-        ));
+        deliver(
+            &mut broker,
+            exchange_report(
+                5,
+                0,
+                issuer,
+                Side::Sell,
+                OrderStatus::PartiallyFilled,
+                (25_00, 40),
+                40,
+                100,
+                3,
+            ),
+        );
         let a = broker.ledger().get(issuer).unwrap();
-        assert_eq!(a.cash.available, 1_000_00);
+        let charges = FeeEngine::default().charges(Role::Issuer, Side::Sell, 25_00, 40, 0, 0);
+        assert_eq!(charges.commission, 20_00);
+        assert_eq!(a.cash.available as i64, 1_000_00 - charges.total());
         assert_eq!(a.position(sym()).reserved, 60);
 
         broker.apply(&Fact::Allocated(Allocation {
@@ -914,17 +1009,10 @@ pub mod tests {
             )
             .unwrap();
         broker.apply(&fact);
-        broker.apply(&exchange_report(
-            900,
-            1,
-            alice,
-            Side::Buy,
-            OrderStatus::New,
-            (0, 0),
-            0,
-            10,
-            1,
-        ));
+        deliver(
+            &mut broker,
+            exchange_report(900, 1, alice, Side::Buy, OrderStatus::New, (0, 0), 0, 10, 1),
+        );
 
         assert!(
             broker
@@ -936,18 +1024,173 @@ pub mod tests {
             broker.decide_cancel(alice, 900),
             Ok(MemberMessage::Cancel { order_id: 900 })
         );
-        broker.apply(&exchange_report(
-            900,
+        deliver(
+            &mut broker,
+            exchange_report(
+                900,
+                1,
+                alice,
+                Side::Buy,
+                OrderStatus::Cancelled,
+                (0, 0),
+                0,
+                10,
+                2,
+            ),
+        );
+        assert_eq!(broker.ledger().get(alice).unwrap().cash.reserved, 0);
+        assert!(broker.decide_cancel(alice, 900).is_err());
+    }
+
+    #[test]
+    fn fills_produce_contract_notes_and_fee_totals_balance_the_books() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = open(&mut broker, "alice", Role::Retail, 10_000_00);
+        let bob = open(&mut broker, "bob", Role::Retail, 0);
+        broker.apply(&Fact::BalanceSet {
+            account: bob,
+            asset: Asset::Shares(sym()),
+            amount: 50,
+        });
+        let start_cash: u64 = 10_000_00;
+
+        let buy = broker
+            .decide_order(
+                alice,
+                1,
+                sym(),
+                Side::Buy,
+                OrderKind::Limit(25_50),
+                20,
+                &market(),
+                0,
+            )
+            .unwrap();
+        broker.apply(&buy);
+        let sell = broker
+            .decide_order(
+                bob,
+                2,
+                sym(),
+                Side::Sell,
+                OrderKind::Limit(25_00),
+                20,
+                &market(),
+                0,
+            )
+            .unwrap();
+        broker.apply(&sell);
+        deliver(
+            &mut broker,
+            exchange_report(70, 2, bob, Side::Sell, OrderStatus::New, (0, 0), 0, 20, 1),
+        );
+        let mut taker = exchange_report(
+            71,
             1,
             alice,
             Side::Buy,
-            OrderStatus::Cancelled,
-            (0, 0),
-            0,
-            10,
+            OrderStatus::Filled,
+            (25_00, 20),
+            20,
+            20,
             2,
-        ));
+        );
+        taker.fees = 6;
+        let effects = deliver(&mut broker, taker);
+        let mut maker = exchange_report(
+            70,
+            2,
+            bob,
+            Side::Sell,
+            OrderStatus::Filled,
+            (25_00, 20),
+            20,
+            20,
+            3,
+        );
+        maker.fees = -3;
+        deliver(&mut broker, maker);
+
+        let note = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::ToAccount {
+                    message: ServerMessage::ContractNote(n),
+                    ..
+                } => Some(n.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(note.qty, 20);
+        assert_eq!(note.charges.exchange_fee, 6);
+        assert_eq!(note.net_amount, -(500_00 + note.charges.total()));
+
+        let totals = broker.fee_summary();
+        assert_eq!(totals.fills, 2);
+        let cash: i64 = [alice, bob]
+            .iter()
+            .map(|id| broker.ledger().get(*id).unwrap().cash.total() as i64)
+            .sum();
+        assert_eq!(cash + totals.charges.total(), start_cash as i64);
         assert_eq!(broker.ledger().get(alice).unwrap().cash.reserved, 0);
-        assert!(broker.decide_cancel(alice, 900).is_err());
+    }
+
+    #[test]
+    fn commission_cap_applies_across_partial_fills_of_one_order() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = open(&mut broker, "alice", Role::Retail, 1_000_000_00);
+        let fact = broker
+            .decide_order(
+                alice,
+                1,
+                sym(),
+                Side::Buy,
+                OrderKind::Limit(25_00),
+                1_000,
+                &market(),
+                0,
+            )
+            .unwrap();
+        broker.apply(&fact);
+        deliver(
+            &mut broker,
+            exchange_report(
+                80,
+                1,
+                alice,
+                Side::Buy,
+                OrderStatus::PartiallyFilled,
+                (25_00, 600),
+                600,
+                1_000,
+                1,
+            ),
+        );
+        deliver(
+            &mut broker,
+            exchange_report(
+                80,
+                1,
+                alice,
+                Side::Buy,
+                OrderStatus::Filled,
+                (25_00, 400),
+                1_000,
+                1_000,
+                2,
+            ),
+        );
+        assert_eq!(broker.fee_summary().charges.commission, 7_50);
+        let big = broker.decide_order(
+            alice,
+            2,
+            sym(),
+            Side::Buy,
+            OrderKind::Limit(27_00),
+            1_000,
+            &market(),
+            0,
+        );
+        assert!(big.is_ok());
     }
 }

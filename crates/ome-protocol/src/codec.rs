@@ -61,6 +61,11 @@ impl Encoder {
         self
     }
 
+    pub fn i64(&mut self, v: i64) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
     pub fn u64(&mut self, v: u64) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());
         self
@@ -187,6 +192,10 @@ impl<'a> Decoder<'a> {
         Ok(u32::from_le_bytes(
             b.try_into().map_err(|_| DecodeError::Truncated)?,
         ))
+    }
+
+    pub fn i64(&mut self) -> Result<i64, DecodeError> {
+        Ok(self.u64()? as i64)
     }
 
     pub fn u64(&mut self) -> Result<u64, DecodeError> {

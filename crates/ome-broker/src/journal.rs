@@ -2,8 +2,8 @@ use crate::broker::Fact;
 use ome_core::types::Timestamp;
 use ome_protocol::Asset;
 use ome_protocol::{
-    DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, role_from, side_from_u8,
-    side_to_u8, tif_from_u8, tif_to_u8,
+    DecodeError, Decoder, Encoder, ServerMessage, asset_symbol, get_charges, put_charges,
+    role_from, side_from_u8, side_to_u8, tif_from_u8, tif_to_u8,
 };
 use ome_store::Entry;
 
@@ -28,7 +28,7 @@ impl Entry for Record {
             Fact::AccountOpened { .. } => template::ACCOUNT_OPENED,
             Fact::BalanceSet { .. } => template::BALANCE_SET,
             Fact::OrderAccepted { .. } => template::ORDER_ACCEPTED,
-            Fact::ExchangeReport(_) => template::EXCHANGE_REPORT,
+            Fact::ExchangeReport { .. } => template::EXCHANGE_REPORT,
             Fact::Allocated(_) => template::ALLOCATED,
             Fact::OrderAbandoned { .. } => template::ORDER_ABANDONED,
         };
@@ -67,6 +67,7 @@ impl Entry for Record {
                 tif,
                 qty,
                 reserved,
+                fee_reserve,
             } => {
                 e.u64(*order_ref)
                     .u64(*account)
@@ -77,9 +78,11 @@ impl Entry for Record {
                     .u8(tif_to_u8(*tif))
                     .u64(*qty)
                     .u64(*reserved)
+                    .u64(*fee_reserve)
                     .end_block();
             }
-            Fact::ExchangeReport(report) => {
+            Fact::ExchangeReport { report, charges } => {
+                put_charges(&mut e, charges);
                 e.end_block()
                     .var_bytes(&ServerMessage::Execution(report.clone()).encode());
             }
@@ -131,6 +134,7 @@ impl Entry for Record {
                 let tif = tif_from_u8(d.u8()?)?;
                 let qty = d.u64()?;
                 let reserved = d.u64()?;
+                let fee_reserve = d.u64()?;
                 d.end_block()?;
                 Fact::OrderAccepted {
                     order_ref,
@@ -142,12 +146,14 @@ impl Entry for Record {
                     tif,
                     qty,
                     reserved,
+                    fee_reserve,
                 }
             }
             template::EXCHANGE_REPORT => {
+                let charges = get_charges(&mut d)?;
                 d.end_block()?;
                 match ServerMessage::decode(d.var_bytes()?)? {
-                    ServerMessage::Execution(report) => Fact::ExchangeReport(report),
+                    ServerMessage::Execution(report) => Fact::ExchangeReport { report, charges },
                     _ => return Err(DecodeError::Invalid("embedded execution report")),
                 }
             }
@@ -180,8 +186,13 @@ mod tests {
     use ome_protocol::{Allocation, ExecutionReport, OrderStatus, Role};
 
     fn facts() -> Vec<Fact> {
-        let report = |seq, status, last: (u64, u64), filled| {
-            Fact::ExchangeReport(ExecutionReport {
+        let report = |seq, status, last: (u64, u64), filled| Fact::ExchangeReport {
+            charges: ome_protocol::Charges {
+                commission: last.1,
+                exchange_fee: -1,
+                ..Default::default()
+            },
+            report: ExecutionReport {
                 seq,
                 order_id: 50,
                 client_order_id: 1,
@@ -198,7 +209,7 @@ mod tests {
                 fees: 0,
                 timestamp: 3,
                 reason: String::new(),
-            })
+            },
         };
         vec![
             Fact::AccountOpened {
@@ -235,6 +246,7 @@ mod tests {
                 tif: TimeInForce::Gtc,
                 qty: 10,
                 reserved: 250_00,
+                fee_reserve: 9,
             },
             report(2, OrderStatus::New, (0, 0), 0),
             report(3, OrderStatus::PartiallyFilled, (24_90, 4), 4),
@@ -248,6 +260,7 @@ mod tests {
                 tif: TimeInForce::Ioc,
                 qty: 5,
                 reserved: 5,
+                fee_reserve: 0,
             },
             Fact::OrderAbandoned { order_ref: 2 },
         ]
@@ -277,6 +290,6 @@ mod tests {
         assert_eq!(live.account_snapshot(2), replayed.account_snapshot(2));
         assert_eq!(live.last_seq(), 3);
         let fund = live.account_snapshot(2).unwrap();
-        assert_eq!(fund.cash.reserved, 25_00 * 6);
+        assert_eq!(fund.cash.reserved, 25_00 * 6 + 6);
     }
 }

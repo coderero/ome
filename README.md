@@ -100,6 +100,40 @@ SBE (schema 7, version 2) with SOFH framing on every connection. All integers ar
 
 Client and member templates never overlap; sending one family's message to the other service fails to decode (tested).
 
+## Fees and Taxes
+
+Every fill produces a **contract note** with an itemised breakdown, sent to the account that traded.
+
+**Exchange fees** (per share, charged to members; a negative fee is a rebate):
+
+| Member | Maker (rests in the book) | Taker (removes liquidity) |
+|---|---|---|
+| broker | −0.15¢ rebate | 0.30¢ |
+| liquidity provider | −0.25¢ rebate | 0.30¢ |
+
+**Broker charges** (on the fill's notional; providers pass exchange fees through to the client):
+
+| Charge | Applies to | Rate |
+|---|---|---|
+| brokerage | retail | 0.03%, capped at 20.00 per order (across partial fills) |
+| | quant, prop | 0.005% |
+| | HFT | 0.0005% |
+| | issuer (IPO underwriting) | 2% |
+| | LP desks | none |
+| transaction tax | sells | 0.1% |
+| stamp duty | buys | 0.015% |
+| regulatory fee | all fills | 0.0001% |
+| GST | brokerage + regulatory fee + exchange fee (rebates are not taxed) | 18% |
+
+Buy orders reserve the notional **plus an upper bound of their charges**, so a client can never end up unable to pay for a fill; the unused part is released when the order completes. The charges are computed when the exchange report arrives and stored in the broker's fact journal, so a later change to the fee schedule never rewrites past balances on replay.
+
+```bash
+ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw buy ACME mkt 10
+# contract note: buy 10 ACME @ 24.88 | brokerage 0.07 exchange 0.03 tax 0.00 stamp 0.04 reg 0.00 GST 0.02 | total 0.16 | net -248.96
+ome broker --addr 127.0.0.1:7101 fees        # broker admin: revenue and taxes collected
+ome exchange members                         # net exchange fees per member
+```
+
 ## Reliability
 
 - **Exchange**: a write-ahead journal of commands. Replay is deterministic and rebuilds books, halts, order ids **and each member's sequenced feed**.
@@ -131,14 +165,13 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 92 tests
+cargo test --workspace     # 102 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider.
 
 ## Roadmap
 
-- **1b** brokerage, taxes and exchange maker/taker fees, with contract notes
 - **1c** clearing house: T+1 netting and settlement between members
 - **1d** market sessions set by exchange operations: pre-open auction, open, close
 - **1e** PostgreSQL (accounts, trades, settlements) and Redis (market data)

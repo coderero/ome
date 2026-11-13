@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod fees;
 pub mod gateway;
 pub mod journal;
 pub mod ledger;

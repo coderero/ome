@@ -205,20 +205,23 @@ impl Ledger {
         id: AccountId,
         symbol: Symbol,
         consumed: u64,
-        cost: u64,
+        paid: i64,
         qty: Qty,
     ) {
         if let Ok(account) = self.account_mut(id) {
-            account.cash.reserved -= consumed;
-            account.cash.available += consumed - cost;
+            account.cash.reserved -= consumed.min(account.cash.reserved);
+            let available = account.cash.available as i128 + consumed as i128 - paid as i128;
+            account.cash.available = available.max(0) as u64;
             account.positions.entry(symbol).or_default().available += qty;
         }
     }
 
-    pub fn settle_sell(&mut self, id: AccountId, symbol: Symbol, qty: Qty, proceeds: u64) {
+    pub fn settle_sell(&mut self, id: AccountId, symbol: Symbol, qty: Qty, proceeds: i64) {
         if let Ok(account) = self.account_mut(id) {
-            account.positions.entry(symbol).or_default().reserved -= qty;
-            account.cash.available += proceeds;
+            let position = account.positions.entry(symbol).or_default();
+            position.reserved -= qty.min(position.reserved);
+            let available = account.cash.available as i128 + proceeds as i128;
+            account.cash.available = available.max(0) as u64;
         }
     }
 
