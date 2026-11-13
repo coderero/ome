@@ -4,7 +4,7 @@ mod strategy;
 use ome_client::{Client, ClientError, DEFAULT_BROKER_ADDR};
 use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
-use ome_protocol::ClientMessage;
+use ome_protocol::{ClientMessage, QuoteSide};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use state::BotState;
@@ -162,9 +162,23 @@ fn run(
                     state.pending.insert(id);
                 }
                 Action::Cancel(order_id) => client.send(&ClientMessage::Cancel { order_id })?,
-                Action::CancelAll => client.send(&ClientMessage::CancelAll {
-                    symbol: Some(spec.symbol),
-                })?,
+                Action::Quote { bid, ask } => {
+                    let side = |q: Option<(u64, u64)>| {
+                        q.map_or(QuoteSide::default(), |(price, qty)| QuoteSide {
+                            price,
+                            qty,
+                        })
+                    };
+                    client.send(&ClientMessage::Quote {
+                        symbol: spec.symbol,
+                        bid: side(bid),
+                        ask: side(ask),
+                    })?
+                }
+                Action::SetMmp { window_ms, max_qty } => {
+                    state.mmp_tripped = false;
+                    client.send(&ClientMessage::SetMmp { window_ms, max_qty })?
+                }
             }
         }
 

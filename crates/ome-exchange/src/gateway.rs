@@ -19,11 +19,30 @@ use std::sync::Arc;
 const HEARTBEAT_MS: Timestamp = 1_000;
 const CANDLE_BACKFILL: usize = 300;
 const TRADE_BACKFILL: usize = 60;
+const THROTTLE_PER_SECOND: f64 = 5_000.0;
+const THROTTLE_BURST: f64 = 10_000.0;
 
 struct Session {
     outbox: Box<dyn Outbox>,
     login: Option<(MemberId, MemberKind)>,
     subscriptions: BTreeSet<Symbol>,
+    tokens: f64,
+    refilled_at: Timestamp,
+    throttled: u64,
+}
+
+impl Session {
+    fn allow(&mut self, now: Timestamp) -> bool {
+        let elapsed = now.saturating_sub(self.refilled_at) as f64 / 1_000.0;
+        self.tokens = (self.tokens + elapsed * THROTTLE_PER_SECOND).min(THROTTLE_BURST);
+        self.refilled_at = now;
+        if self.tokens < 1.0 {
+            self.throttled += 1;
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
 }
 
 pub struct Gateway {
@@ -83,24 +102,60 @@ impl Gateway {
                 outbox,
                 login: None,
                 subscriptions: BTreeSet::new(),
+                tokens: THROTTLE_BURST,
+                refilled_at: self.clock,
+                throttled: 0,
             },
         );
     }
 
-    pub fn disconnect(&mut self, id: SessionId) {
-        if let Some(session) = self.sessions.remove(&id)
-            && let Some((member, _)) = session.login
-            && let Some(m) = self.exchange.members().get(member)
-        {
+    pub fn disconnect(&mut self, id: SessionId, now: Timestamp) {
+        let Some(session) = self.sessions.remove(&id) else {
+            return;
+        };
+        let Some((member, _)) = session.login else {
+            return;
+        };
+        if let Some(m) = self.exchange.members().get(member) {
             log(&format!("session {id} ({}) disconnected", m.name));
+        }
+        let still_connected = self
+            .sessions
+            .values()
+            .any(|s| s.login.is_some_and(|(m, _)| m == member));
+        if !still_connected && self.exchange.cancels_on_disconnect(member) {
+            log(&format!(
+                "member {member} disconnected: cancelling its orders (cancel-on-disconnect)"
+            ));
+            let now = self.advance(now);
+            self.run(
+                None,
+                &Command::CancelAll {
+                    member,
+                    account: None,
+                    symbol: None,
+                },
+                now,
+            );
         }
     }
 
     pub fn handle(&mut self, id: SessionId, bytes: &[u8], now: Timestamp) {
         let now = self.advance(now);
-        let Some(session) = self.sessions.get(&id) else {
+        let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        if !session.allow(now) {
+            if session.throttled % 1_000 == 1 {
+                log(&format!(
+                    "session {id} throttled ({} messages dropped)",
+                    session.throttled
+                ));
+            }
+            let ref_template = Decoder::peek_template(bytes).unwrap_or(0);
+            return self.reject(id, ref_template, "throttled: message rate limit exceeded");
+        }
+        let session = &self.sessions[&id];
         let message = match MemberMessage::decode(bytes) {
             Ok(message) => message,
             Err(e) => {
@@ -289,6 +344,38 @@ impl Gateway {
                 qty,
             },
             MemberMessage::Cancel { order_id } if trader => Command::Cancel { member, order_id },
+            MemberMessage::Quote {
+                account,
+                symbol,
+                bid_ref,
+                bid,
+                ask_ref,
+                ask,
+            } if trader => Command::Quote {
+                member,
+                account,
+                symbol,
+                bid_ref,
+                bid,
+                ask_ref,
+                ask,
+            },
+            MemberMessage::SetMmp {
+                account,
+                window_ms,
+                max_qty,
+            } if trader => Command::SetMmp {
+                member,
+                account,
+                window_ms,
+                max_qty,
+            },
+            MemberMessage::SetMemberStatus { member, enabled } if admin => {
+                Command::SetMemberStatus { member, enabled }
+            }
+            MemberMessage::SetCancelOnDisconnect { member, enabled } if admin => {
+                Command::SetCancelOnDisconnect { member, enabled }
+            }
             MemberMessage::CancelAll { account, symbol } if trader => Command::CancelAll {
                 member,
                 account,
@@ -589,6 +676,20 @@ fn describe_admin_action(command: &Command, events: &[Event]) -> Option<String> 
         Command::Halt { symbol, .. } => format!("{symbol} halted"),
         Command::Resume { symbol } => format!("{symbol} resumed"),
         Command::SetPhase { phase } => format!("market moved to {}", phase.label()),
+        Command::SetMemberStatus {
+            member,
+            enabled: false,
+        } => {
+            format!("member {member} suspended: orders cancelled, new orders rejected")
+        }
+        Command::SetMemberStatus {
+            member,
+            enabled: true,
+        } => format!("member {member} reinstated"),
+        Command::SetCancelOnDisconnect { member, enabled } => format!(
+            "member {member} cancel-on-disconnect {}",
+            if *enabled { "on" } else { "off" }
+        ),
         Command::SetSchedule { schedule: None } => {
             "trading schedule cleared (manual sessions)".to_string()
         }
@@ -855,5 +956,63 @@ mod tests {
         *admin.1.lock().unwrap() = true;
         gw.tick(5_000);
         assert!(gw.sessions.is_empty());
+    }
+
+    #[test]
+    fn cancel_on_disconnect_cancels_orders_when_the_last_session_drops() {
+        let mut gw = gateway();
+        setup(&mut gw);
+        send(
+            &mut gw,
+            1,
+            MemberMessage::SetCancelOnDisconnect {
+                member: 3,
+                enabled: true,
+            },
+        );
+        session(&mut gw, 2, "lp", "pw", 0);
+        session(&mut gw, 3, "lp", "pw", 0);
+        send(
+            &mut gw,
+            2,
+            MemberMessage::NewOrder {
+                member_order_id: 1,
+                account: 7,
+                symbol: sym("ACME"),
+                side: Side::Buy,
+                kind: OrderKind::Limit(9_00),
+                options: OrderOptions::default(),
+                qty: 5,
+            },
+        );
+        gw.disconnect(2, 5);
+        assert_eq!(
+            gw.exchange.member_list(|_| false)[2].open_orders,
+            1,
+            "another session is still connected"
+        );
+        gw.disconnect(3, 6);
+        assert_eq!(gw.exchange.member_list(|_| false)[2].open_orders, 0);
+    }
+
+    #[test]
+    fn floods_are_throttled_before_reaching_the_journal() {
+        let mut gw = gateway();
+        let admin = session(&mut gw, 1, "ops", "root", 0);
+        admin.take();
+        for _ in 0..(THROTTLE_BURST as usize + 50) {
+            gw.handle(1, &MemberMessage::QueryInstruments.encode(), 1);
+        }
+        let throttled = admin
+            .take()
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::Reject { reason, .. } if reason.starts_with("throttled")))
+            .count();
+        assert!(throttled >= 50);
+        gw.handle(1, &MemberMessage::QueryInstruments.encode(), 2_000);
+        assert!(matches!(
+            admin.take().last(),
+            Some(ServerMessage::InstrumentList(_))
+        ));
     }
 }

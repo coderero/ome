@@ -2,8 +2,9 @@ use crate::exchange::Command;
 use crate::session::Schedule;
 use ome_core::types::Timestamp;
 use ome_protocol::{
-    DecodeError, Decoder, Encoder, get_order_kind, get_order_options, member_kind_from, phase_from,
-    put_order_kind, put_order_options, side_from_u8, side_to_u8,
+    DecodeError, Decoder, Encoder, get_order_kind, get_order_options, get_quote_side,
+    member_kind_from, phase_from, put_order_kind, put_order_options, put_quote_side, side_from_u8,
+    side_to_u8,
 };
 use ome_store::Entry;
 
@@ -21,6 +22,10 @@ mod template {
     pub const SET_PHASE: u16 = 210;
     pub const SET_SCHEDULE: u16 = 211;
     pub const EXPIRE_GTD: u16 = 212;
+    pub const SET_MEMBER_STATUS: u16 = 213;
+    pub const SET_CANCEL_ON_DISCONNECT: u16 = 214;
+    pub const QUOTE: u16 = 215;
+    pub const SET_MMP: u16 = 216;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +50,10 @@ impl Entry for Record {
             Command::SetPhase { .. } => template::SET_PHASE,
             Command::SetSchedule { .. } => template::SET_SCHEDULE,
             Command::ExpireGtd { .. } => template::EXPIRE_GTD,
+            Command::SetMemberStatus { .. } => template::SET_MEMBER_STATUS,
+            Command::SetCancelOnDisconnect { .. } => template::SET_CANCEL_ON_DISCONNECT,
+            Command::Quote { .. } => template::QUOTE,
+            Command::SetMmp { .. } => template::SET_MMP,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -114,6 +123,40 @@ impl Entry for Record {
             }
             Command::ExpireGtd { at } => {
                 e.u64(*at).end_block();
+            }
+            Command::SetMemberStatus { member, enabled }
+            | Command::SetCancelOnDisconnect { member, enabled } => {
+                e.u64(*member).u8(*enabled as u8).end_block();
+            }
+            Command::Quote {
+                member,
+                account,
+                symbol,
+                bid_ref,
+                bid,
+                ask_ref,
+                ask,
+            } => {
+                e.u64(*member)
+                    .u64(*account)
+                    .symbol(Some(*symbol))
+                    .u64(*bid_ref);
+                put_quote_side(&mut e, bid);
+                e.u64(*ask_ref);
+                put_quote_side(&mut e, ask);
+                e.end_block();
+            }
+            Command::SetMmp {
+                member,
+                account,
+                window_ms,
+                max_qty,
+            } => {
+                e.u64(*member)
+                    .u64(*account)
+                    .u64(*window_ms)
+                    .u64(*max_qty)
+                    .end_block();
             }
             Command::SetPhase { phase } => {
                 e.u8(*phase as u8).end_block();
@@ -232,6 +275,48 @@ impl Entry for Record {
                 let limit = d.u64()?;
                 d.end_block()?;
                 Command::SetCreditLimit { member, limit }
+            }
+            template::SET_MEMBER_STATUS | template::SET_CANCEL_ON_DISCONNECT => {
+                let member = d.u64()?;
+                let enabled = d.u8()? != 0;
+                d.end_block()?;
+                if d.template_id == template::SET_MEMBER_STATUS {
+                    Command::SetMemberStatus { member, enabled }
+                } else {
+                    Command::SetCancelOnDisconnect { member, enabled }
+                }
+            }
+            template::QUOTE => {
+                let member = d.u64()?;
+                let account = d.u64()?;
+                let symbol = d.symbol()?;
+                let bid_ref = d.u64()?;
+                let bid = get_quote_side(&mut d)?;
+                let ask_ref = d.u64()?;
+                let ask = get_quote_side(&mut d)?;
+                d.end_block()?;
+                Command::Quote {
+                    member,
+                    account,
+                    symbol,
+                    bid_ref,
+                    bid,
+                    ask_ref,
+                    ask,
+                }
+            }
+            template::SET_MMP => {
+                let member = d.u64()?;
+                let account = d.u64()?;
+                let window_ms = d.u64()?;
+                let max_qty = d.u64()?;
+                d.end_block()?;
+                Command::SetMmp {
+                    member,
+                    account,
+                    window_ms,
+                    max_qty,
+                }
             }
             template::EXPIRE_GTD => {
                 let at = d.u64()?;
@@ -362,6 +447,39 @@ mod tests {
         });
         commands.push(Command::SetSchedule { schedule: None });
         commands.push(Command::ExpireGtd { at: 2_000_000 });
+        commands.push(Command::SetMmp {
+            member: 3,
+            account: 2,
+            window_ms: 1_000,
+            max_qty: 5,
+        });
+        commands.push(Command::Quote {
+            member: 3,
+            account: 2,
+            symbol: sym("ACME"),
+            bid_ref: 900,
+            bid: ome_protocol::QuoteSide {
+                price: 24_95,
+                qty: 4,
+            },
+            ask_ref: 901,
+            ask: ome_protocol::QuoteSide {
+                price: 25_05,
+                qty: 4,
+            },
+        });
+        commands.push(Command::SetCancelOnDisconnect {
+            member: 2,
+            enabled: true,
+        });
+        commands.push(Command::SetMemberStatus {
+            member: 3,
+            enabled: false,
+        });
+        commands.push(Command::SetMemberStatus {
+            member: 3,
+            enabled: true,
+        });
         commands.push(Command::OpenCycle { cycle: 1 });
         commands.push(Command::SetCreditLimit {
             member: 2,

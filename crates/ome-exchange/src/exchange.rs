@@ -13,7 +13,8 @@ use ome_net::auth::SecretHash;
 use ome_net::feed::{Feeds, Replay};
 use ome_protocol::{
     Allocation, AuctionInfo, ClearedTrade, ExecutionReport, InstrumentInfo, MarketPhase,
-    MarketStatus, MemberId, MemberInfo, MemberKind, OrderStatus, ServerMessage, TradeEvent,
+    MarketStatus, MemberId, MemberInfo, MemberKind, OrderStatus, QuoteSide, ServerMessage,
+    TradeEvent,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -111,6 +112,36 @@ pub enum Command {
     ExpireGtd {
         at: Timestamp,
     },
+    SetMemberStatus {
+        member: MemberId,
+        enabled: bool,
+    },
+    SetCancelOnDisconnect {
+        member: MemberId,
+        enabled: bool,
+    },
+    Quote {
+        member: MemberId,
+        account: AccountId,
+        symbol: Symbol,
+        bid_ref: u64,
+        bid: QuoteSide,
+        ask_ref: u64,
+        ask: QuoteSide,
+    },
+    SetMmp {
+        member: MemberId,
+        account: AccountId,
+        window_ms: u64,
+        max_qty: Qty,
+    },
+}
+
+struct Mmp {
+    window_ms: u64,
+    max_qty: Qty,
+    fills: std::collections::VecDeque<(Timestamp, Qty)>,
+    tripped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +217,12 @@ pub struct Exchange {
     cycle: u64,
     session: Session,
     gtd: std::collections::BTreeSet<(Timestamp, OrderId)>,
+    suspended: std::collections::BTreeSet<MemberId>,
+    cancel_on_disconnect: std::collections::BTreeSet<MemberId>,
+    quotes: BTreeMap<(MemberId, AccountId, Symbol), [Option<OrderId>; 2]>,
+    quote_owner: HashMap<OrderId, (MemberId, AccountId)>,
+    mmp: HashMap<(MemberId, AccountId), Mmp>,
+    mmp_tripped_now: Vec<(MemberId, AccountId)>,
     risk: RiskEngine,
     next_order_id: OrderId,
     next_trade_id: u64,
@@ -218,6 +255,12 @@ impl Exchange {
             cycle: 0,
             session: Session::default(),
             gtd: std::collections::BTreeSet::new(),
+            suspended: std::collections::BTreeSet::new(),
+            cancel_on_disconnect: std::collections::BTreeSet::new(),
+            quotes: BTreeMap::new(),
+            quote_owner: HashMap::new(),
+            mmp: HashMap::new(),
+            mmp_tripped_now: Vec::new(),
             risk,
             next_order_id: 1,
             next_trade_id: 1,
@@ -309,6 +352,59 @@ impl Exchange {
                 now,
             ),
             Command::ExpireGtd { at } => Ok(self.expire_gtd(*at)),
+            Command::SetMemberStatus { member, enabled } => {
+                self.trading_member(*member)?;
+                if *enabled {
+                    self.suspended.remove(member);
+                    Ok(vec![])
+                } else {
+                    self.suspended.insert(*member);
+                    Ok(self.cancel_all(*member, None, None, now))
+                }
+            }
+            Command::SetCancelOnDisconnect { member, enabled } => {
+                self.trading_member(*member)?;
+                if *enabled {
+                    self.cancel_on_disconnect.insert(*member);
+                } else {
+                    self.cancel_on_disconnect.remove(member);
+                }
+                Ok(vec![])
+            }
+            Command::Quote {
+                member,
+                account,
+                symbol,
+                bid_ref,
+                bid,
+                ask_ref,
+                ask,
+            } => self.quote(
+                *member,
+                *account,
+                *symbol,
+                (*bid_ref, *bid),
+                (*ask_ref, *ask),
+                now,
+            ),
+            Command::SetMmp {
+                member,
+                account,
+                window_ms,
+                max_qty,
+            } => {
+                self.trading_member(*member)?;
+                self.mmp.insert(
+                    (*member, *account),
+                    Mmp {
+                        window_ms: *window_ms,
+                        max_qty: *max_qty,
+                        fills: Default::default(),
+                        tripped: false,
+                    },
+                );
+                Ok(vec![])
+            }
             Command::Cancel { member, order_id } => self.cancel(*member, *order_id, now),
             Command::CancelAll {
                 member,
@@ -393,6 +489,181 @@ impl Exchange {
         events
     }
 
+    pub fn cancels_on_disconnect(&self, member: MemberId) -> bool {
+        self.cancel_on_disconnect.contains(&member)
+    }
+
+    fn quote(
+        &mut self,
+        member: MemberId,
+        account: AccountId,
+        symbol: Symbol,
+        bid: (u64, QuoteSide),
+        ask: (u64, QuoteSide),
+        now: Timestamp,
+    ) -> Result<Vec<Event>, ExchangeError> {
+        self.trading_member(member)?;
+        let mut events = Vec::new();
+        if let Some(previous) = self.quotes.remove(&(member, account, symbol)) {
+            for id in previous.into_iter().flatten() {
+                if self.orders.contains_key(&id) {
+                    if let Some(instrument) = self.instruments.get_mut(&symbol) {
+                        instrument.book.cancel(id);
+                    }
+                    events.extend(self.close(id, OrderStatus::Cancelled, now, "quote replaced"));
+                }
+                self.quote_owner.remove(&id);
+            }
+            events.push(Event::BookChanged(symbol));
+        }
+        let tripped = self.mmp.get(&(member, account)).is_some_and(|m| m.tripped);
+        let mut placed = [None, None];
+        for (slot, (side, (member_order_id, quote))) in [(Side::Buy, bid), (Side::Sell, ask)]
+            .into_iter()
+            .enumerate()
+        {
+            if quote.is_empty() {
+                continue;
+            }
+            if tripped {
+                let reason = "market maker protection tripped; reset it to quote again".to_string();
+                events.push(self.rejection(
+                    member,
+                    member_order_id,
+                    account,
+                    symbol,
+                    side,
+                    quote.price,
+                    quote.qty,
+                    now,
+                    reason,
+                ));
+                continue;
+            }
+            let options = OrderOptions {
+                post_only: true,
+                ..OrderOptions::default()
+            };
+            let result = self.new_order(
+                member,
+                member_order_id,
+                account,
+                symbol,
+                side,
+                OrderKind::Limit(quote.price),
+                options,
+                quote.qty,
+                now,
+            )?;
+            placed[slot] = result.iter().find_map(|e| match e {
+                Event::ToMember {
+                    message: ServerMessage::Execution(r),
+                    ..
+                } if r.client_order_id == member_order_id && r.status == OrderStatus::New => {
+                    Some(r.order_id)
+                }
+                _ => None,
+            });
+            events.extend(result);
+        }
+        for id in placed.iter().flatten() {
+            self.quote_owner.insert(*id, (member, account));
+        }
+        if placed.iter().any(Option::is_some) {
+            self.quotes.insert((member, account, symbol), placed);
+        }
+        Ok(events)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rejection(
+        &mut self,
+        member: MemberId,
+        member_order_id: u64,
+        account: AccountId,
+        symbol: Symbol,
+        side: Side,
+        price: Price,
+        qty: Qty,
+        now: Timestamp,
+        reason: String,
+    ) -> Event {
+        let report = ExecutionReport {
+            seq: 0,
+            order_id: 0,
+            client_order_id: member_order_id,
+            account,
+            symbol,
+            side,
+            status: OrderStatus::Rejected,
+            price,
+            qty,
+            filled: 0,
+            leaves: 0,
+            last_price: 0,
+            last_qty: 0,
+            fees: 0,
+            cycle: self.cycle,
+            timestamp: now,
+            reason,
+        };
+        self.publish(member, ServerMessage::Execution(report))
+    }
+
+    fn record_quote_fill(&mut self, order_id: OrderId, qty: Qty, now: Timestamp) {
+        let Some(owner) = self.quote_owner.get(&order_id).copied() else {
+            return;
+        };
+        let Some(mmp) = self.mmp.get_mut(&owner) else {
+            return;
+        };
+        if mmp.tripped {
+            return;
+        }
+        mmp.fills.push_back((now, qty));
+        while mmp
+            .fills
+            .front()
+            .is_some_and(|(at, _)| at + mmp.window_ms < now)
+        {
+            mmp.fills.pop_front();
+        }
+        if mmp.fills.iter().map(|(_, q)| q).sum::<Qty>() > mmp.max_qty {
+            mmp.tripped = true;
+            self.mmp_tripped_now.push(owner);
+        }
+    }
+
+    fn enforce_mmp(&mut self, now: Timestamp, events: &mut Vec<Event>) {
+        for owner in std::mem::take(&mut self.mmp_tripped_now) {
+            let mut ids: Vec<OrderId> = self
+                .quote_owner
+                .iter()
+                .filter(|(_, o)| **o == owner)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            for id in ids {
+                self.quote_owner.remove(&id);
+                let Some(symbol) = self.orders.get(&id).map(|m| m.symbol) else {
+                    continue;
+                };
+                if let Some(instrument) = self.instruments.get_mut(&symbol) {
+                    instrument.book.cancel(id);
+                }
+                events.extend(self.close(
+                    id,
+                    OrderStatus::Cancelled,
+                    now,
+                    "market maker protection triggered",
+                ));
+                events.push(Event::BookChanged(symbol));
+            }
+            self.quotes
+                .retain(|(member, account, _), _| (*member, *account) != owner);
+        }
+    }
+
     fn uncross_all(&mut self, now: Timestamp, events: &mut Vec<Event>) {
         let symbols: Vec<Symbol> = self.instruments.keys().copied().collect();
         for symbol in symbols {
@@ -419,6 +690,7 @@ impl Exchange {
                 ));
             }
             events.push(Event::BookChanged(symbol));
+            self.enforce_mmp(now, events);
             self.check_circuit(symbol, events, now);
         }
     }
@@ -509,6 +781,8 @@ impl Exchange {
                 member_id: m.id,
                 kind: m.kind,
                 connected: connected(m.id),
+                suspended: self.suspended.contains(&m.id),
+                cancel_on_disconnect: self.cancel_on_disconnect.contains(&m.id),
                 open_orders: open.get(&m.id).copied().unwrap_or(0),
                 net_fees: self.member_fees.get(&m.id).copied().unwrap_or(0),
                 credit_limit: self.credit_limits.get(&m.id).copied().unwrap_or(u64::MAX),
@@ -713,6 +987,7 @@ impl Exchange {
     ) -> Result<Vec<Event>, ExchangeError> {
         self.trading_member(member)?;
         let tif = options.tif;
+        let suspended = self.suspended.contains(&member);
         let reject = |this: &mut Self, reason: String| {
             let report = ExecutionReport {
                 seq: 0,
@@ -750,6 +1025,12 @@ impl Exchange {
             report_events
         };
 
+        if suspended {
+            return Ok(reject(
+                self,
+                "member is suspended by the exchange".to_string(),
+            ));
+        }
         if account >> ACCOUNT_BITS != 0 {
             return Ok(reject(
                 self,
@@ -947,6 +1228,7 @@ impl Exchange {
             ));
         }
         events.push(Event::BookChanged(symbol));
+        self.enforce_mmp(now, &mut events);
         self.check_circuit(symbol, &mut events, now);
         events
     }
@@ -988,6 +1270,7 @@ impl Exchange {
                 .map_or(MemberKind::Broker, |m| m.kind);
             let fee = self.config.fees.fee(kind, maker, trade.qty);
             *self.member_fees.entry(member).or_default() += fee;
+            self.record_quote_fill(order_id, trade.qty, now);
             legs.push((side, member, account, fee));
             let Some(meta) = self.orders.get(&order_id) else {
                 continue;
@@ -1753,6 +2036,188 @@ mod tests {
                 .book
                 .get(resting)
                 .is_some()
+        );
+    }
+
+    fn quote(
+        m: &mut Market,
+        member: MemberId,
+        account: AccountId,
+        bid: (Price, Qty),
+        ask: (Price, Qty),
+        refs: (u64, u64),
+    ) -> Vec<Event> {
+        m.ex.execute(
+            &Command::Quote {
+                member,
+                account,
+                symbol: sym("ACME"),
+                bid_ref: refs.0,
+                bid: QuoteSide {
+                    price: bid.0,
+                    qty: bid.1,
+                },
+                ask_ref: refs.1,
+                ask: QuoteSide {
+                    price: ask.0,
+                    qty: ask.1,
+                },
+            },
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn quotes_replace_the_previous_quote_atomically() {
+        let mut m = market();
+        let lp = m.lp;
+        let first = quote(&mut m, lp, 4, (24_90, 10), (24_99, 10), (1, 2));
+        let first_ids: Vec<OrderId> = reports_for(&first, lp)
+            .iter()
+            .filter(|r| r.status == OrderStatus::New)
+            .map(|r| r.order_id)
+            .collect();
+        assert_eq!(first_ids.len(), 2);
+
+        let second = quote(&mut m, lp, 4, (24_91, 5), (0, 0), (3, 4));
+        let reports = reports_for(&second, lp);
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|r| r.status == OrderStatus::Cancelled && r.reason == "quote replaced")
+                .count(),
+            2
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|r| r.status == OrderStatus::New && r.client_order_id == 3)
+        );
+        let book = &m.ex.instrument(sym("ACME")).unwrap().book;
+        assert_eq!(book.best_bid(), Some(24_91));
+        assert_eq!(
+            book.best_ask(),
+            Some(25_00),
+            "only the IPO offer remains on the ask"
+        );
+
+        let crossing = quote(&mut m, lp, 4, (25_00, 5), (25_10, 5), (5, 6));
+        assert!(
+            reports_for(&crossing, lp)
+                .iter()
+                .any(|r| r.client_order_id == 5 && r.reason.contains("post-only"))
+        );
+    }
+
+    #[test]
+    fn market_maker_protection_pulls_all_quotes_until_reset() {
+        let mut m = market();
+        let (lp, broker) = (m.lp, m.broker);
+        m.ex.execute(
+            &Command::SetMmp {
+                member: lp,
+                account: 4,
+                window_ms: 1_000,
+                max_qty: 15,
+            },
+            0,
+        )
+        .unwrap();
+        quote(&mut m, lp, 4, (24_90, 10), (24_99, 10), (1, 2));
+        m.ex.execute(
+            &Command::Quote {
+                member: lp,
+                account: 4,
+                symbol: sym("ACME"),
+                bid_ref: 0,
+                bid: QuoteSide::default(),
+                ask_ref: 0,
+                ask: QuoteSide::default(),
+            },
+            1,
+        )
+        .unwrap();
+        quote(&mut m, lp, 4, (24_90, 30), (24_99, 10), (1, 2));
+        order(&mut m, broker, 7, Side::Sell, 24_90, 10);
+        let events = order(&mut m, broker, 7, Side::Buy, 24_99, 10);
+        assert!(
+            reports_for(&events, lp)
+                .iter()
+                .any(|r| r.reason == "market maker protection triggered")
+        );
+        assert_eq!(m.ex.instrument(sym("ACME")).unwrap().book.best_bid(), None);
+
+        let blocked = quote(&mut m, lp, 4, (24_80, 1), (0, 0), (7, 8));
+        assert!(
+            reports_for(&blocked, lp)[0]
+                .reason
+                .contains("market maker protection tripped")
+        );
+        m.ex.execute(
+            &Command::SetMmp {
+                member: lp,
+                account: 4,
+                window_ms: 1_000,
+                max_qty: 15,
+            },
+            2,
+        )
+        .unwrap();
+        let resumed = quote(&mut m, lp, 4, (24_80, 1), (0, 0), (9, 10));
+        assert_eq!(reports_for(&resumed, lp)[0].status, OrderStatus::New);
+    }
+
+    #[test]
+    fn suspended_members_lose_their_orders_and_cannot_trade() {
+        let mut m = market();
+        let lp = m.lp;
+        order(&mut m, lp, 4, Side::Buy, 24_00, 5);
+        let events =
+            m.ex.execute(
+                &Command::SetMemberStatus {
+                    member: lp,
+                    enabled: false,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(
+            reports_for(&events, lp)
+                .iter()
+                .any(|r| r.status == OrderStatus::Cancelled)
+        );
+        assert!(
+            reports_for(&order(&mut m, lp, 4, Side::Buy, 24_00, 5), lp)[0]
+                .reason
+                .contains("suspended")
+        );
+        assert!(
+            m.ex.member_list(|_| false)
+                .iter()
+                .any(|i| i.member_id == lp && i.suspended)
+        );
+        m.ex.execute(
+            &Command::SetMemberStatus {
+                member: lp,
+                enabled: true,
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            reports_for(&order(&mut m, lp, 4, Side::Buy, 24_00, 5), lp)[0].status,
+            OrderStatus::New
+        );
+        assert!(
+            m.ex.execute(
+                &Command::SetMemberStatus {
+                    member: 1,
+                    enabled: false
+                },
+                1
+            )
+            .is_err()
         );
     }
 

@@ -457,6 +457,47 @@ impl Gateway {
                 Ok(_) => self.reject(id, ref_template, "exchange link is down, try again shortly"),
                 Err(reason) => self.reject(id, ref_template, &reason),
             },
+            ClientMessage::Quote { symbol, bid, ask } if !admin => {
+                if !self.exchange.is_ready() {
+                    return self.reject(
+                        id,
+                        ref_template,
+                        "exchange link is down, try again shortly",
+                    );
+                }
+                match self
+                    .broker
+                    .decide_quote(account, symbol, bid, ask, &self.market)
+                {
+                    Ok(fact) => {
+                        if self.record(fact, now).is_err() {
+                            self.reject(
+                                id,
+                                ref_template,
+                                "journal unavailable, quote not accepted",
+                            );
+                        }
+                    }
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
+            ClientMessage::SetMmp { window_ms, max_qty } if !admin => {
+                match self.broker.decide_mmp(account, window_ms, max_qty) {
+                    Ok(message) if self.send_exchange(&message) => self.reply(
+                        id,
+                        ServerMessage::Ack {
+                            ref_template,
+                            text: format!(
+                                "market maker protection set: {max_qty} shares per {window_ms} ms"
+                            ),
+                        },
+                    ),
+                    Ok(_) => {
+                        self.reject(id, ref_template, "exchange link is down, try again shortly")
+                    }
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
             ClientMessage::CancelAll { symbol } if !admin => {
                 if !self.send_exchange(&MemberMessage::CancelAll {
                     account: Some(account),

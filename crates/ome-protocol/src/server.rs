@@ -311,7 +311,9 @@ impl ServerMessage {
                         .u32(m.open_orders)
                         .i64(m.net_fees)
                         .u64(m.credit_limit)
-                        .u64(m.exposure);
+                        .u64(m.exposure)
+                        .u8(m.suspended as u8)
+                        .u8(m.cancel_on_disconnect as u8);
                     e.end_entry_block(&mut g);
                     e.var(&m.name);
                 }
@@ -710,6 +712,8 @@ impl ServerMessage {
                     let net_fees = d.i64()?;
                     let credit_limit = d.u64()?;
                     let exposure = d.u64()?;
+                    let suspended = d.u8()? != 0;
+                    let cancel_on_disconnect = d.u8()? != 0;
                     d.end_entry_block(start, &g)?;
                     list.push(MemberInfo {
                         member_id,
@@ -719,6 +723,8 @@ impl ServerMessage {
                         net_fees,
                         credit_limit,
                         exposure,
+                        suspended,
+                        cancel_on_disconnect,
                         name: d.var()?,
                     });
                 }
@@ -980,6 +986,8 @@ mod tests {
                 net_fees: -1_250,
                 credit_limit: u64::MAX,
                 exposure: 5_000,
+                suspended: true,
+                cancel_on_disconnect: true,
                 name: "lp-desk".into(),
             }]),
         ]

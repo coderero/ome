@@ -207,6 +207,29 @@ pub fn phase_from(v: u8) -> Result<MarketPhase, DecodeError> {
     MarketPhase::from_u8(v).ok_or(DecodeError::Invalid("market phase"))
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuoteSide {
+    pub price: Price,
+    pub qty: Qty,
+}
+
+impl QuoteSide {
+    pub fn is_empty(&self) -> bool {
+        self.qty == 0
+    }
+}
+
+pub fn put_quote_side(e: &mut Encoder, side: &QuoteSide) {
+    e.u64(side.price).u64(side.qty);
+}
+
+pub fn get_quote_side(d: &mut Decoder) -> Result<QuoteSide, DecodeError> {
+    Ok(QuoteSide {
+        price: d.u64()?,
+        qty: d.u64()?,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketStatus {
     pub phase: MarketPhase,
@@ -434,6 +457,8 @@ pub struct MemberInfo {
     pub net_fees: i64,
     pub credit_limit: u64,
     pub exposure: u64,
+    pub suspended: bool,
+    pub cancel_on_disconnect: bool,
     pub name: String,
 }
 

@@ -433,6 +433,8 @@ pub mod tests {
                 net_fees: 0,
                 credit_limit: u64::MAX,
                 exposure: 0,
+                suspended: false,
+                cancel_on_disconnect: false,
                 name: name.to_string(),
             })
             .collect()

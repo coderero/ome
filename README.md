@@ -166,6 +166,18 @@ ome broker --addr 127.0.0.1:7102 --user fund --secret fund-pw buy ACME 26.50 5 p
 # rejected: post-only order would take liquidity
 ```
 
+## Member Controls and Market Making
+
+| Control | Who | What it does |
+|---|---|---|
+| **Kill switch** | exchange ops | `ome exchange suspend <member>` cancels every order of the member and rejects new ones until `reinstate` |
+| **Cancel-on-disconnect** | exchange ops | `ome exchange cod <member> on`: when the member's last session drops, the exchange cancels all its orders (a journaled command, so replay agrees) |
+| **Message throttle** | exchange | each member session gets 5,000 messages/s with a 10,000 burst; excess messages are rejected before they reach the journal |
+| **Two-sided quotes** | HFT and LP desks | `quote <SYMBOL> <bid> <qty> <ask> <qty>` replaces the account's previous quote in that symbol atomically; both sides are post-only |
+| **Market maker protection** | HFT and LP desks | `mmp <window-ms> <max-qty>`: if quote fills exceed `max-qty` within the window, the exchange pulls every quote of that account and refuses new ones until protection is reset |
+
+The market-making bots quote this way: they arm protection on start, replace their quote as the price moves, and after a trip wait out a cooldown before resetting.
+
 ## Market Sessions and Auctions
 
 The exchange runs a trading day in four phases, either manually or on a repeating schedule set by exchange operations:
@@ -244,14 +256,13 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 139 tests
+cargo test --workspace     # 146 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1e-ii** member controls: kill switch, cancel-on-disconnect, message throttling, bulk two-sided quotes with market-maker protection
 - **1f** broker-held orders (stop, trailing stop, OCO, bracket, GTT) and institutional algorithms (TWAP, VWAP, POV)
 - **1g** off-exchange execution: broker internalization, wholesaler with payment for order flow, dark pool
 - **1h** PostgreSQL (accounts, trades, settlements) and Redis (market data)

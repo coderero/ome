@@ -130,6 +130,7 @@ fn trades_settle_t_plus_one_and_credit_follows_collateral() {
         .unwrap();
     }
 
+    eventually(|| (status(&mut ops).cycle >= 1).then_some(()));
     let retail = broker(exchange, clearing, ProfileKind::Retail, "retail-co");
     let prime = broker(exchange, clearing, ProfileKind::Prime, "prime-co");
     let issuer = create(prime, Role::Issuer, "acme_ir", 0);

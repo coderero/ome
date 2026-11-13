@@ -95,6 +95,6 @@ fn handle(gateway: &mut Gateway, inbound: Inbound) {
     match inbound {
         Inbound::Connected(id, outbox) => gateway.connect(id, Box::new(outbox)),
         Inbound::Frame(id, bytes) => gateway.handle(id, &bytes, now_ms()),
-        Inbound::Disconnected(id) => gateway.disconnect(id),
+        Inbound::Disconnected(id) => gateway.disconnect(id, now_ms()),
     }
 }

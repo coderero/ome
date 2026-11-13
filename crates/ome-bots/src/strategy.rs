@@ -15,7 +15,14 @@ pub enum Action {
         qty: Qty,
     },
     Cancel(OrderId),
-    CancelAll,
+    Quote {
+        bid: Option<(Price, Qty)>,
+        ask: Option<(Price, Qty)>,
+    },
+    SetMmp {
+        window_ms: u64,
+        max_qty: Qty,
+    },
 }
 
 pub trait Strategy: Send {
@@ -64,6 +71,8 @@ pub struct MarketMaker {
     pub requote_bps: f64,
     target_inventory: Option<Qty>,
     quoted: Option<(Price, Price)>,
+    mmp_armed: bool,
+    mmp_cooldown: u32,
 }
 
 impl Default for MarketMaker {
@@ -75,6 +84,8 @@ impl Default for MarketMaker {
             requote_bps: 4.0,
             target_inventory: None,
             quoted: None,
+            mmp_armed: false,
+            mmp_cooldown: 0,
         }
     }
 }
@@ -94,7 +105,30 @@ impl Strategy for MarketMaker {
             return if state.open_orders.is_empty() {
                 vec![]
             } else {
-                vec![Action::CancelAll]
+                vec![Action::Quote {
+                    bid: None,
+                    ask: None,
+                }]
+            };
+        }
+        let protection = Action::SetMmp {
+            window_ms: 2_000,
+            max_qty: self.quote_size * 8,
+        };
+        if !self.mmp_armed {
+            self.mmp_armed = true;
+            return vec![protection];
+        }
+        if state.mmp_tripped {
+            self.quoted = None;
+            if self.mmp_cooldown == 0 {
+                self.mmp_cooldown = 25;
+            }
+            self.mmp_cooldown -= 1;
+            return if self.mmp_cooldown == 0 {
+                vec![protection]
+            } else {
+                vec![]
             };
         }
         if !state.pending.is_empty() {
@@ -126,25 +160,13 @@ impl Strategy for MarketMaker {
         let size = (self.quote_size as f64 * rng.random_range(0.6..1.4))
             .round()
             .max(1.0) as Qty;
-        let bid_qty = affordable(state.cash + state.cash_reserved, bid, size);
-        let ask_qty = size.min(inventory);
-        let mut actions = vec![Action::CancelAll];
-        if bid_qty > 0 {
-            actions.push(Action::Place {
-                side: Side::Buy,
-                kind: OrderKind::Limit(bid),
-                qty: bid_qty,
-            });
-        }
-        if ask_qty > 0 {
-            actions.push(Action::Place {
-                side: Side::Sell,
-                kind: OrderKind::Limit(ask),
-                qty: ask_qty,
-            });
-        }
+        let bid_qty = affordable(state.cash, bid, size);
+        let ask_qty = size.min(state.shares);
         self.quoted = Some((bid, ask));
-        actions
+        vec![Action::Quote {
+            bid: (bid_qty > 0).then_some((bid, bid_qty)),
+            ask: (ask_qty > 0).then_some((ask, ask_qty)),
+        }]
     }
 }
 
@@ -405,13 +427,17 @@ mod tests {
         let mut mm = MarketMaker::default();
         let state = state_at(10_000, 10_000_000, 500);
 
+        assert!(
+            matches!(mm.on_tick(&state, &mut rng())[0], Action::SetMmp { .. }),
+            "arms protection first"
+        );
         let actions = mm.on_tick(&state, &mut rng());
-
-        assert_eq!(actions[0], Action::CancelAll);
-        let quotes = places(&actions);
-        assert_eq!(quotes.len(), 2);
-        let (OrderKind::Limit(bid), OrderKind::Limit(ask)) = (quotes[0].1, quotes[1].1) else {
-            panic!("expected limits");
+        let Action::Quote {
+            bid: Some((bid, _)),
+            ask: Some((ask, _)),
+        } = actions[0]
+        else {
+            panic!("expected a two-sided quote, got {actions:?}");
         };
         assert!(bid < 10_000 && ask > 10_000 && ask > bid);
     }
@@ -428,13 +454,15 @@ mod tests {
         };
         let state = state_at(10_000, 10_000_000, 500);
 
-        let mid = |actions: &[Action]| {
-            let q = places(actions);
-            match (q[0].1, q[1].1) {
-                (OrderKind::Limit(b), OrderKind::Limit(a)) => (b + a) / 2,
-                _ => unreachable!(),
-            }
+        let mid = |actions: &[Action]| match actions[0] {
+            Action::Quote {
+                bid: Some((b, _)),
+                ask: Some((a, _)),
+            } => (b + a) / 2,
+            _ => unreachable!("{actions:?}"),
         };
+        long.mmp_armed = true;
+        flat.mmp_armed = true;
         assert!(mid(&long.on_tick(&state, &mut rng())) < mid(&flat.on_tick(&state, &mut rng())));
     }
 
@@ -453,7 +481,13 @@ mod tests {
             },
         );
 
-        assert_eq!(mm.on_tick(&state, &mut rng()), vec![Action::CancelAll]);
+        assert_eq!(
+            mm.on_tick(&state, &mut rng()),
+            vec![Action::Quote {
+                bid: None,
+                ask: None
+            }]
+        );
     }
 
     #[test]
@@ -539,5 +573,25 @@ mod tests {
             assert!(create(name).is_some());
         }
         assert!(create("nope").is_none());
+    }
+
+    #[test]
+    fn market_maker_waits_out_a_protection_trip_then_resets() {
+        let mut mm = MarketMaker {
+            mmp_armed: true,
+            ..MarketMaker::default()
+        };
+        let mut state = state_at(10_000, 10_000_000, 500);
+        state.mmp_tripped = true;
+        let mut resets = 0;
+        for _ in 0..25 {
+            let actions = mm.on_tick(&state, &mut rng());
+            assert!(!actions.iter().any(|a| matches!(a, Action::Quote { .. })));
+            resets += actions
+                .iter()
+                .filter(|a| matches!(a, Action::SetMmp { .. }))
+                .count();
+        }
+        assert_eq!(resets, 1);
     }
 }

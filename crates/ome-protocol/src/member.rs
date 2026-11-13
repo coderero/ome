@@ -36,6 +36,27 @@ pub enum MemberMessage {
         symbol: Symbol,
     },
     QueryInstruments,
+    Quote {
+        account: AccountId,
+        symbol: Symbol,
+        bid_ref: u64,
+        bid: QuoteSide,
+        ask_ref: u64,
+        ask: QuoteSide,
+    },
+    SetMmp {
+        account: AccountId,
+        window_ms: u64,
+        max_qty: Qty,
+    },
+    SetMemberStatus {
+        member: MemberId,
+        enabled: bool,
+    },
+    SetCancelOnDisconnect {
+        member: MemberId,
+        enabled: bool,
+    },
     CreateMember {
         kind: MemberKind,
         name: String,
@@ -94,6 +115,10 @@ impl MemberMessage {
             MemberMessage::Subscribe { .. } => MEMBER_SUBSCRIBE,
             MemberMessage::Unsubscribe { .. } => MEMBER_UNSUBSCRIBE,
             MemberMessage::QueryInstruments => MEMBER_QUERY_INSTRUMENTS,
+            MemberMessage::Quote { .. } => MEMBER_QUOTE,
+            MemberMessage::SetMmp { .. } => MEMBER_SET_MMP,
+            MemberMessage::SetMemberStatus { .. } => SET_MEMBER_STATUS,
+            MemberMessage::SetCancelOnDisconnect { .. } => SET_CANCEL_ON_DISCONNECT,
             MemberMessage::CreateMember { .. } => CREATE_MEMBER,
             MemberMessage::ListInstrument { .. } => LIST_INSTRUMENT,
             MemberMessage::Halt { .. } => HALT,
@@ -144,6 +169,31 @@ impl MemberMessage {
             }
             MemberMessage::Cancel { order_id } => {
                 e.u64(*order_id).end_block();
+            }
+            MemberMessage::Quote {
+                account,
+                symbol,
+                bid_ref,
+                bid,
+                ask_ref,
+                ask,
+            } => {
+                e.u64(*account).symbol(Some(*symbol)).u64(*bid_ref);
+                put_quote_side(&mut e, bid);
+                e.u64(*ask_ref);
+                put_quote_side(&mut e, ask);
+                e.end_block();
+            }
+            MemberMessage::SetMmp {
+                account,
+                window_ms,
+                max_qty,
+            } => {
+                e.u64(*account).u64(*window_ms).u64(*max_qty).end_block();
+            }
+            MemberMessage::SetMemberStatus { member, enabled }
+            | MemberMessage::SetCancelOnDisconnect { member, enabled } => {
+                e.u64(*member).u8(*enabled as u8).end_block();
             }
             MemberMessage::CancelAll { account, symbol } => {
                 e.u64(account.unwrap_or(0)).symbol(*symbol).end_block();
@@ -286,6 +336,46 @@ impl MemberMessage {
                     options,
                     qty,
                 }
+            }
+            MEMBER_QUOTE => {
+                let account = d.u64()?;
+                let symbol = d.symbol()?;
+                let bid_ref = d.u64()?;
+                let bid = get_quote_side(&mut d)?;
+                let ask_ref = d.u64()?;
+                let ask = get_quote_side(&mut d)?;
+                d.end_block()?;
+                MemberMessage::Quote {
+                    account,
+                    symbol,
+                    bid_ref,
+                    bid,
+                    ask_ref,
+                    ask,
+                }
+            }
+            MEMBER_SET_MMP => {
+                let account = d.u64()?;
+                let window_ms = d.u64()?;
+                let max_qty = d.u64()?;
+                d.end_block()?;
+                MemberMessage::SetMmp {
+                    account,
+                    window_ms,
+                    max_qty,
+                }
+            }
+            SET_MEMBER_STATUS => {
+                let member = d.u64()?;
+                let enabled = d.u8()? != 0;
+                d.end_block()?;
+                MemberMessage::SetMemberStatus { member, enabled }
+            }
+            SET_CANCEL_ON_DISCONNECT => {
+                let member = d.u64()?;
+                let enabled = d.u8()? != 0;
+                d.end_block()?;
+                MemberMessage::SetCancelOnDisconnect { member, enabled }
             }
             MEMBER_CANCEL => {
                 let order_id = d.u64()?;
@@ -430,6 +520,33 @@ pub mod tests {
                 amount: -500,
             },
             MemberMessage::QueryClearing,
+            MemberMessage::Quote {
+                account: 4,
+                symbol: sym("ACME"),
+                bid_ref: 10,
+                bid: QuoteSide {
+                    price: 2_499,
+                    qty: 50,
+                },
+                ask_ref: 11,
+                ask: QuoteSide {
+                    price: 2_501,
+                    qty: 40,
+                },
+            },
+            MemberMessage::SetMmp {
+                account: 4,
+                window_ms: 1_000,
+                max_qty: 200,
+            },
+            MemberMessage::SetMemberStatus {
+                member: 3,
+                enabled: false,
+            },
+            MemberMessage::SetCancelOnDisconnect {
+                member: 3,
+                enabled: true,
+            },
             MemberMessage::SetSession {
                 phase: MarketPhase::ClosingAuction,
             },

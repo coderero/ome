@@ -11,7 +11,7 @@ use ome_core::types::{
 use ome_net::auth::SecretHash;
 use ome_protocol::{
     AccountInfo, AccountSnapshot, Allocation, Asset, Charges, ContractNote, ExecutionReport,
-    FeeSummary, MarketPhase, MemberMessage, OrderStatus, Position, Role, ServerMessage,
+    FeeSummary, MarketPhase, MemberMessage, OrderStatus, Position, QuoteSide, Role, ServerMessage,
     SettlementReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -52,6 +52,21 @@ pub enum Fact {
         order_ref: u64,
     },
     SettlementReceived(SettlementReport),
+    QuoteAccepted {
+        account: AccountId,
+        symbol: Symbol,
+        bid: Option<QuoteLeg>,
+        ask: Option<QuoteLeg>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuoteLeg {
+    pub order_ref: u64,
+    pub price: Price,
+    pub qty: Qty,
+    pub reserved: u64,
+    pub fee_reserve: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +345,113 @@ impl Broker {
         })
     }
 
+    pub fn decide_quote(
+        &self,
+        account: AccountId,
+        symbol: Symbol,
+        bid: QuoteSide,
+        ask: QuoteSide,
+        market: &MarketCache,
+    ) -> Result<Fact, String> {
+        let holder = self
+            .ledger
+            .get(account)
+            .ok_or_else(|| format!("unknown account {account}"))?;
+        if !matches!(holder.role, Role::Hft | Role::LpDesk) {
+            return Err(format!(
+                "{} accounts may not send two-sided quotes",
+                holder.role.label()
+            ));
+        }
+        if market.phase() == MarketPhase::Closed {
+            return Err("market is closed".into());
+        }
+        if !market.is_trading(symbol) {
+            return Err(format!("{symbol} is not trading"));
+        }
+        if !bid.is_empty() && !ask.is_empty() && bid.price >= ask.price {
+            return Err("quote bid must be below its ask".into());
+        }
+        let (low, high) = market
+            .band(symbol)
+            .ok_or_else(|| format!("no price band for {symbol}"))?;
+        let limits = Profile::limits(holder.role);
+        for side in [bid, ask].iter().filter(|s| !s.is_empty()) {
+            if side.price < low || side.price > high {
+                return Err(format!(
+                    "quote price {} outside band {} - {}",
+                    ome_core::price::format_price(side.price),
+                    ome_core::price::format_price(low),
+                    ome_core::price::format_price(high)
+                ));
+            }
+            if side.qty > limits.max_qty {
+                return Err(format!(
+                    "quote quantity {} exceeds max {}",
+                    side.qty, limits.max_qty
+                ));
+            }
+        }
+        let bid_leg = (!bid.is_empty()).then(|| {
+            let fee_reserve = self
+                .fees
+                .reserve(holder.role, Side::Buy, bid.price, bid.qty);
+            QuoteLeg {
+                order_ref: self.next_order_ref,
+                price: bid.price,
+                qty: bid.qty,
+                reserved: bid.price.saturating_mul(bid.qty),
+                fee_reserve,
+            }
+        });
+        if let Some(leg) = bid_leg
+            && holder.cash.available < leg.reserved + leg.fee_reserve
+        {
+            return Err("insufficient cash for the bid side of the quote".into());
+        }
+        let ask_leg = (!ask.is_empty()).then(|| QuoteLeg {
+            order_ref: self.next_order_ref + 1,
+            price: ask.price,
+            qty: ask.qty,
+            reserved: ask.qty,
+            fee_reserve: 0,
+        });
+        if ask_leg.is_some_and(|leg| holder.position(symbol).available < leg.qty) {
+            return Err(format!(
+                "insufficient {symbol} shares for the ask side of the quote"
+            ));
+        }
+        Ok(Fact::QuoteAccepted {
+            account,
+            symbol,
+            bid: bid_leg,
+            ask: ask_leg,
+        })
+    }
+
+    pub fn decide_mmp(
+        &self,
+        account: AccountId,
+        window_ms: u64,
+        max_qty: Qty,
+    ) -> Result<MemberMessage, String> {
+        let holder = self
+            .ledger
+            .get(account)
+            .ok_or_else(|| format!("unknown account {account}"))?;
+        if !matches!(holder.role, Role::Hft | Role::LpDesk) {
+            return Err(format!(
+                "{} accounts do not use market maker protection",
+                holder.role.label()
+            ));
+        }
+        Ok(MemberMessage::SetMmp {
+            account,
+            window_ms,
+            max_qty,
+        })
+    }
+
     pub fn decide_cancel(
         &self,
         account: AccountId,
@@ -427,6 +549,69 @@ impl Broker {
                         kind: OrderKind::Limit(*price),
                         options: *options,
                         qty: *qty,
+                    }),
+                ]
+            }
+            Fact::QuoteAccepted {
+                account,
+                symbol,
+                bid,
+                ask,
+            } => {
+                let mut sides = [QuoteSide::default(), QuoteSide::default()];
+                let mut refs = [0, 0];
+                for (slot, (side, leg)) in [(Side::Buy, bid), (Side::Sell, ask)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let Some(leg) = leg else {
+                        continue;
+                    };
+                    self.next_order_ref = self.next_order_ref.max(leg.order_ref + 1);
+                    let reserved_ok = match side {
+                        Side::Buy => self
+                            .ledger
+                            .reserve_cash(*account, leg.reserved + leg.fee_reserve)
+                            .is_ok(),
+                        Side::Sell => self
+                            .ledger
+                            .reserve_shares(*account, *symbol, leg.qty)
+                            .is_ok(),
+                    };
+                    if !reserved_ok {
+                        continue;
+                    }
+                    self.orders.insert(
+                        leg.order_ref,
+                        OrderMeta {
+                            account: *account,
+                            client_order_id: 0,
+                            symbol: *symbol,
+                            side,
+                            price: leg.price,
+                            qty: leg.qty,
+                            filled: 0,
+                            reserved: leg.reserved,
+                            fee_reserve: leg.fee_reserve,
+                            commission_paid: 0,
+                            exchange_id: None,
+                        },
+                    );
+                    sides[slot] = QuoteSide {
+                        price: leg.price,
+                        qty: leg.qty,
+                    };
+                    refs[slot] = leg.order_ref;
+                }
+                vec![
+                    Effect::AccountChanged(*account),
+                    Effect::ToExchange(MemberMessage::Quote {
+                        account: *account,
+                        symbol: *symbol,
+                        bid_ref: refs[0],
+                        bid: sides[0],
+                        ask_ref: refs[1],
+                        ask: sides[1],
                     }),
                 ]
             }
@@ -1423,5 +1608,80 @@ pub mod tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn quotes_reserve_both_sides_and_go_out_as_one_message() {
+        let mut broker = Broker::new(Profile::new(ProfileKind::Lp));
+        let desk = open(&mut broker, "desk", Role::LpDesk, 100_000_00);
+        broker.apply(&Fact::BalanceSet {
+            account: desk,
+            asset: Asset::Shares(sym()),
+            amount: 100,
+        });
+        let m = market();
+        let fact = broker
+            .decide_quote(
+                desk,
+                sym(),
+                QuoteSide {
+                    price: 24_90,
+                    qty: 20,
+                },
+                QuoteSide {
+                    price: 25_10,
+                    qty: 30,
+                },
+                &m,
+            )
+            .unwrap();
+        let effects = broker.apply(&fact);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ToExchange(MemberMessage::Quote {
+                bid_ref: 1,
+                ask_ref: 2,
+                ..
+            })
+        )));
+        let holder = broker.ledger().get(desk).unwrap();
+        assert!(holder.cash.reserved >= 24_90 * 20);
+        assert_eq!(holder.position(sym()).reserved, 30);
+
+        assert!(
+            broker
+                .decide_quote(
+                    desk,
+                    sym(),
+                    QuoteSide {
+                        price: 25_10,
+                        qty: 1
+                    },
+                    QuoteSide {
+                        price: 25_00,
+                        qty: 1
+                    },
+                    &m
+                )
+                .is_err()
+        );
+        let mut retail = Broker::new(Profile::new(ProfileKind::Retail));
+        let alice = open(&mut retail, "alice", Role::Retail, 100_000_00);
+        assert!(
+            retail
+                .decide_quote(
+                    alice,
+                    sym(),
+                    QuoteSide {
+                        price: 24_00,
+                        qty: 1
+                    },
+                    QuoteSide::default(),
+                    &m
+                )
+                .is_err()
+        );
+        assert!(retail.decide_mmp(alice, 1_000, 10).is_err());
+        assert!(broker.decide_mmp(desk, 1_000, 10).is_ok());
     }
 }

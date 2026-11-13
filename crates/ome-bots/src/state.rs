@@ -21,6 +21,7 @@ pub struct BotState {
     pub trading: bool,
     pub instrument_trading: bool,
     pub market_open: bool,
+    pub mmp_tripped: bool,
     pub reference_price: Price,
     pub last_price: Option<Price>,
     pub best_bid: Option<Price>,
@@ -43,6 +44,7 @@ impl BotState {
             trading: false,
             instrument_trading: false,
             market_open: true,
+            mmp_tripped: false,
             reference_price: 0,
             last_price: None,
             best_bid: None,
@@ -113,6 +115,9 @@ impl BotState {
             }
             ServerMessage::Execution(report) if report.symbol == self.symbol => {
                 self.pending.remove(&report.client_order_id);
+                if report.reason.contains("market maker protection") {
+                    self.mmp_tripped = true;
+                }
                 if report.last_qty > 0 {
                     self.fills += 1;
                 }

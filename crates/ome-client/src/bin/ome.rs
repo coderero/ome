@@ -3,8 +3,8 @@ use ome_core::price::{format_price, parse_amount, parse_price};
 use ome_core::symbol::Symbol;
 use ome_core::types::{AccountId, OrderKind, OrderOptions, Side, StpMode, TimeInForce};
 use ome_protocol::{
-    AccountInfo, Asset, ClientMessage, InstrumentInfo, MarketPhase, MemberInfo, MemberKind,
-    MemberMessage, OrderStatus, Role, ServerMessage,
+    AccountInfo, Asset, ClientMessage, InstrumentInfo, MarketPhase, MemberId, MemberInfo,
+    MemberKind, MemberMessage, OrderStatus, QuoteSide, Role, ServerMessage,
 };
 use std::time::Duration;
 
@@ -16,6 +16,8 @@ const USAGE: &str = "usage:
                                                           list a company; underwriter is a member name
       halt <SYMBOL> [reason..]  |  resume <SYMBOL>
       status                                              market phase and trading day
+      suspend <member>  |  reinstate <member>             kill switch: cancel all orders and block trading
+      cod <member> on|off                                 cancel-on-disconnect for a member
       session <preopen|open|auction|close>                change the market phase now
       schedule <preopen> <open> <closing> <closed>        repeating trading day in seconds; `schedule off`
       instruments  |  watch <SYMBOL>
@@ -29,6 +31,8 @@ const USAGE: &str = "usage:
                                                           options: gtc day ioc fok auction gtd:<seconds>
                                                           post show:<qty> stp:keep|new|both
       market                                              market phase and trading day
+      quote <SYMBOL> <bid> <bid-qty> <ask> <ask-qty>      two-sided quote (HFT and LP desks); 0 qty = no side
+      mmp <window-ms> <max-qty>                           market maker protection (resets a trip)
       cancel <order_id>  |  cancel-all [SYMBOL]
       instruments  |  watch <SYMBOL>
 
@@ -156,7 +160,7 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
         ["members"] => {
             for m in members(client)? {
                 println!(
-                    "{:>4}  {:<20} {:<20} {}  open orders {:<6} net fees {:<10} exposure {:<14} credit {}",
+                    "{:>4}  {:<20} {:<20} {}  open orders {:<6} net fees {:<10} exposure {:<14} credit {}{}{}",
                     m.member_id,
                     m.name,
                     m.kind.label(),
@@ -168,7 +172,9 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
                         "unlimited".to_string()
                     } else {
                         format_price(m.credit_limit)
-                    }
+                    },
+                    if m.suspended { "  SUSPENDED" } else { "" },
+                    if m.cancel_on_disconnect { "  cod" } else { "" }
                 );
             }
         }
@@ -227,6 +233,22 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
             );
         }
         ["status"] => print_status(client)?,
+        [verb @ ("suspend" | "reinstate"), member] => {
+            let member = member_id(client, member)?;
+            let enabled = *verb == "reinstate";
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::SetMemberStatus { member, enabled })?
+            );
+        }
+        ["cod", member, flag @ ("on" | "off")] => {
+            let member = member_id(client, member)?;
+            let enabled = *flag == "on";
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::SetCancelOnDisconnect { member, enabled })?
+            );
+        }
         ["session", phase] => {
             let phase =
                 MarketPhase::parse(phase).ok_or("phase must be preopen, open, auction or close")?;
@@ -376,6 +398,53 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
             }
         }
         ["market"] => print_status(client)?,
+        ["quote", sym, bid, bid_qty, ask, ask_qty] => {
+            let side = |px: &str, qty: &str| -> std::result::Result<QuoteSide, String> {
+                let qty = number(qty)?;
+                Ok(QuoteSide {
+                    price: if qty == 0 { 0 } else { price(px)? },
+                    qty,
+                })
+            };
+            let symbol = symbol(sym)?;
+            client.send(&ClientMessage::Quote {
+                symbol,
+                bid: side(bid, bid_qty)?,
+                ask: side(ask, ask_qty)?,
+            })?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while let Some(message) = client
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?
+            {
+                match message {
+                    ServerMessage::Reject { reason, .. } => {
+                        return Err(ClientError::Rejected(reason).into());
+                    }
+                    ServerMessage::Execution(r) if r.symbol == symbol => println!(
+                        "#{} {} {} {} @ {} {}",
+                        r.order_id,
+                        r.status.label(),
+                        r.side.label(),
+                        r.qty,
+                        format_price(r.price),
+                        r.reason
+                    ),
+                    _ => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        ["mmp", window, max_qty] => {
+            println!(
+                "{}",
+                client.request(&ClientMessage::SetMmp {
+                    window_ms: number(window)?,
+                    max_qty: number(max_qty)?
+                })?
+            );
+        }
         [side @ ("buy" | "sell"), sym, px, qty, extras @ ..] => {
             let options = order_options(extras)?;
             let side = if *side == "buy" {
@@ -626,6 +695,17 @@ fn order_options(extras: &[&str]) -> std::result::Result<Option<OrderOptions>, S
         }
     }
     Ok(Some(options))
+}
+
+fn member_id(client: &mut Client, member: &str) -> Result<MemberId> {
+    if let Ok(id) = member.parse() {
+        return Ok(id);
+    }
+    members(client)?
+        .into_iter()
+        .find(|m| m.name == member)
+        .map(|m| m.member_id)
+        .ok_or_else(|| format!("no member named '{member}'").into())
 }
 
 fn print_status(client: &mut Client) -> Result<()> {

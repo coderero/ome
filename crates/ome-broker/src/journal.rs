@@ -1,4 +1,4 @@
-use crate::broker::Fact;
+use crate::broker::{Fact, QuoteLeg};
 use ome_core::types::Timestamp;
 use ome_protocol::Asset;
 use ome_protocol::{
@@ -15,6 +15,7 @@ mod template {
     pub const ALLOCATED: u16 = 304;
     pub const ORDER_ABANDONED: u16 = 305;
     pub const SETTLEMENT_RECEIVED: u16 = 306;
+    pub const QUOTE_ACCEPTED: u16 = 307;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,7 @@ impl Entry for Record {
             Fact::Allocated(_) => template::ALLOCATED,
             Fact::OrderAbandoned { .. } => template::ORDER_ABANDONED,
             Fact::SettlementReceived(_) => template::SETTLEMENT_RECEIVED,
+            Fact::QuoteAccepted { .. } => template::QUOTE_ACCEPTED,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -91,6 +93,30 @@ impl Entry for Record {
             }
             Fact::OrderAbandoned { order_ref } => {
                 e.u64(*order_ref).end_block();
+            }
+            Fact::QuoteAccepted {
+                account,
+                symbol,
+                bid,
+                ask,
+            } => {
+                e.u64(*account).symbol(Some(*symbol));
+                for leg in [bid, ask] {
+                    let l = leg.unwrap_or(QuoteLeg {
+                        order_ref: 0,
+                        price: 0,
+                        qty: 0,
+                        reserved: 0,
+                        fee_reserve: 0,
+                    });
+                    e.u8(leg.is_some() as u8)
+                        .u64(l.order_ref)
+                        .u64(l.price)
+                        .u64(l.qty)
+                        .u64(l.reserved)
+                        .u64(l.fee_reserve);
+                }
+                e.end_block();
             }
             Fact::SettlementReceived(report) => {
                 e.end_block()
@@ -171,6 +197,30 @@ impl Entry for Record {
                 let order_ref = d.u64()?;
                 d.end_block()?;
                 Fact::OrderAbandoned { order_ref }
+            }
+            template::QUOTE_ACCEPTED => {
+                let account = d.u64()?;
+                let symbol = d.symbol()?;
+                let mut legs = [None, None];
+                for leg in &mut legs {
+                    let present = d.u8()? != 0;
+                    let read = QuoteLeg {
+                        order_ref: d.u64()?,
+                        price: d.u64()?,
+                        qty: d.u64()?,
+                        reserved: d.u64()?,
+                        fee_reserve: d.u64()?,
+                    };
+                    *leg = present.then_some(read);
+                }
+                d.end_block()?;
+                let [bid, ask] = legs;
+                Fact::QuoteAccepted {
+                    account,
+                    symbol,
+                    bid,
+                    ask,
+                }
             }
             template::SETTLEMENT_RECEIVED => {
                 d.end_block()?;
@@ -275,6 +325,18 @@ mod tests {
                 fee_reserve: 0,
             },
             Fact::OrderAbandoned { order_ref: 2 },
+            Fact::QuoteAccepted {
+                account: 2,
+                symbol: sym(),
+                bid: Some(QuoteLeg {
+                    order_ref: 3,
+                    price: 24_90,
+                    qty: 5,
+                    reserved: 124_50,
+                    fee_reserve: 1,
+                }),
+                ask: None,
+            },
             Fact::SettlementReceived(ome_protocol::SettlementReport {
                 seq: 1,
                 cycle: 1,
@@ -311,6 +373,6 @@ mod tests {
         assert_eq!(live.account_snapshot(2), replayed.account_snapshot(2));
         assert_eq!(live.last_seq(), 3);
         let fund = live.account_snapshot(2).unwrap();
-        assert_eq!(fund.cash.reserved, 25_00 * 6 + 6);
+        assert_eq!(fund.cash.reserved, 25_00 * 6 + 6 + 124_50 + 1);
     }
 }

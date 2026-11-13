@@ -25,6 +25,15 @@ pub enum ClientMessage {
     CancelAll {
         symbol: Option<Symbol>,
     },
+    Quote {
+        symbol: Symbol,
+        bid: QuoteSide,
+        ask: QuoteSide,
+    },
+    SetMmp {
+        window_ms: u64,
+        max_qty: Qty,
+    },
     Subscribe {
         symbol: Symbol,
     },
@@ -56,6 +65,8 @@ impl ClientMessage {
             ClientMessage::NewOrder { .. } => NEW_ORDER,
             ClientMessage::Cancel { .. } => CANCEL,
             ClientMessage::CancelAll { .. } => CANCEL_ALL,
+            ClientMessage::Quote { .. } => QUOTE,
+            ClientMessage::SetMmp { .. } => SET_MMP,
             ClientMessage::Subscribe { .. } => SUBSCRIBE,
             ClientMessage::Unsubscribe { .. } => UNSUBSCRIBE,
             ClientMessage::QueryAccount => QUERY_ACCOUNT,
@@ -101,6 +112,15 @@ impl ClientMessage {
             }
             ClientMessage::CancelAll { symbol } => {
                 e.symbol(*symbol).end_block();
+            }
+            ClientMessage::Quote { symbol, bid, ask } => {
+                e.symbol(Some(*symbol));
+                put_quote_side(&mut e, bid);
+                put_quote_side(&mut e, ask);
+                e.end_block();
+            }
+            ClientMessage::SetMmp { window_ms, max_qty } => {
+                e.u64(*window_ms).u64(*max_qty).end_block();
             }
             ClientMessage::Subscribe { symbol } | ClientMessage::Unsubscribe { symbol } => {
                 e.symbol(Some(*symbol)).end_block();
@@ -182,6 +202,19 @@ impl ClientMessage {
                 let order_id = d.u64()?;
                 d.end_block()?;
                 ClientMessage::Cancel { order_id }
+            }
+            QUOTE => {
+                let symbol = d.symbol()?;
+                let bid = get_quote_side(&mut d)?;
+                let ask = get_quote_side(&mut d)?;
+                d.end_block()?;
+                ClientMessage::Quote { symbol, bid, ask }
+            }
+            SET_MMP => {
+                let window_ms = d.u64()?;
+                let max_qty = d.u64()?;
+                d.end_block()?;
+                ClientMessage::SetMmp { window_ms, max_qty }
             }
             CANCEL_ALL => {
                 let symbol = d.optional_symbol()?;
@@ -265,6 +298,18 @@ pub mod tests {
             },
             ClientMessage::Cancel { order_id: 77 },
             ClientMessage::CancelAll { symbol: None },
+            ClientMessage::Quote {
+                symbol: sym("ACME"),
+                bid: QuoteSide {
+                    price: 2_499,
+                    qty: 100,
+                },
+                ask: QuoteSide::default(),
+            },
+            ClientMessage::SetMmp {
+                window_ms: 1_000,
+                max_qty: 500,
+            },
             ClientMessage::CancelAll {
                 symbol: Some(sym("NOVA")),
             },
