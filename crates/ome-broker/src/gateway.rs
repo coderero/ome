@@ -15,15 +15,17 @@ use ome_protocol::{
     ClientMessage, Decoder, MarketPhase, MemberMessage, Role, ServerMessage, Venue, template,
 };
 use ome_store::Journal;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::Arc;
 
 const HEARTBEAT_MS: Timestamp = 1_000;
+const NEWS_CACHE: usize = 200;
 struct Session {
     outbox: Box<dyn Outbox>,
     login: Option<(AccountId, Role)>,
     subscriptions: BTreeSet<Symbol>,
+    news: bool,
 }
 
 pub struct Gateway {
@@ -39,6 +41,9 @@ pub struct Gateway {
     last_heartbeat: Timestamp,
     guard: EntryGuard,
     algo_steps: BTreeMap<u64, Timestamp>,
+    news: Option<Upstream>,
+    news_seq: u64,
+    news_cache: VecDeque<ome_protocol::NewsItem>,
 }
 
 impl Gateway {
@@ -63,7 +68,50 @@ impl Gateway {
             last_heartbeat: clock,
             guard: EntryGuard::default(),
             algo_steps: BTreeMap::new(),
+            news: None,
+            news_seq: 0,
+            news_cache: VecDeque::new(),
         }
+    }
+
+    pub fn with_news(mut self, news: Option<Upstream>) -> Self {
+        self.news = news;
+        self
+    }
+
+    pub fn on_news(&mut self, generation: u64, event: LinkEvent, now: Timestamp) {
+        let now = self.advance(now);
+        let Some(link) = self.news.as_mut() else {
+            return;
+        };
+        match link.on_event(generation, event, now) {
+            Some(UpstreamEvent::LoggedOn { .. }) => log(&format!(
+                "logged on to the news feed, replaying after #{}",
+                self.news_seq
+            )),
+            Some(UpstreamEvent::Ready { next_seq }) => {
+                log(&format!("news feed ready, next story #{next_seq}"))
+            }
+            Some(UpstreamEvent::Message(ServerMessage::News(item))) if item.seq > self.news_seq => {
+                self.news_seq = item.seq;
+                if self.news_cache.len() == NEWS_CACHE {
+                    self.news_cache.pop_front();
+                }
+                self.news_cache.push_back(item.clone());
+                let targets: Vec<SessionId> = self
+                    .sessions
+                    .iter()
+                    .filter(|(_, s)| s.news)
+                    .map(|(id, _)| *id)
+                    .collect();
+                self.send_to(targets, &ServerMessage::News(item));
+            }
+            Some(UpstreamEvent::Message(ServerMessage::Reject { reason, .. })) => {
+                log(&format!("news feed rejected a request: {reason}"))
+            }
+            _ => {}
+        }
+        self.drop_slow_sessions();
     }
 
     pub fn broker(&self) -> &Broker {
@@ -101,6 +149,7 @@ impl Gateway {
                 outbox,
                 login: None,
                 subscriptions: BTreeSet::new(),
+                news: false,
             },
         );
     }
@@ -129,6 +178,9 @@ impl Gateway {
         }
         for (venue, link) in self.venues.iter_mut() {
             link.tick(now, self.broker.last_venue_seq(*venue));
+        }
+        if let Some(news) = &mut self.news {
+            news.tick(now, self.news_seq);
         }
         self.market.roll(now);
         self.release_after_market_orders(now);
@@ -583,6 +635,19 @@ impl Gateway {
                 }
                 for message in snapshot {
                     self.reply(id, message);
+                }
+            }
+            ClientMessage::SubscribeNews { recent } => {
+                if self.news.is_none() {
+                    return self.reject(id, ref_template, "this broker has no news feed");
+                }
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.news = true;
+                }
+                let skip = self.news_cache.len().saturating_sub(recent as usize);
+                let items: Vec<_> = self.news_cache.iter().skip(skip).cloned().collect();
+                for item in items {
+                    self.reply(id, ServerMessage::News(item));
                 }
             }
             ClientMessage::Unsubscribe { symbol } => {

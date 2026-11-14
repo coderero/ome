@@ -42,6 +42,7 @@ fn twap_parent_fills_through_child_orders_on_the_real_exchange() {
         regime: Regime::India,
         wholesaler_addr: None,
         ats_addr: None,
+        news_addr: None,
     })
     .unwrap()
     .0;

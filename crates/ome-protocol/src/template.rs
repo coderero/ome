@@ -12,6 +12,7 @@ pub const CANCEL_CONDITIONAL: u16 = 18;
 pub const ALGO_ORDER: u16 = 19;
 pub const CANCEL_ALGO: u16 = 24;
 pub const DARK_ORDER: u16 = 25;
+pub const SUBSCRIBE_NEWS: u16 = 26;
 pub const SUBSCRIBE: u16 = 20;
 pub const UNSUBSCRIBE: u16 = 21;
 pub const QUERY_ACCOUNT: u16 = 22;
@@ -53,6 +54,9 @@ pub const SET_CANCEL_ON_DISCONNECT: u16 = 88;
 pub const QUERY_VENUE: u16 = 89;
 pub const SET_DMM: u16 = 90;
 pub const QUERY_OBLIGATIONS: u16 = 91;
+pub const QUERY_NEWSROOM: u16 = 92;
+pub const QUERY_NEWS: u16 = 93;
+pub const INJECT_NEWS: u16 = 94;
 
 pub const LOGON_ACK: u16 = 100;
 pub const SERVER_HEARTBEAT: u16 = 101;
@@ -73,6 +77,8 @@ pub const OBLIGATIONS: u16 = 134;
 pub const SIM_STATUS: u16 = 135;
 pub const SIM_EVENT: u16 = 136;
 pub const SIM_RECORDINGS: u16 = 137;
+pub const NEWS: u16 = 138;
+pub const NEWSROOM_STATUS: u16 = 139;
 
 pub const SIM_LOGON: u16 = 600;
 pub const SIM_GROUPS: u16 = 601;

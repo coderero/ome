@@ -13,6 +13,10 @@ OME_RECORD="${OME_RECORD:-0}"
 OME_SIMCTL="${OME_SIMCTL:-$OME_HOST:7400}"
 OME_SIM_SECRET="${OME_SIM_SECRET:-sim}"
 OME_SIM_RUNNER_SECRET="${OME_SIM_RUNNER_SECRET:-runner}"
+OME_NEWS="${OME_NEWS:-$OME_HOST:7500}"
+OME_NEWS_SECRET="${OME_NEWS_SECRET:-ops}"
+OME_NEWS_RATE="${OME_NEWS_RATE:-3}"
+OME_QUARTER_DAYS="${OME_QUARTER_DAYS:-5}"
 OME_POSTGRES="${OME_POSTGRES:-postgres://ome:ome@127.0.0.1/ome}"
 OME_REDIS="${OME_REDIS:-redis://127.0.0.1/}"
 if [[ "$OME_TRADING_DAY" == "off" ]]; then
@@ -44,6 +48,7 @@ venue_addr() {
   return 1
 }
 
+news_cmd() { "$BIN/ome" news --addr "$OME_NEWS" --user ops --secret "$OME_NEWS_SECRET" "$@"; }
 sim_cmd() { "$BIN/ome" sim --addr "$OME_SIMCTL" --secret "$OME_SIM_SECRET" "$@"; }
 venue_cmd() { local addr; addr="$(venue_addr "$1")"; shift; "$BIN/ome" venue --addr "$addr" --user ops --secret "$OME_VENUE_SECRET" "$@"; }
 

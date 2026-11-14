@@ -39,6 +39,7 @@ pub struct BrokerConfig {
     pub regime: Regime,
     pub wholesaler_addr: Option<String>,
     pub ats_addr: Option<String>,
+    pub news_addr: Option<String>,
 }
 
 pub enum BrokerInbound {
@@ -47,6 +48,7 @@ pub enum BrokerInbound {
     Clearing { generation: u64, event: LinkEvent },
     Wholesaler { generation: u64, event: LinkEvent },
     Ats { generation: u64, event: LinkEvent },
+    News { generation: u64, event: LinkEvent },
 }
 
 impl From<Inbound> for BrokerInbound {
@@ -69,6 +71,10 @@ fn wholesaler_event(generation: u64, event: LinkEvent) -> BrokerInbound {
 
 fn ats_event(generation: u64, event: LinkEvent) -> BrokerInbound {
     BrokerInbound::Ats { generation, event }
+}
+
+fn news_event(generation: u64, event: LinkEvent) -> BrokerInbound {
+    BrokerInbound::News { generation, event }
 }
 
 pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
@@ -136,7 +142,15 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
             ),
         );
     }
-    let mut gateway = Gateway::new(broker, journal, exchange, clearing, venues, last_ts);
+    let news = config.news_addr.clone().map(|addr| {
+        Upstream::new(
+            "news feed",
+            Box::new(TcpConnector::new(addr, tx.clone(), news_event)),
+            credentials(),
+        )
+    });
+    let mut gateway =
+        Gateway::new(broker, journal, exchange, clearing, venues, last_ts).with_news(news);
     gateway.ensure_admin(&config.admin_name, &config.admin_secret, now_ms())?;
     gateway.flush().map_err(|e| e.to_string())?;
 
@@ -196,5 +210,6 @@ fn handle(gateway: &mut Gateway, inbound: BrokerInbound) {
         BrokerInbound::Ats { generation, event } => {
             gateway.on_venue(ome_protocol::Venue::Ats, generation, event, now_ms())
         }
+        BrokerInbound::News { generation, event } => gateway.on_news(generation, event, now_ms()),
     }
 }

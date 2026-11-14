@@ -37,6 +37,7 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str) -> SocketAdd
         regime: Regime::India,
         wholesaler_addr: None,
         ats_addr: None,
+        news_addr: None,
     })
     .unwrap()
     .0

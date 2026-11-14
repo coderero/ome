@@ -60,6 +60,7 @@ const USAGE: &str = "usage:
       algos  |  cancel-algo <id>                          working algos with progress
       dark <SYMBOL> <side> <qty> [limit] [min:<qty>]      midpoint order in the dark pool (quant and prop)
       stats <SYMBOL>                                      market statistics with volume by venue
+      news [n]                                            latest stories from the broker's news feed
       instruments  |  watch <SYMBOL>
 
   ome venue [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>   (wholesaler 7301, dark pool 7302)
@@ -80,6 +81,12 @@ const USAGE: &str = "usage:
       replay <name> [speed]  |  replay stop               re-issue a recording with its original spacing (speed 2 = twice as fast)
       recordings  |  recording <name>                     saved recordings, or one recording's timeline
 
+  ome news [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>   (newsroom 7500)
+      status                                              economy, companies, fundamentals and fair values
+      list [n] [SYMBOL]  |  read <seq>  |  watch          recent stories (a symbol includes its sector and macro news)
+      inject <event> [SYMBOL]                             earnings, cpi, rates, gdp, contract-win, lawsuit, recall, upgrade, ...
+      register <member-name> <secret>                     let a broker subscribe to the news feed
+
   ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
       status                                              cycles, collateral, margin, credit, fails
       register <member-name> <secret>                     make an exchange member a clearing member
@@ -89,6 +96,7 @@ defaults: OME_EXCHANGE / OME_MEMBER / OME_MEMBER_SECRET and OME_BROKER / OME_USE
 <account> may be an id or a username";
 
 enum Target {
+    News,
     Exchange,
     Broker,
     Clearing,
@@ -130,6 +138,13 @@ fn parse_options() -> std::result::Result<Options, String> {
             addr: env("OME_SIMCTL", "127.0.0.1:7400"),
             user: "operator".into(),
             secret: env("OME_SIM_SECRET", "sim"),
+            command: Vec::new(),
+        },
+        Some("news") => Options {
+            target: Target::News,
+            addr: env("OME_NEWS", "127.0.0.1:7500"),
+            user: env("OME_NEWS_OPS", "ops"),
+            secret: env("OME_NEWS_SECRET", "ops"),
             command: Vec::new(),
         },
         Some("venue") => Options {
@@ -185,6 +200,9 @@ fn main() {
         Target::Clearing => Client::connect_member(&options.addr, &options.user, &options.secret)
             .map_err(Into::into)
             .and_then(|(mut client, _)| clearing(&mut client, &args)),
+        Target::News => Client::connect_member(&options.addr, &options.user, &options.secret)
+            .map_err(Into::into)
+            .and_then(|(mut client, _)| news(&mut client, &args)),
         Target::Venue => Client::connect_member(&options.addr, &options.user, &options.secret)
             .map_err(Into::into)
             .and_then(|(mut client, _)| venue(&mut client, &args)),
@@ -896,6 +914,18 @@ fn broker(client: &mut Client, args: &[&str]) -> Result<()> {
                 _ => unreachable!(),
             }
         }
+        ["news", rest @ ..] if rest.len() <= 1 => {
+            let recent = rest.first().map_or(Ok(10), |n| number(n))? as u32;
+            client.send(&ClientMessage::SubscribeNews { recent })?;
+            let quiet = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < quiet {
+                match client.recv_timeout(Duration::from_millis(100))? {
+                    Some(ServerMessage::News(item)) => print_news(&item),
+                    Some(ServerMessage::Reject { reason, .. }) => return Err(reason.into()),
+                    _ => {}
+                }
+            }
+        }
         ["stats", sym] => {
             let symbol = symbol(sym)?;
             client.send(&ClientMessage::Subscribe { symbol })?;
@@ -1228,6 +1258,151 @@ fn clearing(client: &mut Client, args: &[&str]) -> Result<()> {
                 client.request_member(&MemberMessage::Deposit { member, amount })?
             );
         }
+        _ => usage()?,
+    }
+    Ok(())
+}
+
+fn print_news(item: &ome_protocol::NewsItem) {
+    println!(
+        "#{:<5} day {:<3} {:<10} {:<6} {:>+4} {:>+6}bps  {}",
+        item.seq,
+        item.day,
+        item.kind.label(),
+        item.symbol
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| if item.sector.is_empty() {
+                "-".into()
+            } else {
+                item.sector.clone()
+            }),
+        item.sentiment,
+        item.impact_bps,
+        item.headline
+    );
+}
+
+fn bps(value: i64) -> String {
+    format!(
+        "{}{}.{:02}%",
+        if value < 0 { "-" } else { "" },
+        value.abs() / 100,
+        value.abs() % 100
+    )
+}
+
+fn news(client: &mut Client, args: &[&str]) -> Result<()> {
+    match args {
+        ["status"] => {
+            client.send_member(&MemberMessage::QueryNewsroom)?;
+            let ServerMessage::NewsroomStatus(s) = client
+                .wait_for(Duration::from_secs(5), |m| {
+                    matches!(m, ServerMessage::NewsroomStatus(_))
+                })?
+            else {
+                unreachable!()
+            };
+            println!(
+                "day {} · quarter {} · {} stories · {} subscriber(s) · writer {}",
+                s.day, s.quarter, s.published, s.subscribers, s.writer
+            );
+            println!(
+                "economy: policy rate {} · inflation {} · growth {} · risk appetite {:+}",
+                bps(s.economy.rate_bps),
+                bps(s.economy.inflation_bps),
+                bps(s.economy.growth_bps),
+                s.economy.risk_appetite
+            );
+            for c in &s.companies {
+                println!(
+                    "  {:<6} {:<18} {:<10} fair {:>9}  EPS q {:>6} (next est {:>6})  revenue q ${:<10} margin {:>7} growth {:>7}  reports day {}",
+                    c.symbol.map(|s| s.to_string()).unwrap_or_default(),
+                    c.name,
+                    c.sector,
+                    format_price(c.fair),
+                    format_signed(c.eps_cents),
+                    format_signed(c.consensus_cents),
+                    c.revenue,
+                    bps(c.margin_bps),
+                    bps(c.growth_bps),
+                    c.next_report_day
+                );
+            }
+        }
+        ["list", rest @ ..] if rest.len() <= 2 => {
+            let mut limit = 20;
+            let mut filter = None;
+            for arg in rest {
+                match arg.parse::<u32>() {
+                    Ok(n) => limit = n,
+                    Err(_) => filter = Some(symbol(arg)?),
+                }
+            }
+            client.send_member(&MemberMessage::QueryNews {
+                limit,
+                symbol: filter,
+            })?;
+            loop {
+                match client.wait_for(Duration::from_secs(5), |m| {
+                    matches!(
+                        m,
+                        ServerMessage::News(_)
+                            | ServerMessage::Ack { .. }
+                            | ServerMessage::Reject { .. }
+                    )
+                })? {
+                    ServerMessage::News(item) => print_news(&item),
+                    ServerMessage::Reject { reason, .. } => return Err(reason.into()),
+                    _ => break,
+                }
+            }
+        }
+        ["read", seq] => {
+            let wanted = number(seq)?;
+            client.send_member(&MemberMessage::QueryNews {
+                limit: 500,
+                symbol: None,
+            })?;
+            let mut found = None;
+            loop {
+                match client.wait_for(Duration::from_secs(5), |m| {
+                    matches!(m, ServerMessage::News(_) | ServerMessage::Ack { .. })
+                })? {
+                    ServerMessage::News(item) if item.seq == wanted => found = Some(item),
+                    ServerMessage::News(_) => {}
+                    _ => break,
+                }
+            }
+            let item = found.ok_or(format!("story #{wanted} is not among the last 500"))?;
+            print_news(&item);
+            println!("\n{}\n\n{}", item.headline, item.body);
+            if !item.data.is_empty() {
+                println!("\ndata: {}", item.data);
+            }
+        }
+        ["watch"] => loop {
+            if let Some(ServerMessage::News(item)) = client.recv_timeout(Duration::from_secs(10))? {
+                print_news(&item);
+            }
+        },
+        ["inject", event, rest @ ..] if rest.len() <= 1 => {
+            let target = rest.first().map(|s| symbol(s)).transpose()?;
+            println!(
+                "{}",
+                client.request_member(&MemberMessage::InjectNews {
+                    symbol: target,
+                    event: event.to_string(),
+                })?
+            );
+        }
+        ["register", name, secret] => println!(
+            "{}",
+            client.request_member(&MemberMessage::CreateMember {
+                kind: MemberKind::Broker,
+                name: name.to_string(),
+                secret: secret.to_string(),
+            })?
+        ),
         _ => usage()?,
     }
     Ok(())

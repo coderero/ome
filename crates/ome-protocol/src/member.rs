@@ -73,6 +73,15 @@ pub enum MemberMessage {
         member: MemberId,
     },
     QueryObligations,
+    QueryNewsroom,
+    QueryNews {
+        limit: u32,
+        symbol: Option<Symbol>,
+    },
+    InjectNews {
+        symbol: Option<Symbol>,
+        event: String,
+    },
     SetMemberStatus {
         member: MemberId,
         enabled: bool,
@@ -146,6 +155,9 @@ impl MemberMessage {
             MemberMessage::QueryVenue => QUERY_VENUE,
             MemberMessage::SetDmm { .. } => SET_DMM,
             MemberMessage::QueryObligations => QUERY_OBLIGATIONS,
+            MemberMessage::QueryNewsroom => QUERY_NEWSROOM,
+            MemberMessage::QueryNews { .. } => QUERY_NEWS,
+            MemberMessage::InjectNews { .. } => INJECT_NEWS,
             MemberMessage::SetMemberStatus { .. } => SET_MEMBER_STATUS,
             MemberMessage::SetCancelOnDisconnect { .. } => SET_CANCEL_ON_DISCONNECT,
             MemberMessage::CreateMember { .. } => CREATE_MEMBER,
@@ -178,8 +190,15 @@ impl MemberMessage {
             | MemberMessage::QueryMembers
             | MemberMessage::QueryClearing
             | MemberMessage::QueryVenue
-            | MemberMessage::QueryObligations => {
+            | MemberMessage::QueryObligations
+            | MemberMessage::QueryNewsroom => {
                 e.end_block();
+            }
+            MemberMessage::QueryNews { limit, symbol } => {
+                e.u32(*limit).symbol(*symbol).end_block();
+            }
+            MemberMessage::InjectNews { symbol, event } => {
+                e.symbol(*symbol).end_block().var(event);
             }
             MemberMessage::SetDmm { symbol, member } => {
                 e.symbol(Some(*symbol)).u64(*member).end_block();
@@ -476,6 +495,24 @@ impl MemberMessage {
                 d.end_block()?;
                 MemberMessage::QueryObligations
             }
+            QUERY_NEWSROOM => {
+                d.end_block()?;
+                MemberMessage::QueryNewsroom
+            }
+            QUERY_NEWS => {
+                let limit = d.u32()?;
+                let symbol = d.optional_symbol()?;
+                d.end_block()?;
+                MemberMessage::QueryNews { limit, symbol }
+            }
+            INJECT_NEWS => {
+                let symbol = d.optional_symbol()?;
+                d.end_block()?;
+                MemberMessage::InjectNews {
+                    symbol,
+                    event: d.var()?,
+                }
+            }
             MEMBER_SET_MMP => {
                 let account = d.u64()?;
                 let window_ms = d.u64()?;
@@ -685,6 +722,15 @@ pub mod tests {
                 member: 5,
             },
             MemberMessage::QueryObligations,
+            MemberMessage::QueryNewsroom,
+            MemberMessage::QueryNews {
+                limit: 20,
+                symbol: Some(sym("ACME")),
+            },
+            MemberMessage::InjectNews {
+                symbol: None,
+                event: "rate-hike".into(),
+            },
             MemberMessage::SetMemberStatus {
                 member: 3,
                 enabled: false,

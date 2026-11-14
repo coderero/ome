@@ -28,6 +28,13 @@ start_bg simctl "$BIN/ome-simctl" --listen "$OME_SIMCTL" --journal "$OME_DATA/si
   --exchange-secret "$OME_EXCHANGE_SECRET"
 wait_for sim_cmd status
 
+start_bg newsroom "$BIN/ome-newsroom" --listen "$OME_NEWS" --journal "$OME_DATA/newsroom.journal" \
+  --companies config/companies.conf --ops-secret "$OME_NEWS_SECRET" --exchange "$OME_EXCHANGE" \
+  --exchange-secret "$OME_EXCHANGE_SECRET" --simctl "$OME_SIMCTL" --sim-secret "$OME_SIM_SECRET" \
+  --quarter-days "$OME_QUARTER_DAYS" --news-per-minute "$OME_NEWS_RATE"
+wait_for news_cmd status
+(( fresh )) && scripts/seed.sh news
+
 for v in "${venues[@]}"; do
   read -r name kind _ port <<<"$v"
   start_bg "$name" "$BIN/ome-venue" --kind "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
@@ -46,7 +53,7 @@ for p in "${providers[@]}"; do
   if [[ "$OME_REGIME" == "us" && "$name" == "prime-co" ]]; then routes=(--ats "$(venue_addr ats-co)"); fi
   start_bg "$name" "$BIN/ome-broker" --profile "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
     --member "$name" --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/$name.journal" --admin-secret "$OME_BROKER_SECRET" \
-    --clearing "$OME_CLEARING" --regime "$OME_REGIME" "${routes[@]}"
+    --clearing "$OME_CLEARING" --regime "$OME_REGIME" --news "$OME_NEWS" "${routes[@]}"
 done
 for p in "${providers[@]}"; do
   read -r name _ _ _ <<<"$p"
@@ -91,6 +98,7 @@ examples:
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw balance
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw buy ACME mkt 5
 recording:   OME_RECORD=1 scripts/demo.sh records into PostgreSQL and Redis (scripts/db.sh up first)
+news:        ./target/release/ome news status | list | read <seq> | watch | inject lawsuit ACME | inject cpi
 simulation:  ./target/release/ome sim status | pause noise | crash ACME | news NOVA -8 | fair ZEN 85.00 2 | speed 3 30 3 3
 stop everything:  scripts/stop.sh
 MSG

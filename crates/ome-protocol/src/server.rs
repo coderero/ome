@@ -45,6 +45,8 @@ pub enum ServerMessage {
     SimStatus(crate::sim::SimStatus),
     SimEvent(crate::sim::SimCommand),
     SimRecordings(Vec<crate::sim::RecordingInfo>),
+    News(crate::news::NewsItem),
+    NewsroomStatus(crate::news::NewsroomStatus),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -81,6 +83,8 @@ impl ServerMessage {
             ServerMessage::SimStatus(_) => SIM_STATUS,
             ServerMessage::SimEvent(_) => SIM_EVENT,
             ServerMessage::SimRecordings(_) => SIM_RECORDINGS,
+            ServerMessage::News(_) => NEWS,
+            ServerMessage::NewsroomStatus(_) => NEWSROOM_STATUS,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -264,6 +268,8 @@ impl ServerMessage {
                 e.end_block();
                 crate::sim::put_recordings(&mut e, list);
             }
+            ServerMessage::News(item) => crate::news::put_news(&mut e, item),
+            ServerMessage::NewsroomStatus(status) => crate::news::put_status(&mut e, status),
             ServerMessage::SimStatus(s) => {
                 e.u32(s.runners).end_block();
                 crate::sim::put_groups(&mut e, &s.groups);
@@ -708,6 +714,8 @@ impl ServerMessage {
                 ServerMessage::MarketStats(stats)
             }
             SIM_EVENT => ServerMessage::SimEvent(crate::sim::get_command(&mut d)?),
+            NEWS => ServerMessage::News(crate::news::get_news(&mut d)?),
+            NEWSROOM_STATUS => ServerMessage::NewsroomStatus(crate::news::get_status(&mut d)?),
             SIM_RECORDINGS => {
                 d.end_block()?;
                 ServerMessage::SimRecordings(crate::sim::get_recordings(&mut d)?)
@@ -1305,6 +1313,44 @@ mod tests {
                 group: "noise".into(),
                 key: "activity".into(),
                 value: "0.9".into(),
+            }),
+            ServerMessage::News(crate::news::NewsItem {
+                seq: 7,
+                time: 1_000,
+                day: 3,
+                kind: crate::news::NewsKind::Earnings,
+                symbol: Some(sym("ACME")),
+                sentiment: -35,
+                impact_bps: -180,
+                sector: "robotics".into(),
+                headline: "Acme misses estimates".into(),
+                body: "Quarterly EPS of 0.28 against 0.31 expected.".into(),
+                data: "eps=0.28 consensus=0.31".into(),
+            }),
+            ServerMessage::NewsroomStatus(crate::news::NewsroomStatus {
+                day: 4,
+                quarter: 1,
+                published: 30,
+                subscribers: 2,
+                economy: crate::news::MacroInfo {
+                    rate_bps: 450,
+                    inflation_bps: 280,
+                    growth_bps: 190,
+                    risk_appetite: -10,
+                },
+                companies: vec![crate::news::CompanyInfo {
+                    symbol: Some(sym("ACME")),
+                    eps_cents: 125,
+                    consensus_cents: 130,
+                    revenue: 9_000,
+                    margin_bps: 1_200,
+                    growth_bps: 900,
+                    fair: 2_480,
+                    next_report_day: 5,
+                    name: "Acme Robotics".into(),
+                    sector: "robotics".into(),
+                }],
+                writer: "templates".into(),
             }),
             ServerMessage::SimRecordings(vec![crate::sim::RecordingInfo {
                 name: "crash-drill".into(),

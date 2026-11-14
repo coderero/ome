@@ -565,6 +565,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ome-newsroom"
+version = "0.5.0"
+dependencies = [
+ "ome-broker",
+ "ome-client",
+ "ome-core",
+ "ome-exchange",
+ "ome-net",
+ "ome-protocol",
+ "ome-simctl",
+ "ome-store",
+ "rand 0.9.5",
+]
+
+[[package]]
 name = "ome-protocol"
 version = "0.5.0"
 dependencies = [

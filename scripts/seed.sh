@@ -11,6 +11,13 @@ seed_members() {
   done
 }
 
+seed_news() {
+  for p in "${providers[@]}"; do
+    read -r name _ _ _ <<<"$p"
+    news_cmd register "$name" "$OME_MEMBER_SECRET" || true
+  done
+}
+
 seed_venues() {
   wait_for venue_cmd wholesale-co register retail-co "$OME_MEMBER_SECRET" || true
   wait_for venue_cmd ats-co register prime-co "$OME_MEMBER_SECRET" || true
@@ -53,7 +60,7 @@ seed_market() {
     exchange_cmd ipo "$symbol" "$price" "$shares" prime-co "$issuer" "$name"
     wait_for listed_everywhere "$symbol"
     exchange_cmd dmm "$symbol" lp-co
-    sim_cmd fair "$symbol" "$price"
+    news_cmd status >/dev/null 2>&1 || sim_cmd fair "$symbol" "$price"
   done
 }
 
@@ -61,6 +68,7 @@ case "${1:-}" in
   members) seed_members ;;
   clearing) seed_clearing ;;
   venues) seed_venues ;;
+  news) seed_news ;;
   market) seed_market ;;
-  *) echo "usage: scripts/seed.sh members|clearing|venues|market" >&2; exit 2 ;;
+  *) echo "usage: scripts/seed.sh members|clearing|venues|news|market" >&2; exit 2 ;;
 esac

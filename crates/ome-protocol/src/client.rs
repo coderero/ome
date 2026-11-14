@@ -92,6 +92,9 @@ pub enum ClientMessage {
     },
     QueryAccount,
     QueryInstruments,
+    SubscribeNews {
+        recent: u32,
+    },
     SetAccountStatus {
         account_id: AccountId,
         suspended: bool,
@@ -140,6 +143,7 @@ impl ClientMessage {
             ClientMessage::Unsubscribe { .. } => UNSUBSCRIBE,
             ClientMessage::QueryAccount => QUERY_ACCOUNT,
             ClientMessage::QueryInstruments => QUERY_INSTRUMENTS,
+            ClientMessage::SubscribeNews { .. } => SUBSCRIBE_NEWS,
             ClientMessage::CreateAccount { .. } => CREATE_ACCOUNT,
             ClientMessage::SetBalance { .. } => SET_BALANCE,
             ClientMessage::QueryAccounts => QUERY_ACCOUNTS,
@@ -162,6 +166,9 @@ impl ClientMessage {
             | ClientMessage::QueryAccounts
             | ClientMessage::QueryFees => {
                 e.end_block();
+            }
+            ClientMessage::SubscribeNews { recent } => {
+                e.u32(*recent).end_block();
             }
             ClientMessage::NewOrder {
                 client_order_id,
@@ -346,6 +353,11 @@ impl ClientMessage {
             QUERY_INSTRUMENTS => {
                 d.end_block()?;
                 ClientMessage::QueryInstruments
+            }
+            SUBSCRIBE_NEWS => {
+                let recent = d.u32()?;
+                d.end_block()?;
+                ClientMessage::SubscribeNews { recent }
             }
             QUERY_ACCOUNTS => {
                 d.end_block()?;
@@ -676,6 +688,7 @@ pub mod tests {
             },
             ClientMessage::QueryAccount,
             ClientMessage::QueryInstruments,
+            ClientMessage::SubscribeNews { recent: 25 },
             ClientMessage::CreateAccount {
                 role: Role::Hft,
                 cash: 1_000_000,

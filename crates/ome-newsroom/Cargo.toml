@@ -1,0 +1,21 @@
+[package]
+name = "ome-newsroom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ome-core.workspace = true
+ome-protocol.workspace = true
+ome-store.workspace = true
+ome-net.workspace = true
+ome-client.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+ome-exchange.workspace = true
+ome-broker.workspace = true
+ome-simctl = { path = "../ome-simctl" }
+
+[lints]
+workspace = true

@@ -7,7 +7,7 @@ Every price, balance and trade comes from real orders matching in the engine. No
 ## Quick Start
 
 ```bash
-scripts/demo.sh --fresh       # build; start exchange, clearing, 2 venues, 4 providers; seed 3 IPOs; start bots
+scripts/demo.sh --fresh       # build; start exchange, clearing, simctl, newsroom, 2 venues, 4 providers; seed 3 IPOs; start agents
 scripts/stop.sh
 
 scripts/db.sh up              # PostgreSQL + Redis in Docker
@@ -75,6 +75,7 @@ crates/
 ├── ome-broker     provider service with retail / prime / dma / lp profiles (lib + `ome-broker`)
 ├── ome-venue      off-exchange venues: wholesaler and dark pool (lib + `ome-venue`)
 ├── ome-simctl     simulation control plane for the artificial participants (lib + `ome-simctl`)
+├── ome-newsroom   news vendor: company fundamentals, economy, earnings and news feed (lib + `ome-newsroom`)
 ├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
 └── ome-agents     trading firms from config/roster.conf: HFT, DMM, quant, pension, prop, retail personas
@@ -368,6 +369,34 @@ A recording starts with the settings in effect at that moment (group settings, f
 
 Fair values start at the listing prices (the seed script sets them). In a test run a flash crash took ACME from 24.60 to 23.06 and value buyers brought it back to 25.12 in the next session; a -8% news shock moved NOVA from 12.10 to its new fair value of 11.50 within 15 seconds.
 
+## News, Fundamentals and the Economy
+
+`ome-newsroom` (port 7500) is a news vendor. It follows the companies in `config/companies.conf` (sector, listing price, shares, EPS, net margin, revenue growth, sensitivity to the economy) and runs the economy behind them: policy rate, inflation, growth and risk appetite. It takes the trading calendar from the exchange and publishes:
+
+| Story | When | Effect |
+|---|---|---|
+| prospectus | when a company is first covered | financial baseline: revenue, margin, EPS, growth, shares, price |
+| earnings | pre-open, every `--quarter-days` trading days, staggered by company | new revenue, margin and EPS against the analyst consensus; the surprise sets the tone |
+| inflation (CPI), GDP | pre-open on a calendar | actual vs expected moves risk appetite |
+| central bank decision | pre-open on a calendar | hikes against inflation, cuts for weak growth, sometimes a surprise |
+| company news | during the session (`--news-per-minute`) | contract wins, launches, lawsuits, recalls, executive departures, buybacks, guidance changes, analyst ratings, takeover rumours |
+| sector news | during the session | regulation, demand booms, supply shocks, subsidies for every company in the sector |
+
+Each story carries a structured sentiment (-100 to 100), its effect on fair value in bps and its numbers (`eps=0.63 consensus=0.65 ...`) next to the headline and body. Analyst ratings and rumours carry sentiment but do not change fundamentals. Fair value is the listing price scaled by forward earnings and a re-rating from rates, growth and risk appetite; the newsroom keeps ome-simctl's fair values in step, so value investors trade around them. Text currently comes from templates (an LLM writer is phase 3c).
+
+Brokers subscribe with `--news` (registered once with `ome news register`), resume after the last story they saw, cache recent stories and pass them to clients that ask (`ome broker ... news`). Everything is journaled, so a killed newsroom restarts with the same economy, fundamentals and story numbers.
+
+```bash
+ome news status                       # economy, companies: fair value, EPS vs next estimate, margin, growth, next report day
+ome news list 20 ACME                 # recent stories about ACME, its sector and the economy
+ome news read 8                       # one story in full with its numbers
+ome news watch                        # follow the feed live
+ome news inject lawsuit ACME          # publish a story now (earnings, cpi, rates, gdp or any catalogue event)
+ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw news 5
+```
+
+In a test run the newsroom published a hot CPI print (-56 bps on fair values), a rate hold, a Zen Biotech takeover rumour and a Zen earnings miss (0.63 vs 0.65, -63 bps); after a kill -9 it came back at the same day and story count, and an injected lawsuit (-199 bps on ACME) reached the brokers' clients with no duplicates.
+
 ## Storage: PostgreSQL and Redis
 
 The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house and the venues as ops and to every provider as broker admin. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
@@ -406,7 +435,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 216 tests
+cargo test --workspace     # 232 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -417,7 +446,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 - **1g** ~~off-exchange execution: internalization, tape reporting, wholesaler with PFOF, dark pool, market stats, designated market makers~~ done
 - **1h** ~~PostgreSQL (accounts, trades, settlements) and Redis (market data)~~ done
 - **2** ~~tiered agents (HFT, DMM, quant, pension, prop, rule-based and ML retail), simulation control plane with scenarios and record/replay~~ done
-- **3** local-LLM newsroom: company reports, IPO prospectuses, news and macro events
+- **3** newsroom: ~~fundamentals, economy, earnings and news feed (3a)~~ done; news-driven agents and prospectus-gated listings (3b); local-LLM writer (3c)
 - **4** GPUI desktop apps, one per party (the terminal UI was retired)
 
 ## License
