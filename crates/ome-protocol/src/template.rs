@@ -70,6 +70,14 @@ pub const ALGO_UPDATE: u16 = 117;
 pub const VENUE_STATUS: u16 = 118;
 pub const MARKET_STATS: u16 = 119;
 pub const OBLIGATIONS: u16 = 134;
+pub const SIM_STATUS: u16 = 135;
+pub const SIM_EVENT: u16 = 136;
+
+pub const SIM_LOGON: u16 = 600;
+pub const SIM_GROUPS: u16 = 601;
+pub const SIM_COMMAND: u16 = 602;
+pub const SIM_ACCELERATE: u16 = 603;
+pub const SIM_QUERY: u16 = 604;
 pub const SETTLEMENT_REPORT: u16 = 115;
 pub const INSTRUMENT_LIST: u16 = 120;
 pub const INSTRUMENT: u16 = 121;

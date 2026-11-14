@@ -23,6 +23,11 @@ start_bg clearing "$BIN/ome-clearing" --listen "$OME_CLEARING" --exchange "$OME_
 wait_for clearing_cmd status
 (( fresh )) && scripts/seed.sh clearing
 
+start_bg simctl "$BIN/ome-simctl" --listen "$OME_SIMCTL" --journal "$OME_DATA/simctl.journal" \
+  --secret "$OME_SIM_SECRET" --runner-secret "$OME_SIM_RUNNER_SECRET" --exchange "$OME_EXCHANGE" \
+  --exchange-secret "$OME_EXCHANGE_SECRET"
+wait_for sim_cmd status
+
 for v in "${venues[@]}"; do
   read -r name kind _ port <<<"$v"
   start_bg "$name" "$BIN/ome-venue" --kind "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
@@ -86,5 +91,6 @@ examples:
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw balance
   ./target/release/ome broker --addr $(provider_addr retail-co) --user alice --secret alice-pw buy ACME mkt 5
 recording:   OME_RECORD=1 scripts/demo.sh records into PostgreSQL and Redis (scripts/db.sh up first)
+simulation:  ./target/release/ome sim status | pause noise | crash ACME | news NOVA -8 | fair ZEN 85.00 2 | speed 3 30 3 3
 stop everything:  scripts/stop.sh
 MSG

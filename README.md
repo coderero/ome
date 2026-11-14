@@ -74,6 +74,7 @@ crates/
 ├── ome-clearing   clearing house (lib + `ome-clearing` binary)
 ├── ome-broker     provider service with retail / prime / dma / lp profiles (lib + `ome-broker`)
 ├── ome-venue      off-exchange venues: wholesaler and dark pool (lib + `ome-venue`)
+├── ome-simctl     simulation control plane for the artificial participants (lib + `ome-simctl`)
 ├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
 └── ome-agents     trading firms from config/roster.conf: HFT, DMM, quant, pension, prop, retail personas
@@ -328,6 +329,36 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 #   ACME   10 (reserved 0, unsettled 10)
 ```
 
+## Trading Agents and the Simulation Control Plane
+
+`ome-agents` runs the firms listed in `config/roster.conf` (a group per line: broker, role, strategy, symbols, cash, starting inventory and strategy parameters). It opens their accounts through each broker's admin login, buys starting inventory with real orders, and then trades each firm through its broker with the order types of its tier:
+
+| Tier | Strategies |
+|---|---|
+| HFT (DMA) | Avellaneda-Stoikov market making: spread widens with volatility, quotes skew away from inventory, two-sided quotes with market maker protection |
+| Liquidity providers | designated market maker quoting round lots within the 2% obligation |
+| Quant funds (prime) | pairs stat-arb executed with POV algos or in the dark pool; factor model (momentum, reversal, volatility) rebalanced with VWAP parents; value investing around fair value |
+| Slow money (prime) | pension funds rebalancing to target weights with slow VWAP parents |
+| Prop desks (prime) | momentum, breakout and mean reversion entries, each position protected by an OCO take-profit/stop |
+| Retail | day traders (protective stops, flat before the close), swing traders (brackets on dips), investors (GTT dip buys, after-market orders, trailing stops), value-minded retail, noise traders |
+
+`ome-simctl` (port 7400) is the control plane for these artificial participants only; the exchange never sees it. Operators use `ome sim ...`, runners follow it with `--simctl`, and every command is journaled, so a restarted simctl or a reconnecting runner gets the current settings back.
+
+```bash
+ome sim status                        # groups, running/target, paused, fills, equity, parameters, fair values, scenarios
+ome sim pause noise                   # cancel the group's open orders and stop it (resume noise | pause *)
+ome sim count swing 25                # scale a group; new accounts are opened automatically
+ome sim param hft-vega gamma=0.6      # live parameter change (the strategy is rebuilt)
+ome sim fund daytrader 1000           # add cash to every account in a group
+ome sim fair ZEN 85.00 2              # fair value and drift in bps per minute, which value investors trade around
+ome sim crash ACME 15                 # flash crash: panic selling, liquidity withdraws, value buyers wait, then recover
+ome sim news NOVA -8                  # news shock: fair value -8% and negative sentiment for a minute
+ome sim drought 30 | volatility 30    # market-wide liquidity drought or activity burst
+ome sim speed 3 30 3 3                # time acceleration: trading day phase lengths in seconds
+```
+
+Fair values start at the listing prices (the seed script sets them). In a test run a flash crash took ACME from 24.60 to 23.06 and value buyers brought it back to 25.12 in the next session; a -8% news shock moved NOVA from 12.10 to its new fair value of 11.50 within 15 seconds.
+
 ## Storage: PostgreSQL and Redis
 
 The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house and the venues as ops and to every provider as broker admin. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
@@ -377,7 +408,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 195 tests
+cargo test --workspace     # 206 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.

@@ -1,4 +1,5 @@
 use crate::action::{Action, execute};
+use crate::control::{AgentStats, GroupControl, Shared};
 use crate::roster::AgentSpec;
 use crate::state::AgentState;
 use crate::strategies::{self, Strategy, affordable, cancel_stale, scale};
@@ -9,6 +10,7 @@ use ome_core::types::{OrderKind, Side, Timestamp};
 use ome_protocol::{ClientMessage, ServerMessage};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,10 +84,39 @@ fn seed_for(name: &str) -> u64 {
     hasher.finish()
 }
 
-pub fn supervise(spec: AgentSpec, addr: String, secret: String, stop: Arc<AtomicBool>) {
+#[derive(Clone)]
+pub struct AgentContext {
+    pub group: Arc<GroupControl>,
+    pub shared: Arc<Shared>,
+    pub stats: Arc<AgentStats>,
+    pub stop: Arc<AtomicBool>,
+}
+
+impl AgentContext {
+    pub fn standalone(spec: &AgentSpec, stop: Arc<AtomicBool>) -> Self {
+        let group = Arc::new(GroupControl::new(
+            &spec.group,
+            &spec.strategy,
+            &spec.broker,
+            1,
+            spec.params.clone(),
+        ));
+        Self {
+            shared: Arc::new(Shared::new(BTreeMap::from([(
+                spec.group.clone(),
+                group.clone(),
+            )]))),
+            group,
+            stats: Arc::new(AgentStats::default()),
+            stop,
+        }
+    }
+}
+
+pub fn supervise(spec: AgentSpec, addr: String, secret: String, ctx: AgentContext) {
     let mut rng = StdRng::seed_from_u64(seed_for(&spec.name));
-    while !stop.load(Ordering::Relaxed) {
-        match run(&spec, &addr, &secret, &mut rng, &stop) {
+    while !ctx.stop.load(Ordering::Relaxed) {
+        match run(&spec, &addr, &secret, &mut rng, &ctx) {
             Err(ClientError::Rejected(reason)) => {
                 eprintln!("[{}] logon rejected: {reason}; giving up", spec.name);
                 return;
@@ -115,7 +146,7 @@ fn run(
     addr: &str,
     secret: &str,
     rng: &mut StdRng,
-    stop: &AtomicBool,
+    ctx: &AgentContext,
 ) -> Result<(), ClientError> {
     let (mut client, session) = Client::connect_and_logon(addr, &spec.name, secret)?;
     let mut state = AgentState::default();
@@ -123,7 +154,9 @@ fn run(
     for symbol in &symbols {
         client.send(&ClientMessage::Subscribe { symbol: *symbol })?;
     }
-    let Some(mut strategy) = strategies::create(&spec.strategy, &symbols, &spec.params) else {
+    let mut generation = ctx.group.generation();
+    let Some(mut strategy) = strategies::create(&spec.strategy, &symbols, &ctx.group.params())
+    else {
         eprintln!(
             "[{}] {} needs other symbols than {:?}; idle",
             spec.name, spec.strategy, symbols
@@ -141,7 +174,8 @@ fn run(
     let mut bootstrapping = spec.seed > 0;
     let mut next_tick = Instant::now() + strategy.interval();
     let mut next_status = Instant::now() + STATUS_EVERY;
-    while !stop.load(Ordering::Relaxed) {
+    let mut was_paused = false;
+    while !ctx.stop.load(Ordering::Relaxed) {
         let wait = next_tick.saturating_duration_since(Instant::now());
         if let Some(message) = client.recv_timeout(wait)? {
             state.apply(&message);
@@ -153,6 +187,34 @@ fn run(
             continue;
         }
         next_tick = Instant::now() + strategy.interval();
+        state.world = ctx
+            .shared
+            .world
+            .lock()
+            .expect("world lock")
+            .view(Instant::now());
+        ctx.stats.fills.store(state.fills, Ordering::Relaxed);
+        ctx.stats.equity.store(state.equity(), Ordering::Relaxed);
+        if ctx.group.is_paused() {
+            if !was_paused {
+                was_paused = true;
+                client.send(&ClientMessage::CancelAll { symbol: None })?;
+            }
+            continue;
+        }
+        was_paused = false;
+        if ctx.group.generation() != generation {
+            generation = ctx.group.generation();
+            if let Some(rebuilt) = strategies::create(&spec.strategy, &symbols, &ctx.group.params())
+            {
+                strategy = rebuilt;
+                eprintln!(
+                    "[{}] parameters changed: {:?}",
+                    spec.name,
+                    ctx.group.params().0
+                );
+            }
+        }
         let actions = if bootstrapping {
             match bootstrap.on_tick(&state, &symbols) {
                 Some(actions) => actions,
@@ -177,6 +239,7 @@ fn run(
             report(spec, strategy.as_ref(), &state);
         }
     }
+    client.send(&ClientMessage::CancelAll { symbol: None })?;
     Ok(())
 }
 

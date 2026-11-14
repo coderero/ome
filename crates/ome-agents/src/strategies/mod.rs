@@ -5,6 +5,7 @@ mod pension;
 mod prop;
 mod retail;
 mod statarb;
+mod value;
 
 use crate::action::Action;
 use crate::state::AgentState;
@@ -24,6 +25,7 @@ pub use pension::Pension;
 pub use prop::{PropDesk, PropSignal};
 pub use retail::{Persona, RetailPersona};
 pub use statarb::PairsTrader;
+pub use value::ValueInvestor;
 
 pub trait Strategy: Send {
     fn name(&self) -> &'static str;
@@ -67,6 +69,7 @@ pub const STRATEGIES: &[&str] = &[
     "pairs",
     "factor",
     "pension",
+    "value",
 ];
 
 pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn Strategy>> {
@@ -84,6 +87,7 @@ pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn
         "pairs" => Box::new(PairsTrader::new(symbols, params)?),
         "factor" => Box::new(FactorModel::new(symbols, params)),
         "pension" => Box::new(Pension::new(symbols, params)),
+        "value" => Box::new(ValueInvestor::new(symbols, params)),
         _ => return None,
     })
 }

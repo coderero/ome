@@ -128,6 +128,7 @@ pub struct AgentState {
     pub algos: BTreeMap<u64, AlgoReport>,
     pub fills: u64,
     pub rejects: u64,
+    pub world: crate::world::WorldView,
 }
 
 impl Default for AgentState {
@@ -148,6 +149,7 @@ impl Default for AgentState {
             algos: BTreeMap::new(),
             fills: 0,
             rejects: 0,
+            world: crate::world::WorldView::default(),
         }
     }
 }

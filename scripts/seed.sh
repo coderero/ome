@@ -53,6 +53,7 @@ seed_market() {
     exchange_cmd ipo "$symbol" "$price" "$shares" prime-co "$issuer" "$name"
     wait_for listed_everywhere "$symbol"
     exchange_cmd dmm "$symbol" lp-co
+    sim_cmd fair "$symbol" "$price"
   done
 }
 

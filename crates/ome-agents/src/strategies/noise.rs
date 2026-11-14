@@ -44,12 +44,14 @@ impl Strategy for NoiseTrader {
             self.sentiment = if rng.random_bool(0.5) { 1.0 } else { -1.0 };
         }
         let mut actions = cancel_stale(state, None, self.order_ttl);
-        if state.pending.len() > 2 || !rng.random_bool(self.activity.clamp(0.0, 1.0)) {
+        let activity = (self.activity * state.world.activity).clamp(0.0, 1.0);
+        if state.pending.len() > 2 || !rng.random_bool(activity) {
             return actions;
         }
         let Some(symbol) = pick(&self.symbols, rng) else {
             return actions;
         };
+        let mood = (self.sentiment + state.world.sentiment(symbol)).clamp(-1.0, 1.0);
         if !state.trading(symbol) {
             return actions;
         }
@@ -57,16 +59,22 @@ impl Strategy for NoiseTrader {
             return actions;
         };
         let held = state.holding(symbol).available;
-        let qty = rng.random_range(1..=self.max_size.max(1));
-        let mut side = if rng.random_bool((0.5 + self.sentiment * 0.3).clamp(0.05, 0.95)) {
+        let mut qty = rng.random_range(1..=self.max_size.max(1));
+        let mut side = if rng.random_bool((0.5 + mood * 0.4).clamp(0.05, 0.95)) {
             Side::Buy
         } else {
             Side::Sell
         };
         if side == Side::Sell && held < qty {
-            side = Side::Buy;
+            if held > 0 {
+                qty = held;
+            } else if mood < -0.3 {
+                return actions;
+            } else {
+                side = Side::Buy;
+            }
         }
-        let market = rng.random_bool(self.market_share.clamp(0.0, 1.0));
+        let market = mood < -0.5 || rng.random_bool(self.market_share.clamp(0.0, 1.0));
         let offset = rng.random_range(0.0..35.0);
         let price = match side {
             Side::Buy => scale(fair, -offset),

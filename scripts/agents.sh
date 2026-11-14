@@ -4,7 +4,8 @@ cd "$(dirname "$0")/.."
 source scripts/env.sh
 
 roster="${OME_ROSTER:-config/roster.conf}"
-args=(--roster "$roster" --admin-secret "$OME_BROKER_SECRET" --scale "${OME_AGENT_SCALE:-1}")
+args=(--roster "$roster" --admin-secret "$OME_BROKER_SECRET" --scale "${OME_AGENT_SCALE:-1}"
+  --simctl "$OME_SIMCTL" --sim-secret "$OME_SIM_RUNNER_SECRET")
 for p in "${providers[@]}"; do
   read -r name _ _ port <<<"$p"
   args+=(--broker "$name=$OME_HOST:$port")

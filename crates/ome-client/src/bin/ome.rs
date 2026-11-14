@@ -66,6 +66,17 @@ const USAGE: &str = "usage:
       status                                              fills, routing members, inventory and PFOF
       register <member-name> <secret>                     let an exchange member route to this venue
 
+  ome sim [--addr HOST:PORT] [--secret SECRET] <command>        simulation control plane (artificial participants only)
+      status                                              agent groups, fair values, active scenarios
+      pause <group|*>  |  resume <group|*>                stop or restart a group's trading (open orders are cancelled)
+      count <group> <n>                                   scale a group up or down
+      param <group|*> <key>=<value>                       change a strategy parameter live
+      fund <group|*> <amount>                             add cash to every account in a group
+      fair <SYMBOL> <price> [drift-bps-per-minute]        fundamental value that value investors trade around
+      crash <SYMBOL> [seconds]  |  news <SYMBOL> <percent> [seconds]
+      drought [seconds]  |  volatility [seconds]          market-wide liquidity or activity scenarios
+      speed <preopen> <open> <closing> <closed>           trading day length in seconds (time acceleration)
+
   ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
       status                                              cycles, collateral, margin, credit, fails
       register <member-name> <secret>                     make an exchange member a clearing member
@@ -79,6 +90,7 @@ enum Target {
     Broker,
     Clearing,
     Venue,
+    Sim,
 }
 
 struct Options {
@@ -108,6 +120,13 @@ fn parse_options() -> std::result::Result<Options, String> {
             addr: env("OME_CLEARING", "127.0.0.1:7200"),
             user: env("OME_CLEARING_OPS", "ops"),
             secret: env("OME_CLEARING_SECRET", "ops"),
+            command: Vec::new(),
+        },
+        Some("sim") => Options {
+            target: Target::Sim,
+            addr: env("OME_SIMCTL", "127.0.0.1:7400"),
+            user: "operator".into(),
+            secret: env("OME_SIM_SECRET", "sim"),
             command: Vec::new(),
         },
         Some("venue") => Options {
@@ -166,6 +185,14 @@ fn main() {
         Target::Venue => Client::connect_member(&options.addr, &options.user, &options.secret)
             .map_err(Into::into)
             .and_then(|(mut client, _)| venue(&mut client, &args)),
+        Target::Sim => Client::connect_sim(
+            &options.addr,
+            ome_protocol::SimRole::Operator,
+            &options.user,
+            &options.secret,
+        )
+        .map_err(Into::into)
+        .and_then(|mut client| sim(&mut client, &args)),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -1250,6 +1277,113 @@ fn venue(client: &mut Client, args: &[&str]) -> Result<()> {
         }
         _ => usage()?,
     }
+    Ok(())
+}
+
+fn sim(client: &mut Client, args: &[&str]) -> Result<()> {
+    use ome_protocol::{Scenario, SimCommand, SimMessage};
+    let seconds = |rest: &[&str], default: u64| -> std::result::Result<u64, String> {
+        rest.first().map_or(Ok(default), |s| number(s))
+    };
+    let command = match args {
+        ["status"] => {
+            client.send_sim(&SimMessage::QueryStatus)?;
+            let ServerMessage::SimStatus(s) = client.wait_for(Duration::from_secs(5), |m| {
+                matches!(m, ServerMessage::SimStatus(_))
+            })?
+            else {
+                unreachable!()
+            };
+            println!("{} runner(s) connected", s.runners);
+            for g in &s.groups {
+                println!(
+                    "  {:<12} {:<13} {:<10} {:>3}/{:<3} {:<7} fills {:>7}  equity {:>14}  {}",
+                    g.name,
+                    g.strategy,
+                    g.broker,
+                    g.running,
+                    g.target,
+                    if g.paused { "PAUSED" } else { "running" },
+                    g.fills,
+                    format_price(g.equity),
+                    g.params
+                );
+            }
+            for (symbol, price, drift) in &s.fair {
+                println!(
+                    "  fair {symbol:<8} {:>10}  drift {drift} bps/min",
+                    format_price(*price)
+                );
+            }
+            for (text, until) in &s.scenarios {
+                let left = until.saturating_sub(ome_net_now()) / 1_000;
+                println!("  scenario: {text} ({left}s left)");
+            }
+            return Ok(());
+        }
+        ["speed", a, b, c, d] => {
+            println!(
+                "{}",
+                client.request_sim(&SimMessage::Accelerate {
+                    pre_open_s: number(a)?,
+                    open_s: number(b)?,
+                    closing_s: number(c)?,
+                    closed_s: number(d)?,
+                })?
+            );
+            return Ok(());
+        }
+        ["pause", group] => SimCommand::Pause {
+            group: group.to_string(),
+        },
+        ["resume", group] => SimCommand::Resume {
+            group: group.to_string(),
+        },
+        ["count", group, n] => SimCommand::SetCount {
+            group: group.to_string(),
+            count: number(n)? as u32,
+        },
+        ["param", group, pair] => {
+            let (key, value) = pair.split_once('=').ok_or("expected key=value")?;
+            SimCommand::SetParam {
+                group: group.to_string(),
+                key: key.into(),
+                value: value.into(),
+            }
+        }
+        ["fund", group, value] => SimCommand::Fund {
+            group: group.to_string(),
+            amount: amount(value)?,
+        },
+        ["fair", sym, px, rest @ ..] if rest.len() <= 1 => SimCommand::SetFair {
+            symbol: symbol(sym)?,
+            price: price(px)?,
+            drift_bps: rest.first().map_or(Ok(0), |d| {
+                d.parse().map_err(|_| format!("invalid drift '{d}'"))
+            })?,
+        },
+        ["crash", sym, rest @ ..] => SimCommand::Scenario(Scenario::FlashCrash {
+            symbol: symbol(sym)?,
+            seconds: seconds(rest, 20)?,
+        }),
+        ["news", sym, pct, rest @ ..] => {
+            let negative = pct.starts_with('-');
+            let magnitude = price(pct.trim_start_matches(['-', '+']))? as i64;
+            SimCommand::Scenario(Scenario::NewsShock {
+                symbol: symbol(sym)?,
+                move_bps: if negative { -magnitude } else { magnitude },
+                seconds: seconds(rest, 60)?,
+            })
+        }
+        ["drought", rest @ ..] => SimCommand::Scenario(Scenario::LiquidityDrought {
+            seconds: seconds(rest, 30)?,
+        }),
+        ["volatility", rest @ ..] => SimCommand::Scenario(Scenario::VolatilityBurst {
+            seconds: seconds(rest, 30)?,
+        }),
+        _ => return usage(),
+    };
+    println!("{}", client.request_sim(&SimMessage::Command(command))?);
     Ok(())
 }
 

@@ -110,7 +110,8 @@ impl Strategy for MarketMaker {
                 continue;
             };
             let volatility = market.volatility_bps(100).unwrap_or(5.0);
-            let half = self.half_spread_bps(volatility);
+            let drought = state.world.drought;
+            let half = self.half_spread_bps(volatility) * if drought { 4.0 } else { 1.0 };
             let book = self.books.entry(symbol).or_default();
             if !state.trading(symbol) {
                 if open > 0 || book.quoted.is_some() {
@@ -145,7 +146,9 @@ impl Strategy for MarketMaker {
                 continue;
             }
             let mut size = (self.size as f64 * rng.random_range(0.7..1.3)).round() as Qty;
-            if self.obligation {
+            if drought {
+                size = (size / 4).max(1);
+            } else if self.obligation {
                 size = size.max(OBLIGATION_SIZE);
             }
             let bid_qty = affordable(budget, bid, size.max(1));

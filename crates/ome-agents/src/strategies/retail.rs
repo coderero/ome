@@ -78,6 +78,16 @@ impl RetailPersona {
                 continue;
             }
             let stops = Self::armed(state, symbol, Side::Sell);
+            if state.world.sentiment(symbol) < -0.5 && rng.random_bool(0.5) {
+                actions.extend(stops.into_iter().map(Action::CancelConditional));
+                actions.push(Action::Place {
+                    symbol,
+                    side: Side::Sell,
+                    kind: OrderKind::Market,
+                    qty: held,
+                });
+                return actions;
+            }
             let entry = *self.entries.entry(symbol).or_insert(last);
             let target_hit = last as f64 >= entry as f64 * (1.0 + self.target_pct / 100.0);
             if state.closing_soon() || target_hit {
@@ -101,7 +111,8 @@ impl RetailPersona {
                 return actions;
             }
         }
-        if state.closing_soon() || !rng.random_bool(self.activity) {
+        if state.closing_soon() || !rng.random_bool((self.activity * state.world.activity).min(1.0))
+        {
             return actions;
         }
         let candidates: Vec<Symbol> = self

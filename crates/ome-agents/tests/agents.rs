@@ -1,6 +1,6 @@
 use ome_agents::provision::provision;
 use ome_agents::roster::parse;
-use ome_agents::runner::supervise;
+use ome_agents::runner::{AgentContext, supervise};
 use ome_broker::profile::{ProfileKind, Regime};
 use ome_broker::{BrokerConfig, start as start_broker};
 use ome_client::Client;
@@ -102,7 +102,8 @@ fn roster_agents_provision_bootstrap_inventory_and_use_broker_held_orders() {
         .into_iter()
         .map(|agent| {
             let (addr, stop) = (retail.to_string(), stop.clone());
-            std::thread::spawn(move || supervise(agent, addr, "agent-pw".into(), stop))
+            let ctx = AgentContext::standalone(&agent, stop);
+            std::thread::spawn(move || supervise(agent, addr, "agent-pw".into(), ctx))
         })
         .collect();
 

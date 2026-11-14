@@ -584,6 +584,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ome-simctl"
+version = "0.5.0"
+dependencies = [
+ "ome-client",
+ "ome-core",
+ "ome-exchange",
+ "ome-net",
+ "ome-protocol",
+ "ome-store",
+]
+
+[[package]]
 name = "ome-store"
 version = "0.5.0"
 dependencies = [

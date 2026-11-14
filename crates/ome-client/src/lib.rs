@@ -236,6 +236,44 @@ impl Client {
         self.send_bytes(message.encode())
     }
 
+    pub fn send_sim(&mut self, message: &ome_protocol::SimMessage) -> Result<(), ClientError> {
+        self.send_bytes(message.encode())
+    }
+
+    pub fn connect_sim(
+        addr: &str,
+        role: ome_protocol::SimRole,
+        name: &str,
+        secret: &str,
+    ) -> Result<Self, ClientError> {
+        let mut client = Self::connect(addr)?;
+        client.send_sim(&ome_protocol::SimMessage::Logon {
+            role,
+            name: name.into(),
+            secret: secret.into(),
+        })?;
+        match client.wait_for(Duration::from_secs(5), |m| {
+            matches!(m, ServerMessage::Ack { .. } | ServerMessage::Reject { .. })
+        })? {
+            ServerMessage::Reject { reason, .. } => Err(ClientError::Rejected(reason)),
+            _ => Ok(client),
+        }
+    }
+
+    pub fn request_sim(
+        &mut self,
+        message: &ome_protocol::SimMessage,
+    ) -> Result<String, ClientError> {
+        self.send_sim(message)?;
+        match self.wait_for(Duration::from_secs(10), |m| {
+            matches!(m, ServerMessage::Ack { .. } | ServerMessage::Reject { .. })
+        })? {
+            ServerMessage::Ack { text, .. } => Ok(text),
+            ServerMessage::Reject { reason, .. } => Err(ClientError::Rejected(reason)),
+            _ => unreachable!(),
+        }
+    }
+
     fn send_bytes(&mut self, payload: Vec<u8>) -> Result<(), ClientError> {
         if self.link.send(payload) {
             Ok(())

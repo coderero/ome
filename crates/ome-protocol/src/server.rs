@@ -42,6 +42,8 @@ pub enum ServerMessage {
     VenueStatus(VenueStatus),
     MarketStats(MarketStats),
     Obligations(Vec<ObligationInfo>),
+    SimStatus(crate::sim::SimStatus),
+    SimEvent(crate::sim::SimCommand),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -75,6 +77,8 @@ impl ServerMessage {
             ServerMessage::VenueStatus(_) => VENUE_STATUS,
             ServerMessage::MarketStats(_) => MARKET_STATS,
             ServerMessage::Obligations(_) => OBLIGATIONS,
+            ServerMessage::SimStatus(_) => SIM_STATUS,
+            ServerMessage::SimEvent(_) => SIM_EVENT,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -252,6 +256,24 @@ impl ServerMessage {
                     .u64(m.wholesaler_volume)
                     .u64(m.ats_volume)
                     .end_block();
+            }
+            ServerMessage::SimEvent(command) => crate::sim::put_command(&mut e, command),
+            ServerMessage::SimStatus(s) => {
+                e.u32(s.runners).end_block();
+                crate::sim::put_groups(&mut e, &s.groups);
+                let mut g = e.begin_group(s.fair.len());
+                for (symbol, price, drift) in &s.fair {
+                    e.begin_entry(&mut g);
+                    e.symbol(Some(*symbol)).u64(*price).i64(*drift);
+                    e.end_entry_block(&mut g);
+                }
+                let mut g = e.begin_group(s.scenarios.len());
+                for (text, until) in &s.scenarios {
+                    e.begin_entry(&mut g);
+                    e.u64(*until);
+                    e.end_entry_block(&mut g);
+                    e.var(text);
+                }
             }
             ServerMessage::Obligations(list) => {
                 e.end_block();
@@ -678,6 +700,36 @@ impl ServerMessage {
                 };
                 d.end_block()?;
                 ServerMessage::MarketStats(stats)
+            }
+            SIM_EVENT => ServerMessage::SimEvent(crate::sim::get_command(&mut d)?),
+            SIM_STATUS => {
+                let runners = d.u32()?;
+                d.end_block()?;
+                let groups = crate::sim::get_groups(&mut d)?;
+                let g = d.group()?;
+                let mut fair = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let symbol = d.symbol()?;
+                    let price = d.u64()?;
+                    let drift = d.i64()?;
+                    d.end_entry_block(start, &g)?;
+                    fair.push((symbol, price, drift));
+                }
+                let g = d.group()?;
+                let mut scenarios = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let until = d.u64()?;
+                    d.end_entry_block(start, &g)?;
+                    scenarios.push((d.var()?, until));
+                }
+                ServerMessage::SimStatus(crate::sim::SimStatus {
+                    runners,
+                    groups,
+                    fair,
+                    scenarios,
+                })
             }
             OBLIGATIONS => {
                 d.end_block()?;
@@ -1238,6 +1290,27 @@ mod tests {
                 internal_volume: 100,
                 wholesaler_volume: 150,
                 ats_volume: 30,
+            }),
+            ServerMessage::SimEvent(crate::sim::SimCommand::SetParam {
+                group: "noise".into(),
+                key: "activity".into(),
+                value: "0.9".into(),
+            }),
+            ServerMessage::SimStatus(crate::sim::SimStatus {
+                runners: 1,
+                groups: vec![crate::sim::GroupInfo {
+                    name: "noise".into(),
+                    strategy: "noise".into(),
+                    broker: "retail-co".into(),
+                    target: 15,
+                    running: 15,
+                    paused: false,
+                    fills: 10,
+                    equity: 1_000,
+                    params: String::new(),
+                }],
+                fair: vec![(sym("ACME"), 2_500, 4)],
+                scenarios: vec![("liquidity drought for 30s".into(), 99)],
             }),
             ServerMessage::Obligations(vec![ObligationInfo {
                 symbol: sym("ACME"),
