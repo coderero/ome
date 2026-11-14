@@ -96,6 +96,47 @@ pub fn commands(batch: &[Observation]) -> Pipeline {
                     ))
                     .ignore();
             }
+            Observation::News(n) => {
+                let symbol = n.symbol.map(|s| s.to_string()).unwrap_or_default();
+                pipe.cmd("XADD")
+                    .arg("ome:news")
+                    .arg("MAXLEN")
+                    .arg("~")
+                    .arg(TRADE_STREAM_LENGTH)
+                    .arg("*")
+                    .arg("seq")
+                    .arg(n.seq)
+                    .arg("kind")
+                    .arg(n.kind.label())
+                    .arg("symbol")
+                    .arg(&symbol)
+                    .arg("sector")
+                    .arg(&n.sector)
+                    .arg("sentiment")
+                    .arg(n.sentiment)
+                    .arg("impact_bps")
+                    .arg(n.impact_bps)
+                    .arg("headline")
+                    .arg(&n.headline)
+                    .arg("body")
+                    .arg(&n.body)
+                    .arg("data")
+                    .arg(&n.data)
+                    .arg("ts")
+                    .arg(n.time)
+                    .ignore();
+                pipe.cmd("PUBLISH")
+                    .arg("ome:news")
+                    .arg(format!(
+                        "{} {} {} {:+} {}",
+                        n.seq,
+                        n.kind.label(),
+                        if symbol.is_empty() { "-" } else { &symbol },
+                        n.sentiment,
+                        n.headline
+                    ))
+                    .ignore();
+            }
             Observation::Book(b) => {
                 pipe.cmd("SET")
                     .arg(format!("ome:book:{}", b.symbol))

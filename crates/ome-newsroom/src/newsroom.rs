@@ -9,7 +9,7 @@ use ome_net::auth::SecretHash;
 use ome_protocol::{CompanyInfo, MacroInfo, NewsItem, NewsKind, NewsroomStatus};
 use rand::Rng;
 use rand::rngs::StdRng;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 const RETAINED: usize = 5_000;
 
@@ -36,6 +36,13 @@ pub enum Fact {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filing {
+    pub symbol: Symbol,
+    pub reference: u64,
+    pub name: String,
+}
+
 pub struct Newsroom {
     specs: Vec<CompanySpec>,
     fundamentals: BTreeMap<Symbol, Fundamentals>,
@@ -47,7 +54,7 @@ pub struct Newsroom {
     news: VecDeque<NewsItem>,
     next_seq: u64,
     subscribers: BTreeMap<String, SecretHash>,
-    filed: BTreeSet<Symbol>,
+    filed: BTreeMap<Symbol, u64>,
 }
 
 fn pct(bps: i64) -> String {
@@ -121,7 +128,7 @@ impl Newsroom {
             news: VecDeque::new(),
             next_seq: 1,
             subscribers: BTreeMap::new(),
-            filed: BTreeSet::new(),
+            filed: BTreeMap::new(),
         }
     }
 
@@ -149,7 +156,7 @@ impl Newsroom {
                 if item.kind == NewsKind::Prospectus
                     && let Some(symbol) = item.symbol
                 {
-                    self.filed.insert(symbol);
+                    self.filed.insert(symbol, item.seq);
                 }
                 self.next_seq = item.seq + 1;
                 if self.news.len() == RETAINED {
@@ -325,11 +332,24 @@ impl Newsroom {
             .collect()
     }
 
+    pub fn prospectuses(&self) -> Vec<Filing> {
+        self.filed
+            .iter()
+            .filter_map(|(symbol, seq)| {
+                Some(Filing {
+                    symbol: *symbol,
+                    reference: *seq,
+                    name: self.spec(*symbol)?.name.clone(),
+                })
+            })
+            .collect()
+    }
+
     pub fn unfiled(&self) -> Vec<Symbol> {
         self.specs
             .iter()
             .map(|s| s.symbol)
-            .filter(|s| !self.filed.contains(s))
+            .filter(|s| !self.filed.contains_key(s))
             .collect()
     }
 
@@ -412,7 +432,7 @@ impl Newsroom {
         rng: &mut StdRng,
         writer: &mut dyn Writer,
     ) -> Option<Fact> {
-        if self.filed.contains(&symbol) {
+        if self.filed.contains_key(&symbol) {
             return None;
         }
         let spec = self.spec(symbol)?;
@@ -616,6 +636,39 @@ impl Newsroom {
         Some(self.publish(story, &affected, changes, now, rng, writer))
     }
 
+    pub fn decide_shock(
+        &self,
+        symbol: Symbol,
+        move_bps: i64,
+        now: Timestamp,
+        rng: &mut StdRng,
+        writer: &mut dyn Writer,
+    ) -> Option<Fact> {
+        let spec = self.spec(symbol)?;
+        let f = self.fundamentals(symbol)?;
+        let margin_bps = (f.margin_bps * (10_000 + move_bps) / 10_000).max(1);
+        let next = Fundamentals {
+            margin_bps,
+            eps_e4: quarterly_eps_e4(f.revenue, margin_bps, spec.shares),
+            ..f
+        };
+        let mut story = self.story(
+            NewsKind::Company,
+            "shock",
+            Some(symbol),
+            (move_bps / 10).clamp(-90, 90),
+        );
+        story.facts = facts(&[("event", "shock".into()), ("move", signed_pct(move_bps))]);
+        Some(self.publish(
+            story,
+            &[symbol],
+            vec![Change::Company(symbol, next)],
+            now,
+            rng,
+            writer,
+        ))
+    }
+
     pub fn decide_random(
         &self,
         now: Timestamp,
@@ -644,6 +697,15 @@ impl Newsroom {
         let symbol = symbol.ok_or(format!("'{name}' needs a symbol"))?;
         if self.spec(symbol).is_none() {
             return Err(format!("{symbol} is not covered by the newsroom"));
+        }
+        if let Some(bps) = name.strip_prefix("shock:") {
+            let move_bps: i64 = bps.parse().map_err(|_| format!("invalid shock '{bps}'"))?;
+            if !(-5_000..=5_000).contains(&move_bps) || move_bps == 0 {
+                return Err("a shock moves earnings by -50% to +50%".into());
+            }
+            return self
+                .decide_shock(symbol, move_bps, now, rng, writer)
+                .ok_or(format!("nothing to publish for {symbol}"));
         }
         let fact = match name {
             "earnings" => self.decide_earnings(symbol, now, rng, writer),
@@ -717,6 +779,7 @@ company BOLT sector=robotics price=40.00 shares=20000 eps=2.00 margin=15 growth=
                 .is_none()
         );
         assert_eq!(room.unfiled().len(), 2);
+        assert_eq!(room.prospectuses()[0].reference, 1);
     }
 
     #[test]
@@ -829,6 +892,21 @@ company BOLT sector=robotics price=40.00 shares=20000 eps=2.00 margin=15 growth=
                 .is_err()
         );
         assert!(room.inject(None, "gdp", 0, &mut rng, &mut w).is_ok());
+        let fair = room.fair(acme()).unwrap();
+        let shock = run(&mut room, |r| {
+            r.inject(Some(acme()), "shock:-800", 0, &mut rng, &mut w)
+                .unwrap()
+        });
+        assert!((shock.impact_bps + 800).abs() <= 5, "{shock:?}");
+        assert!(room.fair(acme()).unwrap() < fair && shock.sentiment == -80);
+        assert!(
+            room.inject(Some(acme()), "shock:x", 0, &mut rng, &mut w)
+                .is_err()
+        );
+        assert!(
+            room.inject(Some(acme()), "shock:9000", 0, &mut rng, &mut w)
+                .is_err()
+        );
         assert_eq!(
             room.recent(10, Some(Symbol::parse("NOVA").unwrap())).len(),
             0
@@ -839,6 +917,6 @@ company BOLT sector=robotics price=40.00 shares=20000 eps=2.00 margin=15 growth=
             1,
             "sector news is about BOLT too"
         );
-        assert_eq!(room.since(1).len(), 2);
+        assert_eq!(room.since(1).len(), 3);
     }
 }

@@ -7,7 +7,7 @@ use ome_net::auth::{SecretHash, verify};
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
 use ome_protocol::{
-    Decoder, GroupInfo, MemberMessage, ServerMessage, SimCommand, SimMessage, SimRole,
+    Decoder, GroupInfo, MemberMessage, Scenario, ServerMessage, SimCommand, SimMessage, SimRole,
 };
 use ome_store::Journal;
 use std::collections::BTreeMap;
@@ -40,6 +40,7 @@ pub struct Gateway {
     sessions: BTreeMap<SessionId, Session>,
     clock: Timestamp,
     replay: Option<Replay>,
+    newsroom: Option<(String, String)>,
 }
 
 fn encode(message: &ServerMessage) -> Arc<[u8]> {
@@ -62,7 +63,33 @@ impl Gateway {
             sessions: BTreeMap::new(),
             clock,
             replay: None,
+            newsroom: None,
         }
+    }
+
+    pub fn with_newsroom(mut self, newsroom: Option<(String, String)>) -> Self {
+        self.newsroom = newsroom;
+        self
+    }
+
+    fn forward(&self, command: &SimCommand) -> Option<Result<String, String>> {
+        let SimCommand::Scenario(Scenario::NewsShock {
+            symbol, move_bps, ..
+        }) = command
+        else {
+            return None;
+        };
+        let (addr, secret) = self.newsroom.as_ref()?;
+        let published = Client::connect_member(addr, "ops", secret)
+            .map_err(|e| format!("newsroom unreachable: {e}"))
+            .and_then(|(mut news, _)| {
+                news.request_member(&MemberMessage::InjectNews {
+                    symbol: Some(*symbol),
+                    event: format!("shock:{move_bps}"),
+                })
+                .map_err(|e| e.to_string())
+            });
+        Some(published)
     }
 
     pub fn connect(&mut self, id: SessionId, outbox: Box<dyn Outbox>) {
@@ -263,6 +290,17 @@ impl Gateway {
     }
 
     fn issue(&mut self, command: SimCommand, now: Timestamp) -> Result<String, String> {
+        match self.forward(&command) {
+            Some(Ok(story)) => {
+                self.state.check(&Fact::Forwarded(command.clone()))?;
+                self.commit(Fact::Forwarded(command.clone()), now)?;
+                let text = format!("{} -> newsroom story {story}", command.describe());
+                log(&text);
+                return Ok(text);
+            }
+            Some(Err(reason)) => log(&format!("{reason}; applying the shock directly")),
+            None => {}
+        }
         self.commit(Fact::Command(command.clone()), now)?;
         let runners = self.runners();
         for runner in &runners {

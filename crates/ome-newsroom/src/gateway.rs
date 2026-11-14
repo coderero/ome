@@ -1,5 +1,5 @@
 use crate::journal::Record;
-use crate::newsroom::{Fact, Newsroom};
+use crate::newsroom::{Fact, Filing, Newsroom};
 use crate::writer::Writer;
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
@@ -45,6 +45,7 @@ pub struct Gateway {
     last_tick: Option<Timestamp>,
     fair_sink: Option<Sender<Vec<(Symbol, Price)>>>,
     pushed: BTreeMap<Symbol, Price>,
+    filings: Option<Sender<Filing>>,
 }
 
 fn encode(message: &ServerMessage) -> Arc<[u8]> {
@@ -76,7 +77,15 @@ impl Gateway {
             last_tick: None,
             fair_sink,
             pushed: BTreeMap::new(),
+            filings: None,
         }
+    }
+
+    pub fn file_with(&mut self, filings: Sender<Filing>) {
+        for filing in self.room.prospectuses() {
+            let _ = filings.send(filing);
+        }
+        self.filings = Some(filings);
     }
 
     pub fn room(&self) -> &Newsroom {
@@ -146,6 +155,17 @@ impl Gateway {
             })?;
         }
         self.room.apply(&fact);
+        if let Fact::Published { item, .. } = &fact
+            && item.kind == ome_protocol::NewsKind::Prospectus
+            && let Some(sink) = &self.filings
+            && let Some(filing) = self
+                .room
+                .prospectuses()
+                .into_iter()
+                .find(|f| Some(f.symbol) == item.symbol)
+        {
+            let _ = sink.send(filing);
+        }
         if let Fact::Published { item, .. } = &fact {
             log(&format!(
                 "#{} [{}{}] {} (sentiment {:+}, fair {:+} bps)",

@@ -143,7 +143,7 @@ impl MlRetail {
                     self.model.learn(&sample.x, moved > 0.0);
                 }
             }
-            let Some(x) = features(market, state.world.sentiment(symbol)) else {
+            let Some(x) = features(market, state.sentiment(symbol)) else {
                 continue;
             };
             if !state.trading(symbol) {

@@ -131,3 +131,49 @@ pub fn spawn(source: Source, endpoint: Endpoint, every: Duration, tx: Sender<Obs
         }
     });
 }
+
+pub fn spawn_news(endpoint: Endpoint, tx: Sender<Observation>) {
+    thread::spawn(move || {
+        let mut last_seq = 0;
+        let mut reported = false;
+        loop {
+            let logon = Client::connect(&endpoint.addr).and_then(|mut client| {
+                client.logon_member(&endpoint.user, &endpoint.secret, last_seq)?;
+                Ok(client)
+            });
+            match logon {
+                Ok(client) => {
+                    log(&format!(
+                        "recording news from {} after #{last_seq}",
+                        endpoint.addr
+                    ));
+                    reported = false;
+                    loop {
+                        match client.recv_timeout(READ) {
+                            Ok(Some(ServerMessage::News(item))) if item.seq > last_seq => {
+                                last_seq = item.seq;
+                                if tx.send(Observation::News(item)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                log(&format!("lost the newsroom: {e}; reconnecting"));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) if !reported => {
+                    log(&format!(
+                        "cannot reach the newsroom at {}: {e}",
+                        endpoint.addr
+                    ));
+                    reported = true;
+                }
+                Err(_) => {}
+            }
+            thread::sleep(RECONNECT);
+        }
+    });
+}

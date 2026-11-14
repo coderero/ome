@@ -33,6 +33,7 @@ pub struct ExchangeConfig {
     pub depth_levels: usize,
     pub feed_capacity: usize,
     pub fees: FeeSchedule,
+    pub require_prospectus: bool,
 }
 
 impl Default for ExchangeConfig {
@@ -48,12 +49,18 @@ impl Default for ExchangeConfig {
             depth_levels: 12,
             feed_capacity: 100_000,
             fees: FeeSchedule::default(),
+            require_prospectus: false,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    FileProspectus {
+        symbol: Symbol,
+        reference: u64,
+        name: String,
+    },
     SetDmm {
         symbol: Symbol,
         member: MemberId,
@@ -185,6 +192,7 @@ pub enum ExchangeError {
     UnknownOrder(OrderId),
     NotOwner(OrderId),
     InvalidReport(String),
+    NoProspectus(Symbol),
 }
 
 impl fmt::Display for ExchangeError {
@@ -204,6 +212,9 @@ impl fmt::Display for ExchangeError {
             ExchangeError::UnknownOrder(id) => write!(f, "order #{id} is not open"),
             ExchangeError::NotOwner(id) => write!(f, "order #{id} belongs to another member"),
             ExchangeError::InvalidReport(why) => write!(f, "trade report rejected: {why}"),
+            ExchangeError::NoProspectus(s) => {
+                write!(f, "no prospectus has been filed for {s}; listing refused")
+            }
         }
     }
 }
@@ -244,6 +255,7 @@ pub struct Exchange {
     next_trade_id: u64,
     off_exchange: BTreeMap<(Symbol, Venue), Qty>,
     dmm: BTreeMap<Symbol, MemberId>,
+    prospectuses: BTreeMap<Symbol, (u64, String)>,
     next_allocation_id: u64,
 }
 
@@ -284,6 +296,7 @@ impl Exchange {
             next_trade_id: 1,
             off_exchange: BTreeMap::new(),
             dmm: BTreeMap::new(),
+            prospectuses: BTreeMap::new(),
             next_allocation_id: 1,
         }
     }
@@ -306,6 +319,20 @@ impl Exchange {
         now: Timestamp,
     ) -> Result<Vec<Event>, ExchangeError> {
         match command {
+            Command::FileProspectus {
+                symbol,
+                reference,
+                name,
+            } => {
+                if *reference == 0 {
+                    return Err(ExchangeError::InvalidListing(
+                        "prospectus reference is required",
+                    ));
+                }
+                self.prospectuses
+                    .insert(*symbol, (*reference, name.clone()));
+                Ok(vec![])
+            }
             Command::SetDmm { symbol, member } => {
                 if !self.instruments.contains_key(symbol) {
                     return Err(ExchangeError::UnknownSymbol(*symbol));
@@ -923,6 +950,9 @@ impl Exchange {
     ) -> Result<Vec<Event>, ExchangeError> {
         if self.instruments.contains_key(&symbol) {
             return Err(ExchangeError::DuplicateSymbol(symbol));
+        }
+        if self.config.require_prospectus && !self.prospectuses.contains_key(&symbol) {
+            return Err(ExchangeError::NoProspectus(symbol));
         }
         if ipo_price == 0 {
             return Err(ExchangeError::InvalidListing("IPO price must be positive"));
@@ -1621,6 +1651,15 @@ mod tests {
         admit(&mut ex, "ops", MemberKind::Admin);
         let broker = admit(&mut ex, "broker", MemberKind::Broker);
         let lp = admit(&mut ex, "lp", MemberKind::LiquidityProvider);
+        ex.execute(
+            &Command::FileProspectus {
+                symbol: sym("ACME"),
+                reference: 1,
+                name: "Acme".into(),
+            },
+            0,
+        )
+        .unwrap();
         ex.execute(
             &Command::ListInstrument {
                 symbol: sym("ACME"),
@@ -2745,5 +2784,33 @@ mod tests {
             Err(ExchangeError::InvalidAccount(1 << 41))
         );
         assert!(m.ex.execute(&list("NEW", 1_00, 10, 2, 1), 0).is_ok());
+    }
+
+    #[test]
+    fn listings_can_require_a_filed_prospectus() {
+        let mut m = market_with(ExchangeConfig {
+            require_prospectus: true,
+            ..ExchangeConfig::default()
+        });
+        let list = Command::ListInstrument {
+            symbol: sym("NEW"),
+            name: "New Co".into(),
+            ipo_price: 10_00,
+            shares: 100,
+            underwriter: 2,
+            issuer_account: 1,
+        };
+        assert_eq!(
+            m.ex.execute(&list, 0),
+            Err(ExchangeError::NoProspectus(sym("NEW")))
+        );
+        let file = |reference| Command::FileProspectus {
+            symbol: sym("NEW"),
+            reference,
+            name: "New Co".into(),
+        };
+        assert!(m.ex.execute(&file(0), 0).is_err());
+        m.ex.execute(&file(7), 0).unwrap();
+        assert!(m.ex.execute(&list, 0).is_ok());
     }
 }

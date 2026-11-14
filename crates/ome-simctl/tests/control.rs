@@ -19,6 +19,7 @@ fn simctl(exchange: SocketAddr, journal: Option<PathBuf>) -> SocketAddr {
         exchange_addr: exchange.to_string(),
         exchange_name: "ops".into(),
         exchange_secret: "ops".into(),
+        newsroom: None,
     })
     .unwrap()
     .0

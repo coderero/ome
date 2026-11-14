@@ -488,6 +488,15 @@ impl Gateway {
             MemberMessage::Halt { symbol, reason } if admin => Command::Halt { symbol, reason },
             MemberMessage::Resume { symbol } if admin => Command::Resume { symbol },
             MemberMessage::SetDmm { symbol, member } if admin => Command::SetDmm { symbol, member },
+            MemberMessage::FileProspectus {
+                symbol,
+                reference,
+                name,
+            } if admin => Command::FileProspectus {
+                symbol,
+                reference,
+                name,
+            },
             MemberMessage::SetSession { phase } if admin => Command::SetPhase { phase },
             MemberMessage::SetSchedule {
                 pre_open_ms,

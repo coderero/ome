@@ -21,6 +21,7 @@ pub struct RecorderConfig {
     pub clearing: Option<Endpoint>,
     pub brokers: Vec<Endpoint>,
     pub venues: Vec<Endpoint>,
+    pub news: Option<Endpoint>,
     pub postgres: Option<String>,
     pub redis: Option<String>,
     pub poll_ms: u64,
@@ -48,6 +49,9 @@ pub fn start(config: RecorderConfig) -> Result<JoinHandle<()>, String> {
     }
     for venue in config.venues {
         sources::spawn(Source::Venue, venue, every, tx.clone());
+    }
+    if let Some(news) = config.news {
+        sources::spawn_news(news, tx.clone());
     }
     drop(tx);
     let sinks = sinks

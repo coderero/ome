@@ -82,6 +82,11 @@ pub enum MemberMessage {
         symbol: Option<Symbol>,
         event: String,
     },
+    FileProspectus {
+        symbol: Symbol,
+        reference: u64,
+        name: String,
+    },
     SetMemberStatus {
         member: MemberId,
         enabled: bool,
@@ -158,6 +163,7 @@ impl MemberMessage {
             MemberMessage::QueryNewsroom => QUERY_NEWSROOM,
             MemberMessage::QueryNews { .. } => QUERY_NEWS,
             MemberMessage::InjectNews { .. } => INJECT_NEWS,
+            MemberMessage::FileProspectus { .. } => FILE_PROSPECTUS,
             MemberMessage::SetMemberStatus { .. } => SET_MEMBER_STATUS,
             MemberMessage::SetCancelOnDisconnect { .. } => SET_CANCEL_ON_DISCONNECT,
             MemberMessage::CreateMember { .. } => CREATE_MEMBER,
@@ -199,6 +205,16 @@ impl MemberMessage {
             }
             MemberMessage::InjectNews { symbol, event } => {
                 e.symbol(*symbol).end_block().var(event);
+            }
+            MemberMessage::FileProspectus {
+                symbol,
+                reference,
+                name,
+            } => {
+                e.symbol(Some(*symbol))
+                    .u64(*reference)
+                    .end_block()
+                    .var(name);
             }
             MemberMessage::SetDmm { symbol, member } => {
                 e.symbol(Some(*symbol)).u64(*member).end_block();
@@ -505,6 +521,16 @@ impl MemberMessage {
                 d.end_block()?;
                 MemberMessage::QueryNews { limit, symbol }
             }
+            FILE_PROSPECTUS => {
+                let symbol = d.symbol()?;
+                let reference = d.u64()?;
+                d.end_block()?;
+                MemberMessage::FileProspectus {
+                    symbol,
+                    reference,
+                    name: d.var()?,
+                }
+            }
             INJECT_NEWS => {
                 let symbol = d.optional_symbol()?;
                 d.end_block()?;
@@ -730,6 +756,11 @@ pub mod tests {
             MemberMessage::InjectNews {
                 symbol: None,
                 event: "rate-hike".into(),
+            },
+            MemberMessage::FileProspectus {
+                symbol: sym("ACME"),
+                reference: 1,
+                name: "Acme Robotics".into(),
             },
             MemberMessage::SetMemberStatus {
                 member: 3,

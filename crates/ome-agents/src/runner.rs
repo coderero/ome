@@ -154,6 +154,7 @@ fn run(
     for symbol in &symbols {
         client.send(&ClientMessage::Subscribe { symbol: *symbol })?;
     }
+    client.send(&ClientMessage::SubscribeNews { recent: 20 })?;
     let mut generation = ctx.group.generation();
     let Some(mut strategy) = strategies::create(&spec.strategy, &symbols, &ctx.group.params())
     else {

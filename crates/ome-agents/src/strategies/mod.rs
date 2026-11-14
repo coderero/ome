@@ -1,6 +1,7 @@
 mod factor;
 mod market_maker;
 mod ml_retail;
+mod news_fund;
 mod noise;
 mod pension;
 mod prop;
@@ -22,6 +23,7 @@ use std::time::Duration;
 pub use factor::FactorModel;
 pub use market_maker::MarketMaker;
 pub use ml_retail::MlRetail;
+pub use news_fund::NewsFund;
 pub use noise::NoiseTrader;
 pub use pension::Pension;
 pub use prop::{PropDesk, PropSignal};
@@ -81,6 +83,7 @@ pub const STRATEGIES: &[&str] = &[
     "factor",
     "pension",
     "value",
+    "news",
 ];
 
 pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn Strategy>> {
@@ -100,6 +103,7 @@ pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn
         "factor" => Box::new(FactorModel::new(symbols, params)),
         "pension" => Box::new(Pension::new(symbols, params)),
         "value" => Box::new(ValueInvestor::new(symbols, params)),
+        "news" => Box::new(NewsFund::new(symbols, params)),
         _ => return None,
     })
 }

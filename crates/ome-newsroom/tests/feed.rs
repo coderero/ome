@@ -79,7 +79,10 @@ fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_v
         journal: None,
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
-        exchange: ExchangeConfig::default(),
+        exchange: ExchangeConfig {
+            require_prospectus: true,
+            ..ExchangeConfig::default()
+        },
     })
     .unwrap()
     .0;
@@ -100,6 +103,7 @@ fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_v
         exchange_addr: exchange.to_string(),
         exchange_name: "ops".into(),
         exchange_secret: "ops".into(),
+        newsroom: None,
     })
     .unwrap()
     .0;
@@ -136,6 +140,24 @@ fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_v
     })
     .unwrap()
     .0;
+    let listing = |symbol: &str| MemberMessage::ListInstrument {
+        symbol: Symbol::parse(symbol).unwrap(),
+        ipo_price: 25_00,
+        shares: 1_000,
+        underwriter: 2,
+        issuer_account: 1,
+        name: symbol.into(),
+    };
+    let refused = exchange_ops.request_member(&listing("ZZZ")).unwrap_err();
+    assert!(refused.to_string().contains("no prospectus"), "{refused}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while exchange_ops.request_member(&listing("ACME")).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the newsroom never filed ACME's prospectus"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let (mut admin, _) = Client::connect_and_logon(&retail.to_string(), "admin", "admin").unwrap();
     admin
         .request(&ClientMessage::CreateAccount {
@@ -230,6 +252,40 @@ fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_v
     let s = status(&mut desk);
     assert!(s.day >= 1 && s.subscribers == 1, "{s:?}");
     assert_eq!(s.writer, "templates");
+
+    let steering = start_simctl(SimConfig {
+        listen: "127.0.0.1:0".into(),
+        journal: None,
+        operator: ("operator".into(), "sim".into()),
+        runner: ("runner".into(), "runner".into()),
+        exchange_addr: exchange.to_string(),
+        exchange_name: "ops".into(),
+        exchange_secret: "ops".into(),
+        newsroom: Some((news.to_string(), "ops".into())),
+    })
+    .unwrap()
+    .0;
+    let mut steer =
+        Client::connect_sim(&steering.to_string(), SimRole::Operator, "operator", "sim").unwrap();
+    let text = steer
+        .request_sim(&SimMessage::Command(ome_protocol::SimCommand::Scenario(
+            ome_protocol::Scenario::NewsShock {
+                symbol: acme,
+                move_bps: -800,
+                seconds: 30,
+            },
+        )))
+        .unwrap();
+    assert!(text.contains("newsroom story"), "{text}");
+    let shock = collect(&alice, |items| {
+        items.iter().any(|i| i.value("event") == Some("shock"))
+    });
+    let shock = shock
+        .iter()
+        .find(|i| i.value("event") == Some("shock"))
+        .unwrap();
+    assert_eq!((shock.symbol, shock.sentiment), (Some(acme), -80));
+    assert!((shock.impact_bps + 800).abs() <= 5);
 }
 
 #[test]

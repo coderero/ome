@@ -3,7 +3,7 @@ use ome_core::symbol::Symbol;
 use ome_core::types::Side;
 use ome_protocol::{
     BookSnapshot, InstrumentInfo, InstrumentStatus, MarketPhase, MarketStats, MarketStatus,
-    TradeEvent, Venue,
+    NewsItem, NewsKind, TradeEvent, Venue,
 };
 use ome_recorder::observation::Observation;
 use ome_recorder::postgres_sink::PostgresSink;
@@ -77,6 +77,19 @@ fn observations_land_in_postgres_and_redis() {
             since: 0,
             next_change_at: 0,
         }),
+        Observation::News(NewsItem {
+            seq: trade_id,
+            time: 1_700_000_000_000,
+            day: 4,
+            kind: NewsKind::Earnings,
+            symbol: Some(symbol),
+            sentiment: -30,
+            impact_bps: -120,
+            sector: "testing".into(),
+            headline: "Test Corp misses".into(),
+            body: "EPS 0.10 vs 0.12".into(),
+            data: "eps=0.10 consensus=0.12".into(),
+        }),
     ];
     let mut postgres = PostgresSink::new(&pg);
     postgres.write(&batch).unwrap();
@@ -107,6 +120,26 @@ fn observations_land_in_postgres_and_redis() {
         )
         .unwrap();
     assert_eq!((stats.get::<_, i64>(0), stats.get::<_, i64>(1)), (10_03, 5));
+    let news = client
+        .query_one(
+            "SELECT kind, symbol, sentiment, headline FROM news WHERE seq = $1",
+            &[&(trade_id as i64)],
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            news.get::<_, String>(0),
+            news.get::<_, Option<String>>(1),
+            news.get::<_, i32>(2),
+            news.get::<_, String>(3)
+        ),
+        (
+            "earnings".to_string(),
+            Some("TESTX".to_string()),
+            -30,
+            "Test Corp misses".to_string()
+        )
+    );
 
     let mut con = redis::Client::open(rd.as_str())
         .unwrap()
@@ -132,4 +165,6 @@ fn observations_land_in_postgres_and_redis() {
     assert_eq!((last.as_str(), vwap.as_str()), ("1005", "1003"));
     assert!(book.contains("[1000,50,1]"));
     assert!(trades >= 1);
+    let stories: usize = redis::cmd("XLEN").arg("ome:news").query(&mut con).unwrap();
+    assert!(stories >= 1);
 }

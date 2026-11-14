@@ -3,7 +3,7 @@ use ome_recorder::{RecorderConfig, start};
 
 const USAGE: &str = "usage: ome-recorder [--postgres URL] [--redis URL] [--exchange ADDR] [--exchange-secret S]
                     [--clearing ADDR] [--clearing-secret S] [--broker NAME=ADDR ...] [--broker-secret S]
-                    [--venue NAME=ADDR ...] [--venue-secret S] [--poll-ms MS]
+                    [--venue NAME=ADDR ...] [--venue-secret S] [--news ADDR] [--news-secret S] [--poll-ms MS]
   e.g. --postgres postgres://ome:ome@127.0.0.1/ome --redis redis://127.0.0.1/";
 
 fn endpoint(name: &str, addr: &str, user: &str, secret: &str) -> Endpoint {
@@ -27,6 +27,8 @@ fn parse_args() -> Result<RecorderConfig, String> {
     let mut broker_secret = env("OME_BROKER_SECRET", "admin");
     let mut venues: Vec<(String, String)> = Vec::new();
     let mut venue_secret = env("OME_VENUE_SECRET", "ops");
+    let mut news: Option<String> = None;
+    let mut news_secret = env("OME_NEWS_SECRET", "ops");
     let mut postgres = None;
     let mut redis = None;
     let mut poll_ms = 1_000;
@@ -49,6 +51,8 @@ fn parse_args() -> Result<RecorderConfig, String> {
             "--broker-secret" => broker_secret = value()?,
             "--venue" => venues.push(named(value()?)?),
             "--venue-secret" => venue_secret = value()?,
+            "--news" => news = Some(value()?),
+            "--news-secret" => news_secret = value()?,
             "--poll-ms" => {
                 poll_ms = value()?
                     .parse()
@@ -68,6 +72,7 @@ fn parse_args() -> Result<RecorderConfig, String> {
             .iter()
             .map(|(name, addr)| endpoint(name, addr, "ops", &venue_secret))
             .collect(),
+        news: news.map(|addr| endpoint("newsroom", &addr, "ops", &news_secret)),
         postgres,
         redis,
         poll_ms,

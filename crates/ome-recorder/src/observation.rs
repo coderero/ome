@@ -1,7 +1,7 @@
 use ome_core::symbol::Symbol;
 use ome_protocol::{
     AccountInfo, BookSnapshot, ClearingStatus, FeeSummary, InstrumentInfo, MarketStats,
-    MarketStatus, MemberInfo, ServerMessage, TradeEvent, VenueStatus,
+    MarketStatus, MemberInfo, NewsItem, ServerMessage, TradeEvent, VenueStatus,
 };
 use std::collections::BTreeMap;
 
@@ -23,6 +23,7 @@ pub enum Observation {
         fees: FeeSummary,
     },
     Venue(VenueStatus),
+    News(NewsItem),
 }
 
 impl Observation {
@@ -39,6 +40,7 @@ impl Observation {
             ServerMessage::MemberList(list) => vec![Observation::Members(list)],
             ServerMessage::ClearingStatus(status) => vec![Observation::Clearing(status)],
             ServerMessage::VenueStatus(status) => vec![Observation::Venue(status)],
+            ServerMessage::News(item) => vec![Observation::News(item)],
             _ => vec![],
         }
     }
@@ -53,7 +55,7 @@ impl Observation {
             Observation::Accounts { broker, .. } => format!("accounts:{broker}"),
             Observation::Routing { broker, .. } => format!("routing:{broker}"),
             Observation::Venue(v) => format!("venue:{}", v.venue as u8),
-            Observation::Trade(_) | Observation::Market(_) => return None,
+            Observation::Trade(_) | Observation::Market(_) | Observation::News(_) => return None,
         })
     }
 

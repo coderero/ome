@@ -13,7 +13,8 @@ mkdir -p "$OME_DATA"
 fresh=0
 [[ -s "$OME_DATA/exchange.journal" ]] || fresh=1
 
-start_bg exchange "$BIN/ome-exchange" --listen "$OME_EXCHANGE" --journal "$OME_DATA/exchange.journal" --admin-secret "$OME_EXCHANGE_SECRET"
+start_bg exchange "$BIN/ome-exchange" --listen "$OME_EXCHANGE" --journal "$OME_DATA/exchange.journal" --admin-secret "$OME_EXCHANGE_SECRET" \
+  --require-prospectus
 wait_for exchange_cmd instruments
 (( fresh )) && scripts/seed.sh members
 
@@ -25,7 +26,7 @@ wait_for clearing_cmd status
 
 start_bg simctl "$BIN/ome-simctl" --listen "$OME_SIMCTL" --journal "$OME_DATA/simctl.journal" \
   --secret "$OME_SIM_SECRET" --runner-secret "$OME_SIM_RUNNER_SECRET" --exchange "$OME_EXCHANGE" \
-  --exchange-secret "$OME_EXCHANGE_SECRET"
+  --exchange-secret "$OME_EXCHANGE_SECRET" --newsroom "$OME_NEWS" --news-secret "$OME_NEWS_SECRET"
 wait_for sim_cmd status
 
 start_bg newsroom "$BIN/ome-newsroom" --listen "$OME_NEWS" --journal "$OME_DATA/newsroom.journal" \
@@ -70,7 +71,7 @@ scripts/agents.sh
 if [[ "$OME_RECORD" == "1" ]]; then
   recorder_args=(--postgres "$OME_POSTGRES" --redis "$OME_REDIS" --exchange "$OME_EXCHANGE"
     --exchange-secret "$OME_EXCHANGE_SECRET" --clearing "$OME_CLEARING" --clearing-secret "$OME_CLEARING_SECRET"
-    --broker-secret "$OME_BROKER_SECRET" --venue-secret "$OME_VENUE_SECRET")
+    --broker-secret "$OME_BROKER_SECRET" --venue-secret "$OME_VENUE_SECRET" --news "$OME_NEWS" --news-secret "$OME_NEWS_SECRET")
   for p in "${providers[@]}"; do
     read -r name _ _ port <<<"$p"
     recorder_args+=(--broker "$name=$OME_HOST:$port")

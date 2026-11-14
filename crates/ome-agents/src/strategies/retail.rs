@@ -78,7 +78,7 @@ impl RetailPersona {
                 continue;
             }
             let stops = Self::armed(state, symbol, Side::Sell);
-            if state.world.sentiment(symbol) < -0.5 && rng.random_bool(0.5) {
+            if state.sentiment(symbol) < -0.5 && rng.random_bool(0.5) {
                 actions.extend(stops.into_iter().map(Action::CancelConditional));
                 actions.push(Action::Place {
                     symbol,

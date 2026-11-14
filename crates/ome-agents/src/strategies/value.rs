@@ -67,7 +67,7 @@ impl Strategy for ValueInvestor {
             let Some(market) = state.market(symbol) else {
                 continue;
             };
-            let caution = 1.0 + 4.0 * (-state.world.sentiment(symbol)).max(0.0);
+            let caution = 1.0 + 4.0 * (-state.sentiment(symbol)).max(0.0);
             if deviation < -self.band_bps * caution {
                 let price = market.ask.unwrap_or(fair).min(fair);
                 let qty = affordable(state.cash, price, (budget / price as f64) as u64);

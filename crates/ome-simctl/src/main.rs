@@ -2,6 +2,7 @@ use ome_simctl::{SimConfig, start};
 
 const USAGE: &str = "usage: ome-simctl [--listen ADDR] [--journal PATH] [--secret OPERATOR_SECRET]
                   [--runner-secret SECRET] [--exchange ADDR] [--exchange-secret SECRET]
+                  [--newsroom ADDR] [--news-secret SECRET]   (news shocks become newsroom stories)
 operators log in as 'operator', agent runners as 'runner'";
 
 fn parse_args() -> Result<SimConfig, String> {
@@ -14,7 +15,10 @@ fn parse_args() -> Result<SimConfig, String> {
         exchange_addr: env("OME_EXCHANGE", "127.0.0.1:7000"),
         exchange_name: "ops".into(),
         exchange_secret: env("OME_EXCHANGE_SECRET", "ops"),
+        newsroom: None,
     };
+    let mut news_secret = env("OME_NEWS_SECRET", "ops");
+    let mut newsroom = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
@@ -25,9 +29,12 @@ fn parse_args() -> Result<SimConfig, String> {
             "--runner-secret" => config.runner.1 = value()?,
             "--exchange" => config.exchange_addr = value()?,
             "--exchange-secret" => config.exchange_secret = value()?,
+            "--newsroom" => newsroom = Some(value()?),
+            "--news-secret" => news_secret = value()?,
             _ => return Err(USAGE.into()),
         }
     }
+    config.newsroom = newsroom.map(|addr| (addr, news_secret));
     Ok(config)
 }
 

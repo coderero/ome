@@ -1,7 +1,7 @@
 use ome_exchange::exchange::ExchangeConfig;
 use ome_exchange::{ServerConfig, start};
 
-const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
+const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET] [--require-prospectus]";
 
 fn parse_args() -> Result<ServerConfig, String> {
     let mut config = ServerConfig {
@@ -23,6 +23,7 @@ fn parse_args() -> Result<ServerConfig, String> {
             "--journal" => config.journal = Some(value()?.into()),
             "--admin-name" => config.admin_name = value()?,
             "--admin-secret" => config.admin_secret = value()?,
+            "--require-prospectus" => config.exchange.require_prospectus = true,
             _ => return Err(USAGE.into()),
         }
     }

@@ -57,6 +57,7 @@ pub const QUERY_OBLIGATIONS: u16 = 91;
 pub const QUERY_NEWSROOM: u16 = 92;
 pub const QUERY_NEWS: u16 = 93;
 pub const INJECT_NEWS: u16 = 94;
+pub const FILE_PROSPECTUS: u16 = 95;
 
 pub const LOGON_ACK: u16 = 100;
 pub const SERVER_HEARTBEAT: u16 = 101;

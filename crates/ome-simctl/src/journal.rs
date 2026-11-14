@@ -9,6 +9,7 @@ const COMMAND: u16 = 700;
 const ACCELERATED: u16 = 701;
 const RECORDING_STARTED: u16 = 702;
 const RECORDING_STOPPED: u16 = 703;
+const FORWARDED: u16 = 704;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mark {
@@ -23,6 +24,7 @@ pub enum Fact {
     Accelerated([u64; 4]),
     RecordingStarted { name: String, marks: Vec<Mark> },
     RecordingStopped { marks: Vec<Mark> },
+    Forwarded(SimCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +67,12 @@ impl Entry for Record {
             Fact::Accelerated(_) => ACCELERATED,
             Fact::RecordingStarted { .. } => RECORDING_STARTED,
             Fact::RecordingStopped { .. } => RECORDING_STOPPED,
+            Fact::Forwarded(_) => FORWARDED,
         };
         let mut e = Encoder::new(template);
         e.u64(self.timestamp);
         match &self.fact {
-            Fact::Command(command) => put_command(&mut e, command),
+            Fact::Command(command) | Fact::Forwarded(command) => put_command(&mut e, command),
             Fact::Accelerated(seconds) => {
                 for s in seconds {
                     e.u64(*s);
@@ -95,6 +98,7 @@ impl Entry for Record {
         let timestamp = d.u64()?;
         let fact = match template {
             COMMAND => Fact::Command(get_command(&mut d)?),
+            FORWARDED => Fact::Forwarded(get_command(&mut d)?),
             ACCELERATED => {
                 let seconds = [d.u64()?, d.u64()?, d.u64()?, d.u64()?];
                 d.end_block()?;
@@ -143,6 +147,7 @@ mod tests {
                 marks: marks.clone(),
             },
             Fact::RecordingStopped { marks },
+            Fact::Forwarded(SimCommand::Pause { group: "x".into() }),
         ];
         for fact in facts {
             let record = Record {

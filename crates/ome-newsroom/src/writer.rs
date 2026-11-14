@@ -125,6 +125,20 @@ fn templates(story: &Story) -> (&'static [&'static str], &'static [&'static str]
                 ],
             ),
         },
+        ("shock", true) => (
+            &[
+                "Surprise news lifts {company}",
+                "{company} jumps on unexpected news",
+            ],
+            &["An unexpected development is expected to change {company}'s earnings by {move}."],
+        ),
+        ("shock", false) => (
+            &[
+                "{company} hit by surprise news",
+                "Unexpected setback for {company}",
+            ],
+            &["An unexpected development is expected to change {company}'s earnings by {move}."],
+        ),
         ("contract-win", _) => (
             &[
                 "{company} wins major contract",
@@ -295,7 +309,15 @@ mod tests {
             ("move", "25"),
         ];
         let mut events: Vec<&str> = CATALOGUE.iter().map(|e| e.name).collect();
-        events.extend(["prospectus", "earnings", "cpi", "gdp", "rates", "other"]);
+        events.extend([
+            "prospectus",
+            "earnings",
+            "cpi",
+            "gdp",
+            "rates",
+            "shock",
+            "other",
+        ]);
         for event in events {
             for sentiment in [-40, 40] {
                 for _ in 0..5 {

@@ -96,6 +96,12 @@ pub fn start(config: NewsConfig) -> Result<(SocketAddr, JoinHandle<Result<(), St
         fair_sink,
         last_ts,
     );
+    let (tx, rx) = mpsc::channel::<NewsInbound>();
+    if let Some((addr, name, secret)) = config.exchange.clone() {
+        let (filings, filed) = mpsc::channel();
+        gateway.file_with(filings);
+        links::watch_exchange(addr, name, secret, tx.clone(), market, filed);
+    }
     gateway.start_up(now_ms());
     gateway.flush().map_err(|e| e.to_string())?;
 
@@ -106,10 +112,6 @@ pub fn start(config: NewsConfig) -> Result<(SocketAddr, JoinHandle<Result<(), St
         "newsroom listening on {addr}, covering {} companies",
         config.companies.len()
     ));
-    let (tx, rx) = mpsc::channel::<NewsInbound>();
-    if let Some((addr, name, secret)) = config.exchange.clone() {
-        links::watch_exchange(addr, name, secret, tx.clone(), market);
-    }
     listen(listener, tx);
 
     let handle = thread::spawn(move || {

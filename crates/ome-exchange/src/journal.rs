@@ -28,6 +28,7 @@ mod template {
     pub const SET_MMP: u16 = 216;
     pub const TRADE_REPORT: u16 = 217;
     pub const SET_DMM: u16 = 218;
+    pub const FILE_PROSPECTUS: u16 = 219;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,7 @@ impl Entry for Record {
             Command::SetMmp { .. } => template::SET_MMP,
             Command::TradeReport { .. } => template::TRADE_REPORT,
             Command::SetDmm { .. } => template::SET_DMM,
+            Command::FileProspectus { .. } => template::FILE_PROSPECTUS,
         };
         let mut e = Encoder::new(template_id);
         e.u64(self.timestamp);
@@ -152,6 +154,16 @@ impl Entry for Record {
             }
             Command::SetDmm { symbol, member } => {
                 e.symbol(Some(*symbol)).u64(*member).end_block();
+            }
+            Command::FileProspectus {
+                symbol,
+                reference,
+                name,
+            } => {
+                e.symbol(Some(*symbol))
+                    .u64(*reference)
+                    .end_block()
+                    .var(name);
             }
             Command::TradeReport {
                 member,
@@ -332,6 +344,16 @@ impl Entry for Record {
                     ask,
                 }
             }
+            template::FILE_PROSPECTUS => {
+                let symbol = d.symbol()?;
+                let reference = d.u64()?;
+                d.end_block()?;
+                Command::FileProspectus {
+                    symbol,
+                    reference,
+                    name: d.var()?,
+                }
+            }
             template::SET_DMM => {
                 let symbol = d.symbol()?;
                 let member = d.u64()?;
@@ -505,6 +527,11 @@ mod tests {
         commands.push(Command::SetDmm {
             symbol: sym("ACME"),
             member: 3,
+        });
+        commands.push(Command::FileProspectus {
+            symbol: sym("ACME"),
+            reference: 4,
+            name: "Acme Robotics".into(),
         });
         commands.push(Command::TradeReport {
             member: 3,

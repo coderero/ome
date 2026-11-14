@@ -338,7 +338,7 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 |---|---|
 | HFT (DMA) | Avellaneda-Stoikov market making: spread widens with volatility, quotes skew away from inventory, two-sided quotes with market maker protection |
 | Liquidity providers | designated market maker quoting round lots within the 2% obligation |
-| Quant funds (prime) | pairs stat-arb executed with POV algos or in the dark pool; factor model (momentum, reversal, volatility) rebalanced with VWAP parents; value investing around fair value |
+| Quant funds (prime) | pairs stat-arb executed with POV algos or in the dark pool; factor model (momentum, reversal, volatility) rebalanced with VWAP parents; value investing around fair value; news-driven funds trading fresh stories by tone and fair value impact, unwound after a minute |
 | Slow money (prime) | pension funds rebalancing to target weights with slow VWAP parents |
 | Prop desks (prime) | momentum, breakout and mean reversion entries, each position protected by an OCO take-profit/stop |
 | Retail | day traders (protective stops, flat before the close), swing traders (brackets on dips), investors (GTT dip buys, after-market orders, trailing stops), ML personas, value-minded retail, noise traders |
@@ -355,7 +355,7 @@ ome sim param hft-vega gamma=0.6      # live parameter change (rebuilt, except M
 ome sim fund daytrader 1000           # add cash to every account in a group
 ome sim fair ZEN 85.00 2              # fair value and drift in bps per minute, which value investors trade around
 ome sim crash ACME 15                 # flash crash: panic selling, liquidity withdraws, value buyers wait, then recover
-ome sim news NOVA -8                  # news shock: fair value -8% and negative sentiment for a minute
+ome sim news NOVA -8                  # news shock, published by the newsroom as a story (-8% to earnings and fair value)
 ome sim drought 30 | volatility 30    # market-wide liquidity drought or activity burst
 ome sim speed 3 30 3 3                # time acceleration: trading day phase lengths in seconds
 ome sim record start crash-drill      # record operator commands from now on, with a tape mark per symbol
@@ -384,6 +384,14 @@ Fair values start at the listing prices (the seed script sets them). In a test r
 
 Each story carries a structured sentiment (-100 to 100), its effect on fair value in bps and its numbers (`eps=0.63 consensus=0.65 ...`) next to the headline and body. Analyst ratings and rumours carry sentiment but do not change fundamentals. Fair value is the listing price scaled by forward earnings and a re-rating from rates, growth and risk appetite; the newsroom keeps ome-simctl's fair values in step, so value investors trade around them. Text currently comes from templates (an LLM writer is phase 3c).
 
+How the market uses the news:
+- **Agents read it through their broker.** Every agent subscribes to its broker's news feed; a story about a symbol, its sector (learned from company stories) or the economy adds to that symbol's mood, weighted by relevance and fading with a 45-second half-life. The mood drives retail panic selling, value-investor caution, noise-trader tilt and the ML personas' sentiment feature, together with simctl scenarios.
+- **News-driven funds** (`strategy=news`, group `news-fund`) trade stories under 10 seconds old: tone plus fair-value impact sets direction and size, they cross the spread with a limit order and unwind the position after `hold_ms`.
+- **Listings need a prospectus.** With `--require-prospectus` (on in the demo) the exchange refuses an IPO until a prospectus has been filed for the symbol. The newsroom files every prospectus it publishes with the exchange, and files them again whenever it reconnects. `ome exchange ipo FOO ...` for a company the newsroom does not cover fails with "no prospectus has been filed for FOO".
+- **Simulation news shocks are stories.** With `--newsroom`, ome-simctl hands `ome sim news SYM pct` to the newsroom as a shock that scales the company's earnings, so the move reaches fair value, the feed and the agents through the same path as any other story (it falls back to the old direct shock if the newsroom is down). Recordings keep the shock and replays publish it again.
+
+In a test run a `-8%` shock on NOVA became story #8 ("Unexpected setback for Nova Energy", -803 bps) and NOVA traded from 12.74 to 11.62 within 20 seconds; the two news funds had 30 fills by then, and the recorder had every story in PostgreSQL and the `ome:news` stream.
+
 Brokers subscribe with `--news` (registered once with `ome news register`), resume after the last story they saw, cache recent stories and pass them to clients that ask (`ome broker ... news`). Everything is journaled, so a killed newsroom restarts with the same economy, fundamentals and story numbers.
 
 ```bash
@@ -399,12 +407,12 @@ In a test run the newsroom published a hot CPI print (-56 bps on fair values), a
 
 ## Storage: PostgreSQL and Redis
 
-The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house and the venues as ops and to every provider as broker admin. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
+The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house, the venues and the newsroom as ops and to every provider as broker admin. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
 
 | Store | Holds | Keys / tables |
 |---|---|---|
-| **PostgreSQL** (record) | every trade (lit and off-exchange, with venue), instruments, market stats, session changes, exchange members, clearing positions, settled cycles, client accounts per broker, 606 routing stats per broker, venue status and inventory | `trades`, `instruments`, `market_stats`, `sessions`, `members`, `clearing_members`, `settlement_cycles`, `accounts`, `broker_routing`, `venues`, `venue_inventory` |
-| **Redis** (live) | last price, full book as JSON, market stats, a capped trade stream per symbol, a pub/sub trade channel, market phase | `ome:last:SYM`, `ome:book:SYM`, `ome:stats:SYM`, `ome:trades:SYM` (stream), `ome:trades` (channel), `ome:market`, `ome:instrument:SYM`, `ome:symbols` |
+| **PostgreSQL** (record) | every trade (lit and off-exchange, with venue), instruments, market stats, session changes, exchange members, clearing positions, settled cycles, client accounts per broker, 606 routing stats per broker, venue status and inventory, every news story with its sentiment, impact and numbers | `trades`, `instruments`, `market_stats`, `sessions`, `members`, `clearing_members`, `settlement_cycles`, `accounts`, `broker_routing`, `venues`, `venue_inventory`, `news` |
+| **Redis** (live) | last price, full book as JSON, market stats, a capped trade stream per symbol, a pub/sub trade channel, market phase, a news stream and channel | `ome:last:SYM`, `ome:book:SYM`, `ome:stats:SYM`, `ome:trades:SYM` (stream), `ome:trades` (channel), `ome:news` (stream and channel), `ome:market`, `ome:instrument:SYM`, `ome:symbols` |
 
 Prices and cash are stored as integer ticks (0.01), like everywhere else in the system. If a database goes away, the recorder keeps a bounded backlog (200,000 records) and writes it when the database is back. Restarting PostgreSQL in the middle of a session loses nothing.
 
@@ -427,7 +435,7 @@ scripts/db.sh redis SUBSCRIBE ome:trades
 
 ```
 ome broker --addr <prime> create-account acme_ir <secret> issuer 0      →  account 3
-ome exchange ipo ACME 25.00 20000 prime-co 3 Acme Robotics
+ome exchange ipo ACME 25.00 20000 prime-co 3 Acme Robotics          (needs a filed prospectus with --require-prospectus)
 ```
 
 The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, then places the offering as a sell order owned by that account. The prime broker credits and reserves the shares, and proceeds settle into the issuer's account as investors buy. In the demo seed, market makers, HFT desks and retail accounts get their opening inventory by **buying in the IPO**; no shares are created out of thin air.
@@ -435,7 +443,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 232 tests
+cargo test --workspace     # 235 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -446,7 +454,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 - **1g** ~~off-exchange execution: internalization, tape reporting, wholesaler with PFOF, dark pool, market stats, designated market makers~~ done
 - **1h** ~~PostgreSQL (accounts, trades, settlements) and Redis (market data)~~ done
 - **2** ~~tiered agents (HFT, DMM, quant, pension, prop, rule-based and ML retail), simulation control plane with scenarios and record/replay~~ done
-- **3** newsroom: ~~fundamentals, economy, earnings and news feed (3a)~~ done; news-driven agents and prospectus-gated listings (3b); local-LLM writer (3c)
+- **3** newsroom: ~~fundamentals, economy, earnings and news feed (3a), news-driven agents, prospectus-gated listings, recorded news (3b)~~ done; local-LLM writer (3c)
 - **4** GPUI desktop apps, one per party (the terminal UI was retired)
 
 ## License

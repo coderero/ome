@@ -51,7 +51,7 @@ impl Strategy for NoiseTrader {
         let Some(symbol) = pick(&self.symbols, rng) else {
             return actions;
         };
-        let mood = (self.sentiment + state.world.sentiment(symbol)).clamp(-1.0, 1.0);
+        let mood = (self.sentiment + state.sentiment(symbol)).clamp(-1.0, 1.0);
         if !state.trading(symbol) {
             return actions;
         }

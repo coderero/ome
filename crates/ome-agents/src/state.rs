@@ -129,6 +129,7 @@ pub struct AgentState {
     pub fills: u64,
     pub rejects: u64,
     pub world: crate::world::WorldView,
+    pub news: crate::news::NewsDesk,
 }
 
 impl Default for AgentState {
@@ -150,11 +151,16 @@ impl Default for AgentState {
             fills: 0,
             rejects: 0,
             world: crate::world::WorldView::default(),
+            news: crate::news::NewsDesk::default(),
         }
     }
 }
 
 impl AgentState {
+    pub fn sentiment(&self, symbol: Symbol) -> f64 {
+        (self.world.sentiment(symbol) + self.news.mood(symbol, self.now)).clamp(-1.0, 1.0)
+    }
+
     pub fn market(&self, symbol: Symbol) -> Option<&Market> {
         self.markets.get(&symbol)
     }
@@ -303,6 +309,9 @@ impl AgentState {
                 } else {
                     self.algos.remove(&a.algo_id);
                 }
+            }
+            ServerMessage::News(item) => {
+                self.news.absorb(item);
             }
             ServerMessage::Reject { .. } => self.rejects += 1,
             _ => {}

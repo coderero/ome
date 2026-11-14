@@ -23,6 +23,7 @@ pub struct SimConfig {
     pub exchange_addr: String,
     pub exchange_name: String,
     pub exchange_secret: String,
+    pub newsroom: Option<(String, String)>,
 }
 
 pub fn start(config: SimConfig) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
@@ -56,7 +57,8 @@ pub fn start(config: SimConfig) -> Result<(SocketAddr, JoinHandle<Result<(), Str
         name: config.exchange_name.clone(),
         secret: config.exchange_secret.clone(),
     };
-    let mut gateway = Gateway::new(state, journal, credentials, exchange, clock);
+    let mut gateway = Gateway::new(state, journal, credentials, exchange, clock)
+        .with_newsroom(config.newsroom.clone());
     let listener = TcpListener::bind(&config.listen)
         .map_err(|e| format!("cannot listen on {}: {e}", config.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;

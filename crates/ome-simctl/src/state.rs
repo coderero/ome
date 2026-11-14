@@ -93,7 +93,7 @@ pub fn validate(command: &SimCommand) -> Result<(), String> {
 impl SimState {
     pub fn check(&self, fact: &Fact) -> Result<(), String> {
         match fact {
-            Fact::Command(command) => validate(command),
+            Fact::Command(command) | Fact::Forwarded(command) => validate(command),
             Fact::Accelerated(_) => Ok(()),
             Fact::RecordingStarted { name, .. } => {
                 valid_name(name)?;
@@ -119,6 +119,7 @@ impl SimState {
                 Some(Step::Command(command.clone()))
             }
             Fact::Accelerated(seconds) => Some(Step::Accelerate(*seconds)),
+            Fact::Forwarded(command) => Some(Step::Command(command.clone())),
             Fact::RecordingStarted { name, marks } => {
                 let recording = Recording {
                     name: name.clone(),

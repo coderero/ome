@@ -57,7 +57,7 @@ seed_market() {
     read -r symbol price shares name <<<"$listing"
     local lower="${symbol,,}" issuer
     issuer="$(broker_admin prime-co create-account "${lower}_ir" "${lower}-ir-pw" issuer 0 | account_id)"
-    exchange_cmd ipo "$symbol" "$price" "$shares" prime-co "$issuer" "$name"
+    wait_for exchange_cmd ipo "$symbol" "$price" "$shares" prime-co "$issuer" "$name"
     wait_for listed_everywhere "$symbol"
     exchange_cmd dmm "$symbol" lp-co
     news_cmd status >/dev/null 2>&1 || sim_cmd fair "$symbol" "$price"

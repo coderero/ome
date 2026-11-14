@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS venues (
     venue TEXT PRIMARY KEY, fills BIGINT NOT NULL, declined BIGINT NOT NULL, shares BIGINT NOT NULL,
     pfof_paid BIGINT NOT NULL, cash BIGINT NOT NULL, resting BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS news (
+    seq BIGINT PRIMARY KEY, day BIGINT NOT NULL, kind TEXT NOT NULL, symbol TEXT, sector TEXT NOT NULL,
+    sentiment INTEGER NOT NULL, impact_bps INTEGER NOT NULL, headline TEXT NOT NULL, body TEXT NOT NULL,
+    data TEXT NOT NULL, published_at TIMESTAMPTZ NOT NULL);
+CREATE INDEX IF NOT EXISTS news_by_symbol ON news (symbol, published_at);
 CREATE TABLE IF NOT EXISTS venue_inventory (
     venue TEXT NOT NULL, symbol TEXT NOT NULL, qty BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (venue, symbol));
@@ -127,6 +132,27 @@ fn record(tx: &mut Transaction<'_>, observation: &Observation) -> Result<(), pos
                     &int(i.high_limit),
                     &int(i.volume),
                     &i.halt_reason,
+                ],
+            )?;
+        }
+        Observation::News(n) => {
+            tx.execute(
+                "INSERT INTO news (seq, day, kind, symbol, sector, sentiment, impact_bps, headline, body,
+                                   data, published_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_timestamp($11::double precision / 1000))
+                 ON CONFLICT (seq) DO NOTHING",
+                &[
+                    &int(n.seq),
+                    &int(n.day),
+                    &n.kind.label(),
+                    &n.symbol.map(|s| s.to_string()),
+                    &n.sector,
+                    &(n.sentiment as i32),
+                    &(n.impact_bps.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+                    &n.headline,
+                    &n.body,
+                    &n.data,
+                    &(n.time as f64),
                 ],
             )?;
         }

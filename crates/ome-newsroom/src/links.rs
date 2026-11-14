@@ -1,8 +1,9 @@
+use crate::newsroom::Filing;
 use ome_client::Client;
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_net::log;
-use ome_protocol::{MarketPhase, ServerMessage, SimCommand, SimMessage, SimRole};
+use ome_protocol::{MarketPhase, MemberMessage, ServerMessage, SimCommand, SimMessage, SimRole};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -16,25 +17,44 @@ pub fn watch_exchange<T: Send + 'static>(
     secret: String,
     events: Sender<T>,
     wrap: fn(MarketPhase, u64) -> T,
+    filings: Receiver<Filing>,
 ) {
     thread::spawn(move || {
         let mut warned = false;
+        let mut filed: BTreeMap<Symbol, Filing> = BTreeMap::new();
+        let file = |client: &mut Client, f: &Filing| {
+            client.send_member(&MemberMessage::FileProspectus {
+                symbol: f.symbol,
+                reference: f.reference,
+                name: f.name.clone(),
+            })
+        };
         loop {
+            filed.extend(filings.try_iter().map(|f| (f.symbol, f)));
             match Client::connect_member(&addr, &name, &secret) {
-                Ok((client, _)) => {
+                Ok((mut client, _)) => {
                     log(&format!(
-                        "following the trading calendar of exchange {addr}"
+                        "following the trading calendar of exchange {addr}; filing {} prospectus(es)",
+                        filed.len()
                     ));
                     warned = false;
-                    loop {
-                        match client.recv_timeout(Duration::from_secs(1)) {
+                    let mut healthy = filed.values().all(|f| file(&mut client, f).is_ok());
+                    while healthy {
+                        for f in filings.try_iter() {
+                            healthy &= file(&mut client, &f).is_ok();
+                            filed.insert(f.symbol, f);
+                        }
+                        match client.recv_timeout(Duration::from_millis(250)) {
                             Ok(Some(ServerMessage::MarketStatus(s))) => {
                                 if events.send(wrap(s.phase, s.day)).is_err() {
                                     return;
                                 }
                             }
+                            Ok(Some(ServerMessage::Reject { reason, .. })) => {
+                                log(&format!("exchange refused a request: {reason}"))
+                            }
                             Ok(_) => {}
-                            Err(_) => break,
+                            Err(_) => healthy = false,
                         }
                     }
                     log("exchange link lost; reconnecting");
