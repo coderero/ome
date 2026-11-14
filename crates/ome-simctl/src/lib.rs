@@ -1,5 +1,6 @@
 pub mod gateway;
 pub mod journal;
+pub mod recording;
 pub mod state;
 
 use gateway::{Credentials, ExchangeAccess, Gateway};
@@ -32,10 +33,10 @@ pub fn start(config: SimConfig) -> Result<(SocketAddr, JoinHandle<Result<(), Str
             let (journal, records) = Journal::<Record>::open(path)
                 .map_err(|e| format!("cannot open journal {}: {e}", path.display()))?;
             for record in &records {
-                state.apply(&record.command, record.timestamp);
+                state.apply_fact(&record.fact, record.timestamp);
                 clock = record.timestamp;
             }
-            log(&format!("replayed {} simulation command(s)", records.len()));
+            log(&format!("replayed {} simulation fact(s)", records.len()));
             Some(journal)
         }
         None => None,
@@ -73,6 +74,7 @@ pub fn start(config: SimConfig) -> Result<(SocketAddr, JoinHandle<Result<(), Str
                     return Err("listener stopped".to_string());
                 }
             }
+            gateway.tick(now_ms());
             gateway
                 .flush()
                 .map_err(|e| format!("journal flush failed: {e}"))?;

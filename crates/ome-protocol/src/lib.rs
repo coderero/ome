@@ -12,5 +12,5 @@ pub use codec::{DecodeError, Decoder, Encoder};
 pub use framing::{read_frame, write_frame};
 pub use member::MemberMessage;
 pub use server::ServerMessage;
-pub use sim::{GroupInfo, Scenario, SimCommand, SimMessage, SimRole, SimStatus};
+pub use sim::{GroupInfo, RecordingInfo, Scenario, SimCommand, SimMessage, SimRole, SimStatus};
 pub use types::*;

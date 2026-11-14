@@ -1,3 +1,5 @@
+use crate::journal::Fact;
+use crate::recording::{Recording, Step, valid_name};
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_core::types::Timestamp;
@@ -33,6 +35,8 @@ pub struct SimState {
     groups: BTreeMap<String, GroupSettings>,
     fair: BTreeMap<Symbol, Fair>,
     scenarios: Vec<(Scenario, Timestamp)>,
+    recordings: BTreeMap<String, Recording>,
+    recording: Option<String>,
 }
 
 pub fn validate(command: &SimCommand) -> Result<(), String> {
@@ -87,6 +91,76 @@ pub fn validate(command: &SimCommand) -> Result<(), String> {
 }
 
 impl SimState {
+    pub fn check(&self, fact: &Fact) -> Result<(), String> {
+        match fact {
+            Fact::Command(command) => validate(command),
+            Fact::Accelerated(_) => Ok(()),
+            Fact::RecordingStarted { name, .. } => {
+                valid_name(name)?;
+                if let Some(active) = &self.recording {
+                    return Err(format!("already recording '{active}'"));
+                }
+                if self.recordings.contains_key(name) {
+                    return Err(format!("a recording named '{name}' exists"));
+                }
+                Ok(())
+            }
+            Fact::RecordingStopped { .. } => match &self.recording {
+                Some(_) => Ok(()),
+                None => Err("nothing is being recorded".into()),
+            },
+        }
+    }
+
+    pub fn apply_fact(&mut self, fact: &Fact, at: Timestamp) {
+        let step = match fact {
+            Fact::Command(command) => {
+                self.apply(command, at);
+                Some(Step::Command(command.clone()))
+            }
+            Fact::Accelerated(seconds) => Some(Step::Accelerate(*seconds)),
+            Fact::RecordingStarted { name, marks } => {
+                let recording = Recording {
+                    name: name.clone(),
+                    started_at: at,
+                    stopped_at: None,
+                    baseline: self.replay(at),
+                    steps: Vec::new(),
+                    start_marks: marks.clone(),
+                    stop_marks: Vec::new(),
+                };
+                self.recordings.insert(name.clone(), recording);
+                self.recording = Some(name.clone());
+                None
+            }
+            Fact::RecordingStopped { marks } => {
+                if let Some(name) = self.recording.take()
+                    && let Some(recording) = self.recordings.get_mut(&name)
+                {
+                    recording.stopped_at = Some(at);
+                    recording.stop_marks = marks.clone();
+                }
+                None
+            }
+        };
+        if let Some(step) = step
+            && let Some(name) = &self.recording
+            && let Some(recording) = self.recordings.get_mut(name)
+        {
+            recording
+                .steps
+                .push((at.saturating_sub(recording.started_at), step));
+        }
+    }
+
+    pub fn recording(&self) -> Option<&str> {
+        self.recording.as_deref()
+    }
+
+    pub fn recordings(&self) -> &BTreeMap<String, Recording> {
+        &self.recordings
+    }
+
     pub fn apply(&mut self, command: &SimCommand, at: Timestamp) {
         match command {
             SimCommand::Pause { group } | SimCommand::Resume { group } => {
@@ -383,6 +457,47 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn recordings_capture_a_baseline_and_the_timeline_between_start_and_stop() {
+        let mut state = SimState::default();
+        let pause = SimCommand::Pause {
+            group: "noise".into(),
+        };
+        state.apply_fact(&Fact::Command(pause.clone()), 1_000);
+        let start = Fact::RecordingStarted {
+            name: "drill".into(),
+            marks: vec![],
+        };
+        assert!(
+            state
+                .check(&Fact::RecordingStopped { marks: vec![] })
+                .is_err()
+        );
+        assert!(state.check(&start).is_ok());
+        state.apply_fact(&start, 5_000);
+        assert!(state.check(&start).is_err(), "one recording at a time");
+        let crash = SimCommand::Scenario(Scenario::FlashCrash {
+            symbol: acme(),
+            seconds: 20,
+        });
+        state.apply_fact(&Fact::Command(crash.clone()), 17_500);
+        state.apply_fact(&Fact::Accelerated([1, 20, 1, 1]), 20_000);
+        state.apply_fact(&Fact::RecordingStopped { marks: vec![] }, 30_000);
+        state.apply_fact(&Fact::Command(pause.clone()), 40_000);
+        assert_eq!(state.recording(), None);
+        let drill = &state.recordings()["drill"];
+        assert_eq!(drill.baseline, vec![pause]);
+        assert_eq!(
+            drill.steps,
+            vec![
+                (12_500, Step::Command(crash)),
+                (15_000, Step::Accelerate([1, 20, 1, 1]))
+            ]
+        );
+        assert_eq!(drill.stopped_at, Some(30_000));
+        assert!(state.check(&start).is_err(), "names are unique");
     }
 
     #[test]

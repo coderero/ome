@@ -340,7 +340,9 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 | Quant funds (prime) | pairs stat-arb executed with POV algos or in the dark pool; factor model (momentum, reversal, volatility) rebalanced with VWAP parents; value investing around fair value |
 | Slow money (prime) | pension funds rebalancing to target weights with slow VWAP parents |
 | Prop desks (prime) | momentum, breakout and mean reversion entries, each position protected by an OCO take-profit/stop |
-| Retail | day traders (protective stops, flat before the close), swing traders (brackets on dips), investors (GTT dip buys, after-market orders, trailing stops), value-minded retail, noise traders |
+| Retail | day traders (protective stops, flat before the close), swing traders (brackets on dips), investors (GTT dip buys, after-market orders, trailing stops), ML personas, value-minded retail, noise traders |
+
+**ML retail personas** (`strategy=ml-retail`, groups `ml-cautious` and `ml-bold`) each train their own online logistic regression on the live tape: features are the 5, 20 and 100-tick returns, volatility, z-score, news sentiment and the spread, and the label is whether the price is higher a horizon later. They stay out of the market until the model has seen enough samples, then trade the edge of the predicted probability over the model's base rate: a strong edge enters with a bracket, a moderate one with a GTT dip buy, holdings get a trailing stop, and a negative edge exits at market (often filled by the wholesaler). Every agent draws its own horizon, learning rate and sample subset, so agents watching the same tape learn different models. `style=cautious|balanced|bold` sets thresholds and size; `enter`, `strong`, `exit`, `horizon`, `lr`, `diversity` and others can be changed live, and the model is kept across changes. Each agent's status line shows samples seen, hit rate, base rate and its strongest feature. In a live run the models learned short-term mean reversion (a negative weight on the 5-tick return), as expected in a market anchored by value investors.
 
 `ome-simctl` (port 7400) is the control plane for these artificial participants only; the exchange never sees it. Operators use `ome sim ...`, runners follow it with `--simctl`, and every command is journaled, so a restarted simctl or a reconnecting runner gets the current settings back.
 
@@ -348,14 +350,21 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 ome sim status                        # groups, running/target, paused, fills, equity, parameters, fair values, scenarios
 ome sim pause noise                   # cancel the group's open orders and stop it (resume noise | pause *)
 ome sim count swing 25                # scale a group; new accounts are opened automatically
-ome sim param hft-vega gamma=0.6      # live parameter change (the strategy is rebuilt)
+ome sim param hft-vega gamma=0.6      # live parameter change (rebuilt, except ML personas, which keep their model)
 ome sim fund daytrader 1000           # add cash to every account in a group
 ome sim fair ZEN 85.00 2              # fair value and drift in bps per minute, which value investors trade around
 ome sim crash ACME 15                 # flash crash: panic selling, liquidity withdraws, value buyers wait, then recover
 ome sim news NOVA -8                  # news shock: fair value -8% and negative sentiment for a minute
 ome sim drought 30 | volatility 30    # market-wide liquidity drought or activity burst
 ome sim speed 3 30 3 3                # time acceleration: trading day phase lengths in seconds
+ome sim record start crash-drill      # record operator commands from now on, with a tape mark per symbol
+ome sim record stop crash-drill       # close the recording (tape marked again)
+ome sim recordings                    # saved recordings with their tape marks
+ome sim recording crash-drill         # timeline: baseline settings, then each step with its offset
+ome sim replay crash-drill 2          # re-issue the recording at twice the speed (replay stop cancels)
 ```
+
+A recording starts with the settings in effect at that moment (group settings, fair values, active scenarios) as its baseline, then holds each operator command and speed change with its offset. The tape marks (last price and day volume per symbol at both ends, plus wall-clock times) tie it to the trades in PostgreSQL. Recordings live in the simctl journal, so they survive restarts. A replay sends the baseline first and then each step with its original spacing, scaled by the speed; replayed commands are journaled like any other command. A replay that is running when simctl restarts is not resumed.
 
 Fair values start at the listing prices (the seed script sets them). In a test run a flash crash took ACME from 24.60 to 23.06 and value buyers brought it back to 25.12 in the next session; a -8% news shock moved NOVA from 12.10 to its new fair value of 11.50 within 15 seconds.
 
@@ -394,21 +403,10 @@ ome exchange ipo ACME 25.00 20000 prime-co 3 Acme Robotics
 
 The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, then places the offering as a sell order owned by that account. The prime broker credits and reserves the shares, and proceeds settle into the issuer's account as investors buy. In the demo seed, market makers, HFT desks and retail accounts get their opening inventory by **buying in the IPO**; no shares are created out of thin air.
 
-## Agents
-
-`ome-bots --file data/bots.conf`, where each line is `strategy:SYMBOL:user:secret@broker-host:port`.
-
-| Strategy | Seeded at | Behaviour |
-|---|---|---|
-| `mm` | lp-co, dma-co | two-sided quotes around the last trade, skewed against inventory, pulled during halts |
-| `momentum` | prime-co (quant) | fast/slow EMA crossover with market orders |
-| `meanrev` | prime-co (prop) | z-score of recent trades; fades extremes with expiring limit orders |
-| `noise` | retail-co | small random orders driven by a drifting sentiment with rare shocks |
-
 ## Testing
 
 ```bash
-cargo test --workspace     # 206 tests
+cargo test --workspace     # 216 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -418,7 +416,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 - **1f** ~~broker-held orders, broker risk controls, algorithmic orders (TWAP, VWAP, POV, iceberg slicer)~~ done
 - **1g** ~~off-exchange execution: internalization, tape reporting, wholesaler with PFOF, dark pool, market stats, designated market makers~~ done
 - **1h** ~~PostgreSQL (accounts, trades, settlements) and Redis (market data)~~ done
-- **2** tiered agents: HFT and quant institutions, prop desks, ML-managed retail accounts, simulation control plane
+- **2** ~~tiered agents (HFT, DMM, quant, pension, prop, rule-based and ML retail), simulation control plane with scenarios and record/replay~~ done
 - **3** local-LLM newsroom: company reports, IPO prospectuses, news and macro events
 - **4** GPUI desktop apps, one per party (the terminal UI was retired)
 

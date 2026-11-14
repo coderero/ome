@@ -76,6 +76,9 @@ const USAGE: &str = "usage:
       crash <SYMBOL> [seconds]  |  news <SYMBOL> <percent> [seconds]
       drought [seconds]  |  volatility [seconds]          market-wide liquidity or activity scenarios
       speed <preopen> <open> <closing> <closed>           trading day length in seconds (time acceleration)
+      record start|stop <name>                            record operator commands with a tape mark at both ends
+      replay <name> [speed]  |  replay stop               re-issue a recording with its original spacing (speed 2 = twice as fast)
+      recordings  |  recording <name>                     saved recordings, or one recording's timeline
 
   ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
       status                                              cycles, collateral, margin, credit, fails
@@ -1331,6 +1334,77 @@ fn sim(client: &mut Client, args: &[&str]) -> Result<()> {
                     closed_s: number(d)?,
                 })?
             );
+            return Ok(());
+        }
+        ["record", action @ ("start" | "stop"), name] => {
+            println!(
+                "{}",
+                client.request_sim(&SimMessage::Record {
+                    name: name.to_string(),
+                    start: *action == "start",
+                })?
+            );
+            return Ok(());
+        }
+        ["replay", "stop"] => {
+            println!("{}", client.request_sim(&SimMessage::StopReplay)?);
+            return Ok(());
+        }
+        ["replay", name, rest @ ..] if rest.len() <= 1 => {
+            let speed = rest.first().map_or(Ok(1.0), |s| {
+                s.trim_end_matches('x')
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| *v > 0.0)
+                    .ok_or(format!("invalid speed '{s}'"))
+            })?;
+            println!(
+                "{}",
+                client.request_sim(&SimMessage::Replay {
+                    name: name.to_string(),
+                    speed_pct: (speed * 100.0).round() as u32,
+                })?
+            );
+            return Ok(());
+        }
+        ["recordings"] | ["recording", _] => {
+            let name = args.get(1).map_or(String::new(), |n| n.to_string());
+            client.send_sim(&SimMessage::QueryRecordings { name })?;
+            let list = match client.wait_for(Duration::from_secs(5), |m| {
+                matches!(
+                    m,
+                    ServerMessage::SimRecordings(_) | ServerMessage::Reject { .. }
+                )
+            })? {
+                ServerMessage::SimRecordings(list) => list,
+                ServerMessage::Reject { reason, .. } => return Err(reason.into()),
+                _ => unreachable!(),
+            };
+            if list.is_empty() {
+                println!("no recordings");
+            }
+            for r in &list {
+                let length = if r.stopped_at == 0 {
+                    "recording".to_string()
+                } else {
+                    format!("{}s", (r.stopped_at - r.started_at) / 1_000)
+                };
+                let replay = if r.replaying {
+                    format!("  replaying {} issued", r.issued)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {:<16} {:>9}  {:>3} step(s){replay}",
+                    r.name, length, r.steps
+                );
+                if !r.tape.is_empty() {
+                    println!("    tape: {}", r.tape);
+                }
+                if !r.timeline.is_empty() {
+                    println!("{}", r.timeline);
+                }
+            }
             return Ok(());
         }
         ["pause", group] => SimCommand::Pause {

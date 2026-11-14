@@ -1,5 +1,6 @@
 pub mod action;
 pub mod control;
+pub mod model;
 pub mod provision;
 pub mod roster;
 pub mod runner;

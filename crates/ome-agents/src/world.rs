@@ -173,7 +173,10 @@ mod tests {
         );
         let view = world.view(t0);
         assert_eq!((view.sentiment(acme()), view.activity), (-1.0, 3.0));
-        assert!(view.drought, "liquidity providers step back in a flash crash");
+        assert!(
+            view.drought,
+            "liquidity providers step back in a flash crash"
+        );
         let later = world.view(t0 + Duration::from_secs(5));
         assert!(later.sentiment(acme()) > -1.0 && later.sentiment(acme()) < -0.5);
         assert_eq!(

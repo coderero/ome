@@ -326,6 +326,57 @@ pub fn get_groups(d: &mut Decoder) -> Result<Vec<GroupInfo>, DecodeError> {
     Ok(groups)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingInfo {
+    pub name: String,
+    pub started_at: Timestamp,
+    pub stopped_at: Timestamp,
+    pub steps: u32,
+    pub replaying: bool,
+    pub issued: u32,
+    pub tape: String,
+    pub timeline: String,
+}
+
+pub fn put_recordings(e: &mut Encoder, recordings: &[RecordingInfo]) {
+    let mut g = e.begin_group(recordings.len());
+    for r in recordings {
+        e.begin_entry(&mut g);
+        e.u64(r.started_at)
+            .u64(r.stopped_at)
+            .u32(r.steps)
+            .u8(r.replaying as u8)
+            .u32(r.issued);
+        e.end_entry_block(&mut g);
+        e.var(&r.name).var(&r.tape).var(&r.timeline);
+    }
+}
+
+pub fn get_recordings(d: &mut Decoder) -> Result<Vec<RecordingInfo>, DecodeError> {
+    let g = d.group()?;
+    let mut recordings = Vec::with_capacity(g.count);
+    for _ in 0..g.count {
+        let start = d.entry_start();
+        let started_at = d.u64()?;
+        let stopped_at = d.u64()?;
+        let steps = d.u32()?;
+        let replaying = d.u8()? != 0;
+        let issued = d.u32()?;
+        d.end_entry_block(start, &g)?;
+        recordings.push(RecordingInfo {
+            name: d.var()?,
+            started_at,
+            stopped_at,
+            steps,
+            replaying,
+            issued,
+            tape: d.var()?,
+            timeline: d.var()?,
+        });
+    }
+    Ok(recordings)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimMessage {
     Logon {
@@ -342,6 +393,18 @@ pub enum SimMessage {
         closed_s: u64,
     },
     QueryStatus,
+    Record {
+        name: String,
+        start: bool,
+    },
+    Replay {
+        name: String,
+        speed_pct: u32,
+    },
+    StopReplay,
+    QueryRecordings {
+        name: String,
+    },
 }
 
 impl SimMessage {
@@ -352,6 +415,10 @@ impl SimMessage {
             SimMessage::Command(_) => SIM_COMMAND,
             SimMessage::Accelerate { .. } => SIM_ACCELERATE,
             SimMessage::QueryStatus => SIM_QUERY,
+            SimMessage::Record { .. } => SIM_RECORD,
+            SimMessage::Replay { .. } => SIM_REPLAY,
+            SimMessage::StopReplay => SIM_STOP_REPLAY,
+            SimMessage::QueryRecordings { .. } => SIM_QUERY_RECORDINGS,
         }
     }
 
@@ -378,8 +445,17 @@ impl SimMessage {
                     .u64(*closed_s)
                     .end_block();
             }
-            SimMessage::QueryStatus => {
+            SimMessage::QueryStatus | SimMessage::StopReplay => {
                 e.end_block();
+            }
+            SimMessage::Record { name, start } => {
+                e.u8(*start as u8).end_block().var(name);
+            }
+            SimMessage::Replay { name, speed_pct } => {
+                e.u32(*speed_pct).end_block().var(name);
+            }
+            SimMessage::QueryRecordings { name } => {
+                e.end_block().var(name);
             }
         }
         e.finish()
@@ -419,6 +495,30 @@ impl SimMessage {
             SIM_QUERY => {
                 d.end_block()?;
                 SimMessage::QueryStatus
+            }
+            SIM_RECORD => {
+                let start = d.u8()? != 0;
+                d.end_block()?;
+                SimMessage::Record {
+                    name: d.var()?,
+                    start,
+                }
+            }
+            SIM_REPLAY => {
+                let speed_pct = d.u32()?;
+                d.end_block()?;
+                SimMessage::Replay {
+                    name: d.var()?,
+                    speed_pct,
+                }
+            }
+            SIM_STOP_REPLAY => {
+                d.end_block()?;
+                SimMessage::StopReplay
+            }
+            SIM_QUERY_RECORDINGS => {
+                d.end_block()?;
+                SimMessage::QueryRecordings { name: d.var()? }
             }
             other => return Err(DecodeError::UnknownTemplate(other)),
         })
@@ -497,6 +597,18 @@ mod tests {
                 closed_s: 3,
             },
             SimMessage::QueryStatus,
+            SimMessage::Record {
+                name: "crash-drill".into(),
+                start: true,
+            },
+            SimMessage::Replay {
+                name: "crash-drill".into(),
+                speed_pct: 200,
+            },
+            SimMessage::StopReplay,
+            SimMessage::QueryRecordings {
+                name: String::new(),
+            },
         ];
         messages.extend(commands().into_iter().map(SimMessage::Command));
         for message in messages {

@@ -1,5 +1,6 @@
 mod factor;
 mod market_maker;
+mod ml_retail;
 mod noise;
 mod pension;
 mod prop;
@@ -20,6 +21,7 @@ use std::time::Duration;
 
 pub use factor::FactorModel;
 pub use market_maker::MarketMaker;
+pub use ml_retail::MlRetail;
 pub use noise::NoiseTrader;
 pub use pension::Pension;
 pub use prop::{PropDesk, PropSignal};
@@ -31,6 +33,14 @@ pub trait Strategy: Send {
     fn name(&self) -> &'static str;
     fn interval(&self) -> Duration;
     fn on_tick(&mut self, state: &AgentState, rng: &mut StdRng) -> Vec<Action>;
+
+    fn retune(&mut self, _params: &Params) -> bool {
+        false
+    }
+
+    fn detail(&self) -> String {
+        String::new()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,6 +73,7 @@ pub const STRATEGIES: &[&str] = &[
     "daytrader",
     "swing",
     "investor",
+    "ml-retail",
     "momentum",
     "breakout",
     "meanrev",
@@ -81,6 +92,7 @@ pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn
         "daytrader" => Box::new(RetailPersona::new(Persona::DayTrader, symbols, params)),
         "swing" => Box::new(RetailPersona::new(Persona::Swing, symbols, params)),
         "investor" => Box::new(RetailPersona::new(Persona::Investor, symbols, params)),
+        "ml-retail" => Box::new(MlRetail::new(symbols, params)),
         "momentum" => Box::new(PropDesk::new(PropSignal::Momentum, symbols, params)),
         "breakout" => Box::new(PropDesk::new(PropSignal::Breakout, symbols, params)),
         "meanrev" => Box::new(PropDesk::new(PropSignal::MeanReversion, symbols, params)),

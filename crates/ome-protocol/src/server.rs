@@ -44,6 +44,7 @@ pub enum ServerMessage {
     Obligations(Vec<ObligationInfo>),
     SimStatus(crate::sim::SimStatus),
     SimEvent(crate::sim::SimCommand),
+    SimRecordings(Vec<crate::sim::RecordingInfo>),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -79,6 +80,7 @@ impl ServerMessage {
             ServerMessage::Obligations(_) => OBLIGATIONS,
             ServerMessage::SimStatus(_) => SIM_STATUS,
             ServerMessage::SimEvent(_) => SIM_EVENT,
+            ServerMessage::SimRecordings(_) => SIM_RECORDINGS,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -258,6 +260,10 @@ impl ServerMessage {
                     .end_block();
             }
             ServerMessage::SimEvent(command) => crate::sim::put_command(&mut e, command),
+            ServerMessage::SimRecordings(list) => {
+                e.end_block();
+                crate::sim::put_recordings(&mut e, list);
+            }
             ServerMessage::SimStatus(s) => {
                 e.u32(s.runners).end_block();
                 crate::sim::put_groups(&mut e, &s.groups);
@@ -702,6 +708,10 @@ impl ServerMessage {
                 ServerMessage::MarketStats(stats)
             }
             SIM_EVENT => ServerMessage::SimEvent(crate::sim::get_command(&mut d)?),
+            SIM_RECORDINGS => {
+                d.end_block()?;
+                ServerMessage::SimRecordings(crate::sim::get_recordings(&mut d)?)
+            }
             SIM_STATUS => {
                 let runners = d.u32()?;
                 d.end_block()?;
@@ -1296,6 +1306,16 @@ mod tests {
                 key: "activity".into(),
                 value: "0.9".into(),
             }),
+            ServerMessage::SimRecordings(vec![crate::sim::RecordingInfo {
+                name: "crash-drill".into(),
+                started_at: 1_000,
+                stopped_at: 61_000,
+                steps: 3,
+                replaying: true,
+                issued: 1,
+                tape: "ACME 25.00 -> 23.10".into(),
+                timeline: "+0.0s paused noise".into(),
+            }]),
             ServerMessage::SimStatus(crate::sim::SimStatus {
                 runners: 1,
                 groups: vec![crate::sim::GroupInfo {

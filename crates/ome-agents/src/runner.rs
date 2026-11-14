@@ -205,8 +205,10 @@ fn run(
         was_paused = false;
         if ctx.group.generation() != generation {
             generation = ctx.group.generation();
-            if let Some(rebuilt) = strategies::create(&spec.strategy, &symbols, &ctx.group.params())
-            {
+            let params = ctx.group.params();
+            if strategy.retune(&params) {
+                eprintln!("[{}] retuned: {:?}", spec.name, params.0);
+            } else if let Some(rebuilt) = strategies::create(&spec.strategy, &symbols, &params) {
                 strategy = rebuilt;
                 eprintln!(
                     "[{}] parameters changed: {:?}",
@@ -245,7 +247,7 @@ fn run(
 
 fn report(spec: &AgentSpec, strategy: &dyn Strategy, state: &AgentState) {
     eprintln!(
-        "[{}] {} equity {} cash {} day P&L {}{} fills {} open {} armed {} algos {}",
+        "[{}] {} equity {} cash {} day P&L {}{} fills {} open {} armed {} algos {} {}",
         spec.name,
         strategy.name(),
         format_price(state.equity()),
@@ -255,7 +257,8 @@ fn report(spec: &AgentSpec, strategy: &dyn Strategy, state: &AgentState) {
         state.fills,
         state.open_orders.len(),
         state.armed.len(),
-        state.algos.len()
+        state.algos.len(),
+        strategy.detail()
     );
 }
 
