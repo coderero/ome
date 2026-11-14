@@ -11,6 +11,7 @@ ome-store.workspace = true
 ome-net.workspace = true
 ome-client.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 ome-exchange.workspace = true

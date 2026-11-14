@@ -5,7 +5,8 @@ const USAGE: &str = "usage: ome-newsroom [--listen ADDR] [--journal PATH] [--com
                     [--ops-name NAME] [--ops-secret SECRET]
                     [--exchange ADDR] [--exchange-secret SECRET] [--no-exchange]
                     [--simctl ADDR] [--sim-secret SECRET] [--no-simctl]
-                    [--quarter-days N] [--news-per-minute RATE] [--seed N]";
+                    [--quarter-days N] [--news-per-minute RATE] [--seed N]
+                    [--llm http://HOST:PORT] [--llm-model MODEL] [--llm-timeout-ms MS]";
 
 fn parse_args() -> Result<NewsConfig, String> {
     let env = |name: &str, fallback: &str| std::env::var(name).unwrap_or_else(|_| fallback.into());
@@ -30,7 +31,11 @@ fn parse_args() -> Result<NewsConfig, String> {
         quarter_days: 5,
         news_per_minute: 3.0,
         seed: None,
+        llm: None,
     };
+    let mut llm_url: Option<String> = None;
+    let mut llm_model = env("OME_LLM_MODEL", "qwen2.5:1.5b");
+    let mut llm_timeout_ms: u64 = 8_000;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
@@ -72,6 +77,13 @@ fn parse_args() -> Result<NewsConfig, String> {
                     .parse()
                     .map_err(|_| "--news-per-minute needs a number")?
             }
+            "--llm" => llm_url = Some(value()?),
+            "--llm-model" => llm_model = value()?,
+            "--llm-timeout-ms" => {
+                llm_timeout_ms = value()?
+                    .parse()
+                    .map_err(|_| "--llm-timeout-ms needs a number")?
+            }
             "--seed" => config.seed = Some(value()?.parse().map_err(|_| "--seed needs a number")?),
             _ => return Err(USAGE.into()),
         }
@@ -79,6 +91,11 @@ fn parse_args() -> Result<NewsConfig, String> {
     let text = std::fs::read_to_string(&companies_path)
         .map_err(|e| format!("cannot read {companies_path}: {e}"))?;
     config.companies = parse_companies(&text).map_err(|e| format!("{companies_path}: {e}"))?;
+    config.llm = llm_url.map(|url| ome_newsroom::llm::LlmConfig {
+        url,
+        model: llm_model,
+        timeout: std::time::Duration::from_millis(llm_timeout_ms),
+    });
     config.exchange = exchange;
     config.simctl = simctl;
     Ok(config)

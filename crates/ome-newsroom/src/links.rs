@@ -1,13 +1,17 @@
+use crate::llm::Llm;
 use crate::newsroom::Filing;
+use crate::writer::Copy;
 use ome_client::Client;
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_net::log;
+use ome_protocol::NewsItem;
 use ome_protocol::{MarketPhase, MemberMessage, ServerMessage, SimCommand, SimMessage, SimRole};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 const RETRY: Duration = Duration::from_secs(2);
 
@@ -121,4 +125,60 @@ pub fn sync_fair(addr: String, secret: String) -> Sender<Vec<(Symbol, Price)>> {
         }
     });
     tx
+}
+
+pub struct Job {
+    pub item: NewsItem,
+    pub company: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Done {
+    pub seq: u64,
+    pub result: Result<Copy, String>,
+    pub elapsed_ms: u64,
+}
+
+pub fn spawn_writer<T: Send + 'static>(
+    llm: Llm,
+    jobs: Receiver<Job>,
+    events: Sender<T>,
+    wrap: fn(Done) -> T,
+) {
+    thread::spawn(move || {
+        let started = Instant::now();
+        match llm.warm_up() {
+            Ok(()) => log(&format!(
+                "LLM writer ready: {} loaded in {:?}",
+                llm.model(),
+                started.elapsed()
+            )),
+            Err(e) => log(&format!(
+                "LLM writer offline ({e}); stories keep their template text"
+            )),
+        }
+        let mut offline_until: Option<Instant> = None;
+        for job in jobs {
+            let begun = Instant::now();
+            let result = if offline_until.is_some_and(|t| t > begun) {
+                Err("LLM offline".to_string())
+            } else {
+                let result = llm.rewrite(&job.item, &job.company);
+                if let Err(e) = &result
+                    && (e.contains("refused") || e.contains("resolve") || e.contains("no answer"))
+                {
+                    offline_until = Some(Instant::now() + Duration::from_secs(10));
+                }
+                result
+            };
+            let done = Done {
+                seq: job.item.seq,
+                result,
+                elapsed_ms: begun.elapsed().as_millis() as u64,
+            };
+            if events.send(wrap(done)).is_err() {
+                return;
+            }
+        }
+    });
 }

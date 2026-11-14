@@ -34,6 +34,11 @@ pub enum Fact {
         item: NewsItem,
         changes: Vec<Change>,
     },
+    Rewritten {
+        seq: u64,
+        headline: String,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +146,16 @@ impl Newsroom {
                 self.day = *day;
                 self.economy = *economy;
             }
+            Fact::Rewritten {
+                seq,
+                headline,
+                body,
+            } => {
+                if let Some(item) = self.news.iter_mut().find(|n| n.seq == *seq) {
+                    item.headline = headline.clone();
+                    item.body = body.clone();
+                }
+            }
             Fact::Published { item, changes } => {
                 for change in changes {
                     match change {
@@ -222,6 +237,10 @@ impl Newsroom {
 
     pub fn oldest_retained(&self) -> u64 {
         self.news.front().map_or(self.next_seq, |n| n.seq)
+    }
+
+    pub fn item(&self, seq: u64) -> Option<&NewsItem> {
+        self.news.iter().rev().find(|n| n.seq == seq)
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -611,12 +630,14 @@ impl Newsroom {
                 let margin_bps = margin.clamp(100, 4_000);
                 let growth_bps = (f.growth_bps + draw.growth_bps).clamp(-3_000, 5_000);
                 let shares = self.spec(*s)?.shares;
+                let eps_e4 = quarterly_eps_e4(f.revenue, margin_bps, shares);
                 Some(Change::Company(
                     *s,
                     Fundamentals {
                         margin_bps,
                         growth_bps,
-                        eps_e4: quarterly_eps_e4(f.revenue, margin_bps, shares),
+                        eps_e4,
+                        consensus_e4: eps_e4 + eps_e4 * growth_bps / 40_000,
                         ..f
                     },
                 ))
@@ -647,9 +668,11 @@ impl Newsroom {
         let spec = self.spec(symbol)?;
         let f = self.fundamentals(symbol)?;
         let margin_bps = (f.margin_bps * (10_000 + move_bps) / 10_000).max(1);
+        let eps_e4 = quarterly_eps_e4(f.revenue, margin_bps, spec.shares);
         let next = Fundamentals {
             margin_bps,
-            eps_e4: quarterly_eps_e4(f.revenue, margin_bps, spec.shares),
+            eps_e4,
+            consensus_e4: eps_e4 + eps_e4 * f.growth_bps / 40_000,
             ..f
         };
         let mut story = self.story(
@@ -865,7 +888,12 @@ company BOLT sector=robotics price=40.00 shares=20000 eps=2.00 margin=15 growth=
             lawsuit.sentiment < 0 && lawsuit.impact_bps < 0,
             "{lawsuit:?}"
         );
-        assert!(room.fundamentals(acme()).unwrap().margin_bps < before.margin_bps);
+        let after = room.fundamentals(acme()).unwrap();
+        assert!(after.margin_bps < before.margin_bps);
+        assert!(
+            after.consensus_e4 < before.consensus_e4,
+            "analysts cut their estimate"
+        );
         let bolt = Symbol::parse("BOLT").unwrap();
         let bolt_growth = room.fundamentals(bolt).unwrap().growth_bps;
         let boom = run(&mut room, |r| {

@@ -35,6 +35,7 @@ fn newsroom(
         quarter_days: 2,
         news_per_minute,
         seed: Some(7),
+        llm: None,
     })
     .unwrap()
     .0
@@ -336,5 +337,155 @@ fn the_newsroom_recovers_from_its_journal_and_subscribers_resume_after_their_las
         "replay starts after the subscriber's last story"
     );
     assert!(Client::connect_member(&second.to_string(), "prime-co", "wrong").is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn fake_llm() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for (n, stream) in listener.incoming().enumerate() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buf).unwrap_or(0);
+                request.extend_from_slice(&buf[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length: usize = text[..split]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+                if read == 0 {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&request).to_string();
+            let body = &text[text.find("\r\n\r\n").unwrap() + 4..];
+            let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+            let content = payload["messages"][0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let between = |from: &str, to: &str| {
+                content
+                    .split_once(from)
+                    .and_then(|(_, rest)| rest.split_once(to))
+                    .map(|(v, _)| v.trim().to_string())
+                    .unwrap_or_default()
+            };
+            let reply = if content.is_empty() {
+                serde_json::json!({"message": {"role": "assistant", "content": ""}, "done": true})
+            } else if n % 3 == 2 {
+                serde_json::json!({"message": {"role": "assistant", "content": "not json at all"}})
+            } else {
+                let copy = serde_json::json!({
+                    "headline": format!("Wire: {}", between("Draft headline:", "\n")),
+                    "body": between("Draft body:", "\nRules:"),
+                });
+                serde_json::json!({"message": {"role": "assistant", "content": copy.to_string()}, "done": true})
+            };
+            let reply = reply.to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    addr
+}
+
+#[test]
+fn an_llm_rewrites_stories_in_order_and_bad_replies_fall_back_to_the_template() {
+    let dir = std::env::temp_dir().join(format!("ome-newsroom-llm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let journal = dir.join("newsroom.journal");
+    let _ = std::fs::remove_file(&journal);
+    let llm = fake_llm();
+    let start = |journal: PathBuf| {
+        start_newsroom(NewsConfig {
+            listen: "127.0.0.1:0".into(),
+            journal: Some(journal),
+            companies: parse_companies(COMPANIES).unwrap(),
+            ops_name: "ops".into(),
+            ops_secret: "ops".into(),
+            exchange: None,
+            simctl: None,
+            quarter_days: 2,
+            news_per_minute: 0.0,
+            seed: Some(3),
+            llm: Some(ome_newsroom::llm::LlmConfig {
+                url: format!("http://{llm}"),
+                model: "fake".into(),
+                timeout: Duration::from_secs(2),
+            }),
+        })
+        .unwrap()
+        .0
+    };
+    let news = start(journal.clone());
+    let mut desk = ops(news);
+    desk.request_member(&MemberMessage::CreateMember {
+        kind: MemberKind::Broker,
+        name: "prime-co".into(),
+        secret: "pw".into(),
+    })
+    .unwrap();
+    let mut subscriber = Client::connect(&news.to_string()).unwrap();
+    subscriber.logon_member("prime-co", "pw", 0).unwrap();
+    let acme = Symbol::parse("ACME").unwrap();
+    for event in ["upgrade", "contract-win", "lawsuit", "earnings"] {
+        desk.request_member(&MemberMessage::InjectNews {
+            symbol: Some(acme),
+            event: event.into(),
+        })
+        .unwrap();
+    }
+    let items = collect(&subscriber, |items| items.len() >= 6);
+    let seqs: Vec<u64> = items.iter().map(|i| i.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6], "published strictly in order");
+    let rewritten = items
+        .iter()
+        .filter(|i| i.headline.starts_with("Wire: "))
+        .count();
+    assert!(
+        (3..=5).contains(&rewritten),
+        "{rewritten} of 6 rewritten: {items:#?}"
+    );
+    let writer = status(&mut desk).writer;
+    assert!(
+        writer.starts_with("llm fake") && writer.contains("fallback"),
+        "{writer}"
+    );
+
+    let again = start(journal.clone());
+    let mut reader = ops(again);
+    reader
+        .send_member(&MemberMessage::QueryNews {
+            limit: 10,
+            symbol: None,
+        })
+        .unwrap();
+    let mut replayed = Vec::new();
+    while let Ok(Some(message)) = reader.recv_timeout(Duration::from_millis(500)) {
+        match message {
+            ServerMessage::News(item) => replayed.push(item.headline),
+            ServerMessage::Ack { .. } => break,
+            _ => {}
+        }
+    }
+    let expected: Vec<String> = items.iter().map(|i| i.headline.clone()).collect();
+    assert_eq!(replayed, expected, "rewrites survive a restart");
     let _ = std::fs::remove_dir_all(&dir);
 }

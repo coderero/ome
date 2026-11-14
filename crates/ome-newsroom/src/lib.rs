@@ -4,6 +4,7 @@ pub mod events;
 pub mod gateway;
 pub mod journal;
 pub mod links;
+pub mod llm;
 pub mod newsroom;
 pub mod writer;
 
@@ -36,17 +37,23 @@ pub struct NewsConfig {
     pub quarter_days: u64,
     pub news_per_minute: f64,
     pub seed: Option<u64>,
+    pub llm: Option<llm::LlmConfig>,
 }
 
 pub enum NewsInbound {
     Client(Inbound),
     Market { phase: MarketPhase, day: u64 },
+    Rewrite(links::Done),
 }
 
 impl From<Inbound> for NewsInbound {
     fn from(inbound: Inbound) -> Self {
         NewsInbound::Client(inbound)
     }
+}
+
+fn rewrite(done: links::Done) -> NewsInbound {
+    NewsInbound::Rewrite(done)
 }
 
 fn market(phase: MarketPhase, day: u64) -> NewsInbound {
@@ -102,6 +109,16 @@ pub fn start(config: NewsConfig) -> Result<(SocketAddr, JoinHandle<Result<(), St
         gateway.file_with(filings);
         links::watch_exchange(addr, name, secret, tx.clone(), market, filed);
     }
+    if let Some(llm_config) = &config.llm {
+        let llm = llm::Llm::new(llm_config)?;
+        let (jobs, queue) = mpsc::channel();
+        gateway.use_rewriter(
+            jobs,
+            llm.model().to_string(),
+            llm_config.timeout.as_millis() as u64 + 500,
+        );
+        links::spawn_writer(llm, queue, tx.clone(), rewrite);
+    }
     gateway.start_up(now_ms());
     gateway.flush().map_err(|e| e.to_string())?;
 
@@ -147,5 +164,6 @@ fn handle(gateway: &mut Gateway, inbound: NewsInbound) {
         NewsInbound::Client(Inbound::Frame(id, bytes)) => gateway.handle(id, &bytes, now_ms()),
         NewsInbound::Client(Inbound::Disconnected(id)) => gateway.disconnect(id),
         NewsInbound::Market { phase, day } => gateway.on_market(phase, day, now_ms()),
+        NewsInbound::Rewrite(done) => gateway.on_rewrite(done, now_ms()),
     }
 }

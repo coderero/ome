@@ -17,6 +17,7 @@ ome-exchange = { path = "crates/ome-exchange" }
 ome-broker = { path = "crates/ome-broker" }
 rand = "0.9"
 sha2 = "0.10"
+serde_json = "1"
 
 [workspace.lints.clippy]
 inconsistent_digit_grouping = "allow"

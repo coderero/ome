@@ -1,4 +1,5 @@
 use crate::journal::Record;
+use crate::links::{Done, Job};
 use crate::newsroom::{Fact, Filing, Newsroom};
 use crate::writer::Writer;
 use ome_core::price::Price;
@@ -11,7 +12,7 @@ use ome_protocol::{Decoder, MarketPhase, MemberKind, MemberMessage, ServerMessag
 use ome_store::Journal;
 use rand::Rng;
 use rand::rngs::StdRng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -46,6 +47,21 @@ pub struct Gateway {
     fair_sink: Option<Sender<Vec<(Symbol, Price)>>>,
     pushed: BTreeMap<Symbol, Price>,
     filings: Option<Sender<Filing>>,
+    rewriter: Option<Sender<Job>>,
+    rewrite_wait_ms: Timestamp,
+    pending: VecDeque<(u64, Timestamp, bool)>,
+    published: u64,
+    stats: WriterStats,
+}
+
+#[derive(Default)]
+struct WriterStats {
+    model: String,
+    written: u64,
+    fallbacks: u64,
+    timeouts: u64,
+    total_ms: u64,
+    last_error: String,
 }
 
 fn encode(message: &ServerMessage) -> Arc<[u8]> {
@@ -78,7 +94,18 @@ impl Gateway {
             fair_sink,
             pushed: BTreeMap::new(),
             filings: None,
+            rewriter: None,
+            rewrite_wait_ms: 0,
+            pending: VecDeque::new(),
+            published: 0,
+            stats: WriterStats::default(),
         }
+        .caught_up()
+    }
+
+    fn caught_up(mut self) -> Self {
+        self.published = self.room.next_seq() - 1;
+        self
     }
 
     pub fn file_with(&mut self, filings: Sender<Filing>) {
@@ -167,29 +194,143 @@ impl Gateway {
             let _ = sink.send(filing);
         }
         if let Fact::Published { item, .. } = &fact {
-            log(&format!(
-                "#{} [{}{}] {} (sentiment {:+}, fair {:+} bps)",
-                item.seq,
-                item.kind.label(),
-                item.symbol.map(|s| format!(" {s}")).unwrap_or_default(),
-                item.headline,
-                item.sentiment,
-                item.impact_bps
-            ));
-            let message = encode(&ServerMessage::News(item.clone()));
-            let dead: Vec<SessionId> = self
-                .sessions
-                .iter()
-                .filter(|(_, s)| s.login.is_some())
-                .filter(|(_, s)| !s.outbox.send(message.clone()))
-                .map(|(id, _)| *id)
-                .collect();
-            for id in dead {
-                self.sessions.remove(&id);
+            match &self.rewriter {
+                Some(rewriter) => {
+                    let company = item
+                        .symbol
+                        .and_then(|s| self.room.spec(s))
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    let job = Job {
+                        item: item.clone(),
+                        company,
+                    };
+                    self.pending
+                        .push_back((item.seq, now + self.rewrite_wait_ms, false));
+                    if rewriter.send(job).is_err() {
+                        self.rewriter = None;
+                    }
+                    self.release(now);
+                }
+                None => self.publish(item.seq),
             }
-            self.push_fairs();
         }
         Ok(())
+    }
+
+    fn publish(&mut self, seq: u64) {
+        let Some(item) = self.room.item(seq).cloned() else {
+            return;
+        };
+        self.published = self.published.max(seq);
+        log(&format!(
+            "#{} [{}{}] {} (sentiment {:+}, fair {:+} bps)",
+            item.seq,
+            item.kind.label(),
+            item.symbol.map(|s| format!(" {s}")).unwrap_or_default(),
+            item.headline,
+            item.sentiment,
+            item.impact_bps
+        ));
+        let message = encode(&ServerMessage::News(item));
+        let dead: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.login.is_some())
+            .filter(|(_, s)| !s.outbox.send(message.clone()))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead {
+            self.sessions.remove(&id);
+        }
+        self.push_fairs();
+    }
+
+    fn release(&mut self, now: Timestamp) {
+        while let Some((seq, deadline, ready)) = self.pending.front().copied() {
+            if !ready && now < deadline {
+                return;
+            }
+            if !ready {
+                self.stats.timeouts += 1;
+            }
+            self.pending.pop_front();
+            self.publish(seq);
+        }
+    }
+
+    pub fn on_rewrite(&mut self, done: Done, now: Timestamp) {
+        let now = self.advance(now);
+        let Some(slot) = self.pending.iter_mut().find(|(seq, _, _)| *seq == done.seq) else {
+            return;
+        };
+        slot.2 = true;
+        match done.result {
+            Ok(copy) => {
+                self.stats.written += 1;
+                self.stats.total_ms += done.elapsed_ms;
+                let fact = Fact::Rewritten {
+                    seq: done.seq,
+                    headline: copy.headline,
+                    body: copy.body,
+                };
+                let journaled = match &mut self.journal {
+                    Some(journal) => journal
+                        .append(&Record {
+                            timestamp: now,
+                            fact: fact.clone(),
+                        })
+                        .is_ok(),
+                    None => true,
+                };
+                if journaled {
+                    self.room.apply(&fact);
+                } else {
+                    log("journal append failed; keeping the template text");
+                }
+            }
+            Err(reason) => {
+                self.stats.fallbacks += 1;
+                if self.stats.last_error != reason {
+                    log(&format!(
+                        "story #{} keeps its template text: {reason}",
+                        done.seq
+                    ));
+                }
+                self.stats.last_error = reason;
+            }
+        }
+        self.release(now);
+    }
+
+    pub fn use_rewriter(&mut self, rewriter: Sender<Job>, model: String, wait_ms: u64) {
+        self.rewriter = Some(rewriter);
+        self.stats.model = model;
+        self.rewrite_wait_ms = wait_ms;
+    }
+
+    fn writer_status(&self) -> String {
+        if self.stats.model.is_empty() {
+            return self.writer.name();
+        }
+        let average = self
+            .stats
+            .total_ms
+            .checked_div(self.stats.written)
+            .unwrap_or(0);
+        format!(
+            "llm {} ({} written, avg {} ms, {} fallback(s), {} timeout(s){})",
+            self.stats.model,
+            self.stats.written,
+            average,
+            self.stats.fallbacks,
+            self.stats.timeouts,
+            if self.stats.last_error.is_empty() {
+                String::new()
+            } else {
+                format!(", last problem: {}", self.stats.last_error)
+            }
+        )
     }
 
     fn commit(&mut self, fact: Option<Fact>, now: Timestamp) {
@@ -257,6 +398,7 @@ impl Gateway {
 
     pub fn tick(&mut self, now: Timestamp) {
         let now = self.advance(now);
+        self.release(now);
         let elapsed = now.saturating_sub(self.last_tick.unwrap_or(now));
         self.last_tick = Some(now);
         if self.phase != MarketPhase::Open || self.news_per_minute <= 0.0 {
@@ -300,11 +442,21 @@ impl Gateway {
                 self.reject(id, ref_template, "already logged on")
             }
             (Some(_), MemberMessage::QueryNewsroom) => {
-                let status = self.room.status(self.subscribers(), self.writer.name());
+                let mut status = self.room.status(self.subscribers(), self.writer_status());
+                status.published = self.published;
                 self.reply(id, &ServerMessage::NewsroomStatus(status));
             }
             (Some(_), MemberMessage::QueryNews { limit, symbol }) => {
-                let items = self.room.recent(limit.clamp(1, 500) as usize, symbol);
+                let published = self.published;
+                let limit = limit.clamp(1, 500) as usize;
+                let mut items: Vec<_> = self
+                    .room
+                    .recent(limit + self.pending.len(), symbol)
+                    .into_iter()
+                    .filter(|i| i.seq <= published)
+                    .collect();
+                let skip = items.len().saturating_sub(limit);
+                items.drain(..skip);
                 let count = items.len();
                 for item in items {
                     self.reply(id, &ServerMessage::News(item));
@@ -396,11 +548,17 @@ impl Gateway {
                     "{name} asked for news after #{last_seq}; older items are no longer retained"
                 ));
             }
-            for item in self.room.since(last_seq) {
+            let published = self.published;
+            for item in self
+                .room
+                .since(last_seq)
+                .into_iter()
+                .filter(|i| i.seq <= published)
+            {
                 self.reply(id, &ServerMessage::News(item));
             }
         }
-        let next_seq = self.room.next_seq();
+        let next_seq = self.published + 1;
         self.reply(id, &ServerMessage::ReplayComplete { next_seq });
     }
 }

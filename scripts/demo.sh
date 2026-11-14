@@ -29,10 +29,14 @@ start_bg simctl "$BIN/ome-simctl" --listen "$OME_SIMCTL" --journal "$OME_DATA/si
   --exchange-secret "$OME_EXCHANGE_SECRET" --newsroom "$OME_NEWS" --news-secret "$OME_NEWS_SECRET"
 wait_for sim_cmd status
 
+writer=()
+if [[ "$OME_WRITER" == "llm" ]] || { [[ "$OME_WRITER" == "auto" ]] && curl -sf "$OME_LLM/api/tags" >/dev/null 2>&1; }; then
+  writer=(--llm "$OME_LLM" --llm-model "$OME_LLM_MODEL")
+fi
 start_bg newsroom "$BIN/ome-newsroom" --listen "$OME_NEWS" --journal "$OME_DATA/newsroom.journal" \
   --companies config/companies.conf --ops-secret "$OME_NEWS_SECRET" --exchange "$OME_EXCHANGE" \
   --exchange-secret "$OME_EXCHANGE_SECRET" --simctl "$OME_SIMCTL" --sim-secret "$OME_SIM_SECRET" \
-  --quarter-days "$OME_QUARTER_DAYS" --news-per-minute "$OME_NEWS_RATE"
+  --quarter-days "$OME_QUARTER_DAYS" --news-per-minute "$OME_NEWS_RATE" "${writer[@]}"
 wait_for news_cmd status
 (( fresh )) && scripts/seed.sh news
 

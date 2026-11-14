@@ -30,6 +30,22 @@ services:
       timeout: 3s
       retries: 30
 
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    environment:
+      OLLAMA_KEEP_ALIVE: "30m"
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ome-ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
 volumes:
   ome-postgres:
   ome-redis:
+  ome-ollama:

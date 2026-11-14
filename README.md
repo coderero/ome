@@ -12,6 +12,7 @@ scripts/stop.sh
 
 scripts/db.sh up              # PostgreSQL + Redis in Docker
 OME_RECORD=1 scripts/demo.sh --fresh   # also record the market into them
+scripts/llm.sh up             # Ollama with qwen2.5:1.5b (GPU when the NVIDIA runtime is installed); the newsroom then writes with it
 ```
 
 ```bash
@@ -79,8 +80,9 @@ crates/
 ├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
 └── ome-agents     trading firms from config/roster.conf: HFT, DMM, quant, pension, prop, retail personas
-scripts/  env.sh · demo.sh · seed.sh · agents.sh · stop.sh · db.sh
-docker-compose.yml   PostgreSQL 16 + Redis 7 for the recorder
+scripts/  env.sh · demo.sh · seed.sh · agents.sh · stop.sh · db.sh · llm.sh
+docker-compose.yml   PostgreSQL 16 + Redis 7 for the recorder, Ollama (profile llm) for the newsroom
+docker-compose.gpu.yml   GPU reservation for Ollama
 ```
 
 Each service is a library with a thin binary. That lets the end-to-end tests start a real exchange and real brokers in-process on random ports.
@@ -382,7 +384,13 @@ Fair values start at the listing prices (the seed script sets them). In a test r
 | company news | during the session (`--news-per-minute`) | contract wins, launches, lawsuits, recalls, executive departures, buybacks, guidance changes, analyst ratings, takeover rumours |
 | sector news | during the session | regulation, demand booms, supply shocks, subsidies for every company in the sector |
 
-Each story carries a structured sentiment (-100 to 100), its effect on fair value in bps and its numbers (`eps=0.63 consensus=0.65 ...`) next to the headline and body. Analyst ratings and rumours carry sentiment but do not change fundamentals. Fair value is the listing price scaled by forward earnings and a re-rating from rates, growth and risk appetite; the newsroom keeps ome-simctl's fair values in step, so value investors trade around them. Text currently comes from templates (an LLM writer is phase 3c).
+Each story carries a structured sentiment (-100 to 100), its effect on fair value in bps and its numbers (`eps=0.63 consensus=0.65 ...`) next to the headline and body. Analyst ratings and rumours carry sentiment but do not change fundamentals. Fair value is the listing price scaled by forward earnings and a re-rating from rates, growth and risk appetite; the newsroom keeps ome-simctl's fair values in step, so value investors trade around them. ### LLM writer
+
+The engine decides every fact (what happened, the numbers, the tone, the effect on fair value); a local LLM only writes the words. `scripts/llm.sh up` starts Ollama in Docker (`docker-compose.yml` profile `llm`, plus `docker-compose.gpu.yml` when Docker has the NVIDIA runtime) and pulls `qwen2.5:1.5b`; `scripts/demo.sh` passes `--llm` to the newsroom when Ollama answers (`OME_WRITER=auto|llm|templates`).
+
+Each story is journaled at once with template text and handed to a writer thread, which asks the model for a JSON headline and body. The prompt gives the draft, the numbers that appear in it and the tone; the reply is rejected if it drops or changes a number, contradicts the tone ("exceeding expectations" in a miss), or is too short or long. Accepted copy is journaled as a `Rewritten` fact. Stories leave the newsroom strictly in order: a story waits for its rewrite at most `--llm-timeout-ms` (8 s) plus half a second, then goes out with the template text. If Ollama is down, the writer backs off for 10 seconds at a time and every story uses its template, so the feed never stalls. `ome news status` shows the writer: model, stories written, average latency, fallbacks, timeouts and the last problem.
+
+On the RTX 5070 Ti the model runs fully on the GPU at about 0.2-0.3 s per story. In a test run it wrote all of the first 23 stories with no fallbacks, for example "Zen Biotech Falls Short as Quarterly Profit Disappoints: Quarter 1 results: Zen Biotech earned 0.61 a share, down 5.89% from expectations of 0.65, on revenue of $58,632." With Ollama stopped, two stories went out with their template text without delay, and the writer was back within ten seconds of restarting it.
 
 How the market uses the news:
 - **Agents read it through their broker.** Every agent subscribes to its broker's news feed; a story about a symbol, its sector (learned from company stories) or the economy adds to that symbol's mood, weighted by relevance and fading with a 45-second half-life. The mood drives retail panic selling, value-investor caution, noise-trader tilt and the ML personas' sentiment feature, together with simctl scenarios.
@@ -443,7 +451,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 235 tests
+cargo test --workspace     # 238 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -454,7 +462,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 - **1g** ~~off-exchange execution: internalization, tape reporting, wholesaler with PFOF, dark pool, market stats, designated market makers~~ done
 - **1h** ~~PostgreSQL (accounts, trades, settlements) and Redis (market data)~~ done
 - **2** ~~tiered agents (HFT, DMM, quant, pension, prop, rule-based and ML retail), simulation control plane with scenarios and record/replay~~ done
-- **3** newsroom: ~~fundamentals, economy, earnings and news feed (3a), news-driven agents, prospectus-gated listings, recorded news (3b)~~ done; local-LLM writer (3c)
+- **3** ~~newsroom: fundamentals, economy, earnings and news feed, news-driven agents, prospectus-gated listings, recorded news, local-LLM writer~~ done
 - **4** GPUI desktop apps, one per party (the terminal UI was retired)
 
 ## License
