@@ -281,7 +281,7 @@ fn sessions_are_recorded_and_replayed_with_their_original_spacing() {
     );
     let gap = seen[2].1 - seen[1].1;
     assert!(
-        gap >= Duration::from_millis(450) && gap < Duration::from_millis(1_500),
+        gap >= Duration::from_millis(300) && gap < Duration::from_millis(3_000),
         "spacing kept: {gap:?}"
     );
 

@@ -79,6 +79,9 @@ crates/
 ├── ome-newsroom   news vendor: company fundamentals, economy, earnings and news feed (lib + `ome-newsroom`)
 ├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
+├── ui/ome-ui-kit  GPUI components: theme, candle chart, depth ladder, tables, tabs, command menu
+├── ui/ome-ui-data data layer for the apps: broker link thread and the market/account/news store
+├── ui/apps/ome-retail   desktop trading app for retail broker clients
 └── ome-agents     trading firms from config/roster.conf: HFT, DMM, quant, pension, prop, retail personas
 scripts/  env.sh · demo.sh · seed.sh · agents.sh · stop.sh · db.sh · llm.sh
 docker-compose.yml   PostgreSQL 16 + Redis 7 for the recorder, Ollama (profile llm) for the newsroom
@@ -413,6 +416,30 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw news 5
 
 In a test run the newsroom published a hot CPI print (-56 bps on fair values), a rate hold, a Zen Biotech takeover rumour and a Zen earnings miss (0.63 vs 0.65, -63 bps); after a kill -9 it came back at the same day and story count, and an injected lawsuit (-199 bps on ACME) reached the brokers' clients with no duplicates.
 
+## Desktop Apps (GPUI)
+
+The desktop apps are built with GPUI (the community fork `gpui-ce`, since Zed's crates.io release no longer builds with current `libc`). There is one app per party, sharing `ome-ui-kit` (visual components, no networking) and `ome-ui-data` (connections and state, no drawing). Linux builds need `fontconfig-devel` and `libxkbcommon-x11-devel`.
+
+```bash
+scripts/demo.sh --fresh
+cargo run --release -p ome-retail -- --broker 127.0.0.1:7101 --user alice --secret alice-pw
+```
+
+**ome-retail** is the retail client's trading screen: a watchlist with change from the reference price, a candle chart with volume and the session's open/high/low/VWAP, a depth ladder with your own resting orders and recent prints (click a bid to buy or an ask to sell at that price), an order ticket for the retail order types (market, day limit, stop, bracket) with quantity and price steppers, time and sales with the venue of each print, and an account area with positions, open orders and armed conditionals (each cancellable), contract notes with charges, and the news feed. Everything is buttons and keys, nothing is typed:
+
+| Keys | Action |
+|---|---|
+| `b` / `s` | buy / sell with the ticket |
+| `↑` `↓` (`k` `j`) | previous / next symbol |
+| `-` / `=` | smaller / larger quantity |
+| `[` / `]` | price down / up a cent (`f` follows the book again) |
+| `m` `l` `p` `r` | market, limit, stop, bracket |
+| `x` | cancel every order and conditional in the symbol |
+| `1`-`4` | positions, orders, contract notes, news |
+| `ctrl-k` | command menu (`↑↓`, `enter`, `esc`) |
+
+The palette is our own dark order-flow theme; the layout follows the reference terminal studied for this phase (watchlist, chart, ladder with click-to-trade, ticket, tape, account tabs, command menu).
+
 ## Storage: PostgreSQL and Redis
 
 The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house, the venues and the newsroom as ops and to every provider as broker admin. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
@@ -451,7 +478,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 238 tests
+cargo test --workspace     # 245 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -463,7 +490,7 @@ Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap de
 - **1h** ~~PostgreSQL (accounts, trades, settlements) and Redis (market data)~~ done
 - **2** ~~tiered agents (HFT, DMM, quant, pension, prop, rule-based and ML retail), simulation control plane with scenarios and record/replay~~ done
 - **3** ~~newsroom: fundamentals, economy, earnings and news feed, news-driven agents, prospectus-gated listings, recorded news, local-LLM writer~~ done
-- **4** GPUI desktop apps, one per party (the terminal UI was retired)
+- **4** GPUI desktop apps, one per party: ~~UI kit, data layer, retail app (4a)~~ done; institutional terminal, HFT monitor, LP desk (4b); broker desk, ops console, clearing desk (4c); simulation control, issuer portal (4d)
 
 ## License
 
