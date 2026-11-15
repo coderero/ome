@@ -99,20 +99,38 @@ mod tests {
         store.apply(trade(2, 25_20, 2_200));
         assert_eq!(store.tape(acme())[0].trade_id, 2, "newest first");
         assert_eq!(store.last(acme()), Some(25_20));
-        let candles = store.candles(acme());
+        let candles = store.candles(acme(), 1_000);
         assert_eq!(candles.len(), 2);
         assert_eq!((candles[0].high, candles[1].close), (25_10, 25_20));
         store.roll(5_000);
         assert_eq!(
-            store.candles(acme()).len(),
+            store.candles(acme(), 1_000).len(),
             5,
             "flat candles fill quiet time"
         );
+        assert_eq!(
+            store.candles(acme(), 5_000).len(),
+            2,
+            "coarser intervals aggregate the finest"
+        );
+        store.apply(ServerMessage::Candles(CandleSnapshot {
+            symbol: acme(),
+            interval: 60_000,
+            candles: vec![Candle::new(0, 24_00, 9)],
+        }));
+        store.apply(trade(3, 25_30, 5_500));
+        assert_eq!(
+            store.candles(acme(), 60_000)[0].high,
+            25_30,
+            "live trades extend history too"
+        );
+        assert_eq!(store.intervals(acme()), vec![1_000, 60_000]);
 
         store.apply(report(9, OrderStatus::New));
         assert_eq!(store.open_orders().len(), 1);
         store.apply(report(9, OrderStatus::Cancelled));
         assert!(store.open_orders().is_empty());
+        assert_eq!(store.closed_orders()[0].status, OrderStatus::Cancelled);
         store.apply(report(10, OrderStatus::Rejected));
         assert!(store.notices()[0].error && store.notices()[0].text.contains("insufficient"));
 

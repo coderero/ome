@@ -95,6 +95,12 @@ impl FeeEngine {
         }
     }
 
+    pub fn estimate(&self, role: Role, side: Side, price: Price, qty: Qty) -> Charges {
+        let exchange_fee = ((qty as u128 * self.exchange_fee_ceiling_per_share as u128)
+            .div_ceil(PER_SHARE_SCALE)) as i64;
+        self.charges(role, side, price, qty, exchange_fee, 0)
+    }
+
     pub fn reserve(&self, role: Role, side: Side, price: Price, qty: Qty) -> u64 {
         if side == Side::Sell {
             return 0;

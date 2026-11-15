@@ -246,6 +246,31 @@ impl Broker {
         &self.risk
     }
 
+    pub fn estimate(
+        &self,
+        account: AccountId,
+        symbol: Symbol,
+        side: Side,
+        price: Price,
+        qty: Qty,
+    ) -> Option<ome_protocol::ChargesEstimate> {
+        let role = self.ledger.get(account)?.role;
+        let charges = self.fees.estimate(role, side, price, qty);
+        let notional = price.saturating_mul(qty) as i64;
+        let cash_effect = match side {
+            Side::Buy => -(notional + charges.total()),
+            Side::Sell => notional - charges.total(),
+        };
+        Some(ome_protocol::ChargesEstimate {
+            symbol,
+            side,
+            qty,
+            price,
+            cash_effect,
+            charges,
+        })
+    }
+
     pub fn day_pnl(&self, account: AccountId) -> i64 {
         self.risk
             .day_pnl(account, |symbol| self.marks.get(&symbol).copied())
@@ -2119,10 +2144,15 @@ impl Broker {
             positions: account
                 .positions
                 .iter()
-                .map(|(symbol, balance)| Position {
-                    symbol: *symbol,
-                    balance: *balance,
-                    unsettled: unsettled_shares.get(symbol).copied().unwrap_or(0),
+                .map(|(symbol, balance)| {
+                    let (avg_cost, day_cost) = self.risk.costs(id, *symbol);
+                    Position {
+                        symbol: *symbol,
+                        balance: *balance,
+                        unsettled: unsettled_shares.get(symbol).copied().unwrap_or(0),
+                        avg_cost,
+                        day_cost,
+                    }
                 })
                 .filter(|p| p.balance.total() > 0 || p.unsettled != 0)
                 .collect(),

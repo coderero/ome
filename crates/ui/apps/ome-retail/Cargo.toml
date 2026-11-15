@@ -10,6 +10,7 @@ ome-protocol.workspace = true
 ome-ui-kit.workspace = true
 ome-ui-data.workspace = true
 gpui.workspace = true
+gpui_elements.workspace = true
 gpui_platform.workspace = true
 
 [lints]

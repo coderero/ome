@@ -29,6 +29,7 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str) -> SocketAdd
         wholesaler_addr: None,
         ats_addr: None,
         news_addr: None,
+        postgres: None,
     })
     .unwrap()
     .0

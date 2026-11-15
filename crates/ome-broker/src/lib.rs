@@ -2,6 +2,7 @@ pub mod algo;
 pub mod broker;
 pub mod fees;
 pub mod gateway;
+pub mod history;
 pub mod journal;
 pub mod ledger;
 pub mod market;
@@ -40,6 +41,7 @@ pub struct BrokerConfig {
     pub wholesaler_addr: Option<String>,
     pub ats_addr: Option<String>,
     pub news_addr: Option<String>,
+    pub postgres: Option<String>,
 }
 
 pub enum BrokerInbound {
@@ -49,6 +51,7 @@ pub enum BrokerInbound {
     Wholesaler { generation: u64, event: LinkEvent },
     Ats { generation: u64, event: LinkEvent },
     News { generation: u64, event: LinkEvent },
+    History(history::HistoryResult),
 }
 
 impl From<Inbound> for BrokerInbound {
@@ -71,6 +74,10 @@ fn wholesaler_event(generation: u64, event: LinkEvent) -> BrokerInbound {
 
 fn ats_event(generation: u64, event: LinkEvent) -> BrokerInbound {
     BrokerInbound::Ats { generation, event }
+}
+
+fn history_result(result: history::HistoryResult) -> BrokerInbound {
+    BrokerInbound::History(result)
 }
 
 fn news_event(generation: u64, event: LinkEvent) -> BrokerInbound {
@@ -149,8 +156,13 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
             credentials(),
         )
     });
-    let mut gateway =
-        Gateway::new(broker, journal, exchange, clearing, venues, last_ts).with_news(news);
+    let history = config
+        .postgres
+        .clone()
+        .map(|url| history::spawn(url, tx.clone(), history_result));
+    let mut gateway = Gateway::new(broker, journal, exchange, clearing, venues, last_ts)
+        .with_news(news)
+        .with_history(history);
     gateway.ensure_admin(&config.admin_name, &config.admin_secret, now_ms())?;
     gateway.flush().map_err(|e| e.to_string())?;
 
@@ -211,5 +223,6 @@ fn handle(gateway: &mut Gateway, inbound: BrokerInbound) {
             gateway.on_venue(ome_protocol::Venue::Ats, generation, event, now_ms())
         }
         BrokerInbound::News { generation, event } => gateway.on_news(generation, event, now_ms()),
+        BrokerInbound::History(result) => gateway.on_history(result),
     }
 }

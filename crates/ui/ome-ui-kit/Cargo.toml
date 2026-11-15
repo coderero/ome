@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 ome-core.workspace = true
 gpui.workspace = true
+gpui_elements.workspace = true
 
 [lints]
 workspace = true

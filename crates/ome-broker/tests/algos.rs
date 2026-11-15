@@ -43,6 +43,7 @@ fn twap_parent_fills_through_child_orders_on_the_real_exchange() {
         wholesaler_addr: None,
         ats_addr: None,
         news_addr: None,
+        postgres: None,
     })
     .unwrap()
     .0;

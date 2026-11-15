@@ -44,6 +44,7 @@ pub struct Gateway {
     news: Option<Upstream>,
     news_seq: u64,
     news_cache: VecDeque<ome_protocol::NewsItem>,
+    history: Option<std::sync::mpsc::Sender<crate::history::HistoryJob>>,
 }
 
 impl Gateway {
@@ -71,7 +72,27 @@ impl Gateway {
             news: None,
             news_seq: 0,
             news_cache: VecDeque::new(),
+            history: None,
         }
+    }
+
+    pub fn with_history(
+        mut self,
+        history: Option<std::sync::mpsc::Sender<crate::history::HistoryJob>>,
+    ) -> Self {
+        self.history = history;
+        self
+    }
+
+    pub fn on_history(&mut self, result: crate::history::HistoryResult) {
+        let snapshot = result.snapshot.or_else(|| {
+            self.market
+                .history(result.symbol, result.interval, result.limit as usize)
+        });
+        if let Some(snapshot) = snapshot {
+            self.reply(result.session, ServerMessage::Candles(snapshot));
+        }
+        self.drop_slow_sessions();
     }
 
     pub fn with_news(mut self, news: Option<Upstream>) -> Self {
@@ -657,6 +678,44 @@ impl Gateway {
             }
             ClientMessage::QueryInstruments => {
                 self.reply(id, ServerMessage::InstrumentList(self.market.instruments()))
+            }
+            ClientMessage::QueryHistory {
+                symbol,
+                interval_ms,
+                limit,
+            } => {
+                let limit = limit.clamp(1, 2_000);
+                let job = crate::history::HistoryJob {
+                    session: id,
+                    symbol,
+                    interval: interval_ms.max(1_000),
+                    limit,
+                };
+                match &self.history {
+                    Some(history) if history.send(job).is_ok() => {}
+                    _ => match self.market.history(symbol, interval_ms, limit as usize) {
+                        Some(snapshot) => self.reply(id, ServerMessage::Candles(snapshot)),
+                        None => self.reject(id, ref_template, &format!("unknown symbol {symbol}")),
+                    },
+                }
+            }
+            ClientMessage::EstimateCharges {
+                symbol,
+                side,
+                qty,
+                price,
+            } => {
+                let price = if price == 0 {
+                    self.market.last(symbol).unwrap_or(0)
+                } else {
+                    price
+                };
+                match self.broker.estimate(account, symbol, side, price, qty) {
+                    Some(estimate) if price > 0 && qty > 0 => {
+                        self.reply(id, ServerMessage::ChargesEstimate(estimate))
+                    }
+                    _ => self.reject(id, ref_template, "cannot estimate this order"),
+                }
             }
             ClientMessage::QueryAccount if !admin => {
                 if let Some(snapshot) = self.broker.account_snapshot(account) {

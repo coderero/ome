@@ -138,6 +138,7 @@ fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_v
         wholesaler_addr: None,
         ats_addr: None,
         news_addr: Some(news.to_string()),
+        postgres: None,
     })
     .unwrap()
     .0;

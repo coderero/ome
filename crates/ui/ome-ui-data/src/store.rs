@@ -13,6 +13,7 @@ const NOTES: usize = 100;
 const NEWS: usize = 200;
 const CANDLES: usize = 600;
 const NOTICES: usize = 20;
+const CLOSED: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Connection {
@@ -41,9 +42,11 @@ pub struct MarketStore {
     pub books: BTreeMap<Symbol, BookSnapshot>,
     pub stats: BTreeMap<Symbol, MarketStats>,
     tapes: BTreeMap<Symbol, VecDeque<TradeEvent>>,
-    candles: BTreeMap<Symbol, CandleSeries>,
+    candles: BTreeMap<(Symbol, Timestamp), CandleSeries>,
+    pub estimate: Option<ome_protocol::ChargesEstimate>,
     pub account: Option<AccountSnapshot>,
     pub orders: BTreeMap<OrderId, ExecutionReport>,
+    closed: VecDeque<ExecutionReport>,
     pub conditionals: BTreeMap<u64, ConditionalReport>,
     notes: VecDeque<ContractNote>,
     news: VecDeque<NewsItem>,
@@ -56,7 +59,8 @@ pub trait MarketData {
     fn instrument(&self, symbol: Symbol) -> Option<&InstrumentInfo>;
     fn book(&self, symbol: Symbol) -> Option<&BookSnapshot>;
     fn tape(&self, symbol: Symbol) -> Vec<&TradeEvent>;
-    fn candles(&self, symbol: Symbol) -> Vec<Candle>;
+    fn candles(&self, symbol: Symbol, interval: Timestamp) -> Vec<Candle>;
+    fn intervals(&self, symbol: Symbol) -> Vec<Timestamp>;
     fn stats(&self, symbol: Symbol) -> Option<&MarketStats>;
     fn phase(&self) -> Option<MarketPhase>;
     fn last(&self, symbol: Symbol) -> Option<u64>;
@@ -67,6 +71,7 @@ pub trait AccountView {
     fn open_orders(&self) -> Vec<&ExecutionReport>;
     fn armed(&self) -> Vec<&ConditionalReport>;
     fn contract_notes(&self) -> Vec<&ContractNote>;
+    fn closed_orders(&self) -> Vec<&ExecutionReport>;
     fn notices(&self) -> Vec<&Notice>;
 }
 
@@ -118,12 +123,8 @@ impl MarketStore {
             }
             ServerMessage::Candles(snapshot) => {
                 self.candles.insert(
-                    snapshot.symbol,
-                    CandleSeries::from_candles(
-                        snapshot.interval.max(1),
-                        CANDLES,
-                        snapshot.candles,
-                    ),
+                    (snapshot.symbol, snapshot.interval.max(1)),
+                    CandleSeries::from_candles(snapshot.interval.max(1), CANDLES, snapshot.candles),
                 );
             }
             ServerMessage::Trade(trade) => {
@@ -134,8 +135,10 @@ impl MarketStore {
                 if trade.trade_id == 0 {
                     return;
                 }
-                if let Some(series) = self.candles.get_mut(&trade.symbol) {
-                    series.record(trade.price, trade.qty, trade.timestamp);
+                for ((symbol, _), series) in self.candles.iter_mut() {
+                    if *symbol == trade.symbol {
+                        series.record(trade.price, trade.qty, trade.timestamp);
+                    }
                 }
                 let tape = self.tapes.entry(trade.symbol).or_default();
                 if tape.len() == TAPE {
@@ -156,6 +159,10 @@ impl MarketStore {
                     self.orders.insert(report.order_id, report);
                 } else {
                     self.orders.remove(&report.order_id);
+                    if self.closed.len() == CLOSED {
+                        self.closed.pop_back();
+                    }
+                    self.closed.push_front(report);
                 }
             }
             ServerMessage::ConditionalUpdate(report) => match report.status {
@@ -186,6 +193,7 @@ impl MarketStore {
                 }
                 self.news.push_front(item);
             }
+            ServerMessage::ChargesEstimate(estimate) => self.estimate = Some(estimate),
             ServerMessage::Reject { reason, .. } => self.notice(reason, true),
             ServerMessage::Ack { text, .. } => self.notice(text, false),
             _ => {}
@@ -227,11 +235,30 @@ impl MarketData for MarketStore {
             .unwrap_or_default()
     }
 
-    fn candles(&self, symbol: Symbol) -> Vec<Candle> {
+    fn candles(&self, symbol: Symbol, interval: Timestamp) -> Vec<Candle> {
+        if let Some(series) = self.candles.get(&(symbol, interval)) {
+            return series.candles().iter().copied().collect();
+        }
+        let finest = self
+            .candles
+            .iter()
+            .filter(|((s, i), _)| *s == symbol && *i <= interval)
+            .min_by_key(|((_, i), _)| *i);
+        match finest {
+            Some((_, series)) => {
+                let candles: Vec<Candle> = series.candles().iter().copied().collect();
+                ome_core::candles::aggregate(&candles, interval)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn intervals(&self, symbol: Symbol) -> Vec<Timestamp> {
         self.candles
-            .get(&symbol)
-            .map(|s| s.candles().iter().copied().collect())
-            .unwrap_or_default()
+            .keys()
+            .filter(|(s, _)| *s == symbol)
+            .map(|(_, i)| *i)
+            .collect()
     }
 
     fn stats(&self, symbol: Symbol) -> Option<&MarketStats> {
@@ -263,6 +290,10 @@ impl AccountView for MarketStore {
 
     fn contract_notes(&self) -> Vec<&ContractNote> {
         self.notes.iter().collect()
+    }
+
+    fn closed_orders(&self) -> Vec<&ExecutionReport> {
+        self.closed.iter().collect()
     }
 
     fn notices(&self) -> Vec<&Notice> {

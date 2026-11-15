@@ -2207,6 +2207,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_ce_elements"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c74a09e0d1e27d0d5d22be1c9764d4576b11c7a60fe1e13f2ca88873714423de"
+dependencies = [
+ "derive_setters",
+ "gpui-ce",
+ "palette",
+ "smallvec",
+ "unicode-segmentation",
+ "web-time",
+]
+
+[[package]]
 name = "gpui_ce_ios"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4223,6 +4237,7 @@ dependencies = [
  "ome-net",
  "ome-protocol",
  "ome-store",
+ "postgres",
 ]
 
 [[package]]
@@ -4309,6 +4324,7 @@ name = "ome-retail"
 version = "0.5.0"
 dependencies = [
  "gpui-ce",
+ "gpui_ce_elements",
  "gpui_ce_platform",
  "ome-core",
  "ome-protocol",
@@ -4351,6 +4367,7 @@ name = "ome-ui-kit"
 version = "0.5.0"
 dependencies = [
  "gpui-ce",
+ "gpui_ce_elements",
  "ome-core",
 ]
 

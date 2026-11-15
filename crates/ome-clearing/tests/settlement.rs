@@ -44,6 +44,7 @@ fn broker(
         wholesaler_addr: None,
         ats_addr: None,
         news_addr: None,
+        postgres: None,
     })
     .unwrap()
     .0

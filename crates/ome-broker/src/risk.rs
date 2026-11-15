@@ -20,6 +20,7 @@ pub struct AccountRisk {
     loss_limits: BTreeMap<AccountId, u64>,
     realized: BTreeMap<AccountId, i64>,
     basis: BTreeMap<(AccountId, Symbol), Basis>,
+    lifetime: BTreeMap<(AccountId, Symbol), Basis>,
     day: u64,
 }
 
@@ -83,6 +84,7 @@ impl AccountRisk {
         (price, qty): (Price, Qty),
         charges: i64,
     ) {
+        Self::track(&mut self.lifetime, (account, symbol), side, price, qty);
         let basis = self.basis.entry((account, symbol)).or_default();
         let realized = self.realized.entry(account).or_default();
         *realized -= charges;
@@ -104,6 +106,41 @@ impl AccountRisk {
         if basis.qty == 0 {
             self.basis.remove(&(account, symbol));
         }
+    }
+
+    fn track(
+        book: &mut BTreeMap<(AccountId, Symbol), Basis>,
+        key: (AccountId, Symbol),
+        side: Side,
+        price: Price,
+        qty: Qty,
+    ) {
+        let basis = book.entry(key).or_default();
+        match side {
+            Side::Buy => {
+                basis.qty += qty;
+                basis.cost += price as u128 * qty as u128;
+            }
+            Side::Sell => {
+                let tracked = qty.min(basis.qty);
+                if tracked > 0 {
+                    basis.cost -= basis.cost * tracked as u128 / basis.qty as u128;
+                    basis.qty -= tracked;
+                }
+            }
+        }
+        if basis.qty == 0 {
+            book.remove(&key);
+        }
+    }
+
+    pub fn costs(&self, account: AccountId, symbol: Symbol) -> (Price, Price) {
+        let average = |book: &BTreeMap<(AccountId, Symbol), Basis>| {
+            book.get(&(account, symbol))
+                .filter(|b| b.qty > 0)
+                .map_or(0, |b| (b.cost / b.qty as u128) as Price)
+        };
+        (average(&self.lifetime), average(&self.basis))
     }
 
     pub fn day_pnl(&self, account: AccountId, mark: impl Fn(Symbol) -> Option<Price>) -> i64 {

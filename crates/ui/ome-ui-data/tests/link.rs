@@ -27,6 +27,7 @@ fn pump(
         match updates.recv_timeout(Duration::from_millis(100)) {
             Ok(LinkUpdate::Message(message)) => store.apply(message),
             Ok(LinkUpdate::Down(_)) => store.disconnected(),
+            Ok(LinkUpdate::Rejected(reason)) => panic!("rejected: {reason}"),
             Err(_) => {}
         }
     }
@@ -66,6 +67,7 @@ fn a_ui_link_streams_the_market_and_trades_through_a_real_broker() {
         wholesaler_addr: None,
         ats_addr: None,
         news_addr: None,
+        postgres: None,
     })
     .unwrap()
     .0;
@@ -133,4 +135,49 @@ fn a_ui_link_streams_the_market_and_trades_through_a_real_broker() {
     });
     assert_eq!(store.tape(acme)[0].price, 25_00);
     assert!(!store.contract_notes().is_empty());
+    let held = store
+        .account()
+        .unwrap()
+        .positions
+        .iter()
+        .find(|p| p.symbol == acme)
+        .cloned()
+        .unwrap();
+    assert_eq!((held.avg_cost, held.day_cost), (25_00, 25_00));
+
+    assert!(link.query(ClientMessage::EstimateCharges {
+        symbol: acme,
+        side: Side::Buy,
+        qty: 10,
+        price: 25_00,
+    }));
+    pump(&mut store, &rx, |s| s.estimate.is_some());
+    let estimate = store.estimate.unwrap();
+    assert!(estimate.charges.total() > 0);
+    assert_eq!(estimate.cash_effect, -(25_000 + estimate.charges.total()));
+    assert!(link.query(ClientMessage::QueryHistory {
+        symbol: acme,
+        interval_ms: 60_000,
+        limit: 100,
+    }));
+    pump(&mut store, &rx, |s| s.intervals(acme).contains(&60_000));
+    assert!(!store.candles(acme, 60_000).is_empty());
+
+    let (tx, rejected) = mpsc::channel();
+    let _wrong = BrokerLink::start(
+        Credentials {
+            addr: broker.to_string(),
+            user: "alice".into(),
+            secret: "wrong".into(),
+        },
+        tx,
+    );
+    assert!(matches!(
+        rejected.recv_timeout(Duration::from_secs(5)),
+        Ok(LinkUpdate::Rejected(_))
+    ));
+    assert!(
+        rejected.recv_timeout(Duration::from_secs(3)).is_err(),
+        "no retry after a rejected logon"
+    );
 }

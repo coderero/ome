@@ -121,6 +121,33 @@ impl CandleSeries {
     }
 }
 
+pub fn aggregate(candles: &[Candle], interval: Timestamp) -> Vec<Candle> {
+    let interval = interval.max(1);
+    let mut out: Vec<Candle> = Vec::new();
+    for c in candles {
+        let start = c.start / interval * interval;
+        match out.last_mut() {
+            Some(last) if last.start == start => {
+                if c.trades > 0 {
+                    if last.trades == 0 {
+                        last.open = c.open;
+                        last.high = c.high;
+                        last.low = c.low;
+                    } else {
+                        last.high = last.high.max(c.high);
+                        last.low = last.low.min(c.low);
+                    }
+                    last.close = c.close;
+                }
+                last.volume += c.volume;
+                last.trades += c.trades;
+            }
+            _ => out.push(Candle { start, ..*c }),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +200,29 @@ mod tests {
         let candles = series.candles();
         assert_eq!(candles.len(), 5);
         assert_eq!(candles.back().unwrap().start, 1_000_000);
+    }
+
+    #[test]
+    fn candles_aggregate_into_longer_intervals() {
+        let mut a = Candle::new(1_000, 10_00, 5);
+        a.update(10_20, 1);
+        let quiet = Candle::flat(2_000, 10_20);
+        let mut b = Candle::new(61_000, 9_90, 2);
+        b.update(10_05, 3);
+        let minutes = aggregate(&[quiet, a, b], 60_000);
+        assert_eq!(minutes.len(), 2);
+        assert_eq!(
+            (
+                minutes[0].open,
+                minutes[0].high,
+                minutes[0].close,
+                minutes[0].volume
+            ),
+            (10_00, 10_20, 10_20, 6)
+        );
+        assert_eq!(
+            (minutes[1].start, minutes[1].low, minutes[1].close),
+            (60_000, 9_90, 10_05)
+        );
     }
 }

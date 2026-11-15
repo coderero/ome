@@ -3,7 +3,7 @@ use ome_broker::{BrokerConfig, start};
 use ome_client::DEFAULT_EXCHANGE_ADDR;
 
 const USAGE: &str = "usage: ome-broker --profile retail|prime|dma|lp --member NAME --member-secret SECRET
-                  [--regime us|india] [--wholesaler ADDR] [--ats ADDR] [--news ADDR] [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
+                  [--regime us|india] [--wholesaler ADDR] [--ats ADDR] [--news ADDR] [--postgres URL] [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
 
 fn parse_args() -> Result<BrokerConfig, String> {
     let mut config = BrokerConfig {
@@ -21,6 +21,7 @@ fn parse_args() -> Result<BrokerConfig, String> {
         wholesaler_addr: None,
         ats_addr: None,
         news_addr: None,
+        postgres: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -36,6 +37,7 @@ fn parse_args() -> Result<BrokerConfig, String> {
             "--wholesaler" => config.wholesaler_addr = Some(value()?),
             "--ats" => config.ats_addr = Some(value()?),
             "--news" => config.news_addr = Some(value()?),
+            "--postgres" => config.postgres = Some(value()?),
             "--listen" => config.listen = value()?,
             "--exchange" => config.exchange_addr = value()?,
             "--journal" => config.journal = Some(value()?.into()),

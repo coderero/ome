@@ -64,6 +64,7 @@ fn broker(
         wholesaler_addr: venues.0.map(|a| a.to_string()),
         ats_addr: venues.1.map(|a| a.to_string()),
         news_addr: None,
+        postgres: None,
     })
     .unwrap()
     .0

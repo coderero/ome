@@ -115,6 +115,12 @@ pub trait OrderEntry {
 pub enum LinkUpdate {
     Message(ServerMessage),
     Down(String),
+    Rejected(String),
+}
+
+enum Outgoing {
+    Order(OrderRequest),
+    Query(ClientMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +131,7 @@ pub struct Credentials {
 }
 
 pub struct BrokerLink {
-    commands: Sender<OrderRequest>,
+    commands: Sender<Outgoing>,
 }
 
 const POLL: Duration = Duration::from_millis(40);
@@ -138,6 +144,10 @@ impl BrokerLink {
             loop {
                 let reason = match session(&credentials, &updates, &inbox) {
                     Ok(()) => return,
+                    Err(ClientError::Rejected(reason)) => {
+                        let _ = updates.send(LinkUpdate::Rejected(reason));
+                        return;
+                    }
                     Err(e) => e.to_string(),
                 };
                 if updates.send(LinkUpdate::Down(reason)).is_err() {
@@ -148,18 +158,22 @@ impl BrokerLink {
         });
         Self { commands }
     }
+
+    pub fn query(&self, message: ClientMessage) -> bool {
+        self.commands.send(Outgoing::Query(message)).is_ok()
+    }
 }
 
 impl OrderEntry for BrokerLink {
     fn submit(&self, request: OrderRequest) -> bool {
-        self.commands.send(request).is_ok()
+        self.commands.send(Outgoing::Order(request)).is_ok()
     }
 }
 
 fn session(
     credentials: &Credentials,
     updates: &Sender<LinkUpdate>,
-    inbox: &Receiver<OrderRequest>,
+    inbox: &Receiver<Outgoing>,
 ) -> Result<(), ClientError> {
     let (mut client, session) =
         Client::connect_and_logon(&credentials.addr, &credentials.user, &credentials.secret)?;
@@ -194,10 +208,11 @@ fn session(
         }
         loop {
             match inbox.try_recv() {
-                Ok(request) => {
+                Ok(Outgoing::Order(request)) => {
                     let id = client.next_order_id();
                     client.send(&request.message(id))?;
                 }
+                Ok(Outgoing::Query(message)) => client.send(&message)?,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }

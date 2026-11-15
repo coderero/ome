@@ -46,6 +46,7 @@ pub enum ServerMessage {
     SimEvent(crate::sim::SimCommand),
     SimRecordings(Vec<crate::sim::RecordingInfo>),
     News(crate::news::NewsItem),
+    ChargesEstimate(ChargesEstimate),
     NewsroomStatus(crate::news::NewsroomStatus),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
@@ -84,6 +85,7 @@ impl ServerMessage {
             ServerMessage::SimEvent(_) => SIM_EVENT,
             ServerMessage::SimRecordings(_) => SIM_RECORDINGS,
             ServerMessage::News(_) => NEWS,
+            ServerMessage::ChargesEstimate(_) => CHARGES_ESTIMATE,
             ServerMessage::NewsroomStatus(_) => NEWSROOM_STATUS,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
@@ -166,7 +168,7 @@ impl ServerMessage {
                     e.begin_entry(&mut g);
                     e.symbol(Some(p.symbol));
                     put_balance(&mut e, &p.balance);
-                    e.i64(p.unsettled);
+                    e.i64(p.unsettled).u64(p.avg_cost).u64(p.day_cost);
                     e.end_entry_block(&mut g);
                 }
             }
@@ -269,6 +271,15 @@ impl ServerMessage {
                 crate::sim::put_recordings(&mut e, list);
             }
             ServerMessage::News(item) => crate::news::put_news(&mut e, item),
+            ServerMessage::ChargesEstimate(c) => {
+                e.symbol(Some(c.symbol))
+                    .u8(side_to_u8(c.side))
+                    .u64(c.qty)
+                    .u64(c.price)
+                    .i64(c.cash_effect);
+                put_charges(&mut e, &c.charges);
+                e.end_block();
+            }
             ServerMessage::NewsroomStatus(status) => crate::news::put_status(&mut e, status),
             ServerMessage::SimStatus(s) => {
                 e.u32(s.runners).end_block();
@@ -558,11 +569,15 @@ impl ServerMessage {
                     let symbol = d.symbol()?;
                     let balance = get_balance(&mut d)?;
                     let unsettled = d.i64()?;
+                    let avg_cost = d.u64()?;
+                    let day_cost = d.u64()?;
                     d.end_entry_block(start, &g)?;
                     positions.push(Position {
                         symbol,
                         balance,
                         unsettled,
+                        avg_cost,
+                        day_cost,
                     });
                 }
                 ServerMessage::Account(AccountSnapshot {
@@ -715,6 +730,23 @@ impl ServerMessage {
             }
             SIM_EVENT => ServerMessage::SimEvent(crate::sim::get_command(&mut d)?),
             NEWS => ServerMessage::News(crate::news::get_news(&mut d)?),
+            CHARGES_ESTIMATE => {
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let price = d.u64()?;
+                let cash_effect = d.i64()?;
+                let charges = get_charges(&mut d)?;
+                d.end_block()?;
+                ServerMessage::ChargesEstimate(ChargesEstimate {
+                    symbol,
+                    side,
+                    qty,
+                    price,
+                    cash_effect,
+                    charges,
+                })
+            }
             NEWSROOM_STATUS => ServerMessage::NewsroomStatus(crate::news::get_status(&mut d)?),
             SIM_RECORDINGS => {
                 d.end_block()?;
@@ -1218,6 +1250,8 @@ mod tests {
                         reserved: 2,
                     },
                     unsettled: 5,
+                    avg_cost: 24_80,
+                    day_cost: 25_00,
                 }],
             }),
             ServerMessage::ClearedTrade(ClearedTrade {
@@ -1313,6 +1347,21 @@ mod tests {
                 group: "noise".into(),
                 key: "activity".into(),
                 value: "0.9".into(),
+            }),
+            ServerMessage::ChargesEstimate(ChargesEstimate {
+                symbol: sym("ACME"),
+                side: Side::Buy,
+                qty: 10,
+                price: 25_00,
+                cash_effect: -250_40,
+                charges: Charges {
+                    commission: 20,
+                    exchange_fee: 3,
+                    transaction_tax: 0,
+                    stamp_duty: 4,
+                    regulatory_fee: 1,
+                    gst: 4,
+                },
             }),
             ServerMessage::News(crate::news::NewsItem {
                 seq: 7,

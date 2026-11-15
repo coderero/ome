@@ -149,6 +149,30 @@ impl MarketCache {
             .is_some_and(|q| q.info.status == InstrumentStatus::Trading)
     }
 
+    pub fn last(&self, symbol: Symbol) -> Option<Price> {
+        let quote = self.quotes.get(&symbol)?;
+        quote.info.last_price.or(Some(quote.info.reference_price))
+    }
+
+    pub fn history(
+        &self,
+        symbol: Symbol,
+        interval: Timestamp,
+        limit: usize,
+    ) -> Option<CandleSnapshot> {
+        let quote = self.quotes.get(&symbol)?;
+        let candles: Vec<_> = quote.candles.candles().iter().copied().collect();
+        let interval = interval.max(quote.candles.interval());
+        let mut candles = ome_core::candles::aggregate(&candles, interval);
+        let skip = candles.len().saturating_sub(limit.max(1));
+        candles.drain(..skip);
+        Some(CandleSnapshot {
+            symbol,
+            interval,
+            candles,
+        })
+    }
+
     pub fn snapshot(&self, symbol: Symbol) -> Vec<ServerMessage> {
         let Some(quote) = self.quotes.get(&symbol) else {
             return Vec::new();

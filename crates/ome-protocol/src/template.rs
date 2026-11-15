@@ -13,6 +13,8 @@ pub const ALGO_ORDER: u16 = 19;
 pub const CANCEL_ALGO: u16 = 24;
 pub const DARK_ORDER: u16 = 25;
 pub const SUBSCRIBE_NEWS: u16 = 26;
+pub const ESTIMATE_CHARGES: u16 = 27;
+pub const QUERY_HISTORY: u16 = 28;
 pub const SUBSCRIBE: u16 = 20;
 pub const UNSUBSCRIBE: u16 = 21;
 pub const QUERY_ACCOUNT: u16 = 22;
@@ -80,6 +82,7 @@ pub const SIM_EVENT: u16 = 136;
 pub const SIM_RECORDINGS: u16 = 137;
 pub const NEWS: u16 = 138;
 pub const NEWSROOM_STATUS: u16 = 139;
+pub const CHARGES_ESTIMATE: u16 = 140;
 
 pub const SIM_LOGON: u16 = 600;
 pub const SIM_GROUPS: u16 = 601;

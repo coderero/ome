@@ -95,6 +95,17 @@ pub enum ClientMessage {
     SubscribeNews {
         recent: u32,
     },
+    EstimateCharges {
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        price: Price,
+    },
+    QueryHistory {
+        symbol: Symbol,
+        interval_ms: u64,
+        limit: u32,
+    },
     SetAccountStatus {
         account_id: AccountId,
         suspended: bool,
@@ -144,6 +155,8 @@ impl ClientMessage {
             ClientMessage::QueryAccount => QUERY_ACCOUNT,
             ClientMessage::QueryInstruments => QUERY_INSTRUMENTS,
             ClientMessage::SubscribeNews { .. } => SUBSCRIBE_NEWS,
+            ClientMessage::EstimateCharges { .. } => ESTIMATE_CHARGES,
+            ClientMessage::QueryHistory { .. } => QUERY_HISTORY,
             ClientMessage::CreateAccount { .. } => CREATE_ACCOUNT,
             ClientMessage::SetBalance { .. } => SET_BALANCE,
             ClientMessage::QueryAccounts => QUERY_ACCOUNTS,
@@ -169,6 +182,28 @@ impl ClientMessage {
             }
             ClientMessage::SubscribeNews { recent } => {
                 e.u32(*recent).end_block();
+            }
+            ClientMessage::EstimateCharges {
+                symbol,
+                side,
+                qty,
+                price,
+            } => {
+                e.symbol(Some(*symbol))
+                    .u8(side_to_u8(*side))
+                    .u64(*qty)
+                    .u64(*price)
+                    .end_block();
+            }
+            ClientMessage::QueryHistory {
+                symbol,
+                interval_ms,
+                limit,
+            } => {
+                e.symbol(Some(*symbol))
+                    .u64(*interval_ms)
+                    .u32(*limit)
+                    .end_block();
             }
             ClientMessage::NewOrder {
                 client_order_id,
@@ -358,6 +393,30 @@ impl ClientMessage {
                 let recent = d.u32()?;
                 d.end_block()?;
                 ClientMessage::SubscribeNews { recent }
+            }
+            ESTIMATE_CHARGES => {
+                let symbol = d.symbol()?;
+                let side = side_from_u8(d.u8()?)?;
+                let qty = d.u64()?;
+                let price = d.u64()?;
+                d.end_block()?;
+                ClientMessage::EstimateCharges {
+                    symbol,
+                    side,
+                    qty,
+                    price,
+                }
+            }
+            QUERY_HISTORY => {
+                let symbol = d.symbol()?;
+                let interval_ms = d.u64()?;
+                let limit = d.u32()?;
+                d.end_block()?;
+                ClientMessage::QueryHistory {
+                    symbol,
+                    interval_ms,
+                    limit,
+                }
             }
             QUERY_ACCOUNTS => {
                 d.end_block()?;
@@ -689,6 +748,17 @@ pub mod tests {
             ClientMessage::QueryAccount,
             ClientMessage::QueryInstruments,
             ClientMessage::SubscribeNews { recent: 25 },
+            ClientMessage::EstimateCharges {
+                symbol: sym("ACME"),
+                side: Side::Sell,
+                qty: 10,
+                price: 25_10,
+            },
+            ClientMessage::QueryHistory {
+                symbol: sym("ACME"),
+                interval_ms: 60_000,
+                limit: 300,
+            },
             ClientMessage::CreateAccount {
                 role: Role::Hft,
                 cash: 1_000_000,

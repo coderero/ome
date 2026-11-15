@@ -54,8 +54,9 @@ done
 for p in "${providers[@]}"; do
   read -r name kind member port <<<"$p"
   routes=()
-  if [[ "$OME_REGIME" == "us" && "$name" == "retail-co" ]]; then routes=(--wholesaler "$(venue_addr wholesale-co)"); fi
-  if [[ "$OME_REGIME" == "us" && "$name" == "prime-co" ]]; then routes=(--ats "$(venue_addr ats-co)"); fi
+  if [[ "$OME_RECORD" == "1" ]]; then routes+=(--postgres "$OME_POSTGRES"); fi
+  if [[ "$OME_REGIME" == "us" && "$name" == "retail-co" ]]; then routes+=(--wholesaler "$(venue_addr wholesale-co)"); fi
+  if [[ "$OME_REGIME" == "us" && "$name" == "prime-co" ]]; then routes+=(--ats "$(venue_addr ats-co)"); fi
   start_bg "$name" "$BIN/ome-broker" --profile "$kind" --listen "$OME_HOST:$port" --exchange "$OME_EXCHANGE" \
     --member "$name" --member-secret "$OME_MEMBER_SECRET" --journal "$OME_DATA/$name.journal" --admin-secret "$OME_BROKER_SECRET" \
     --clearing "$OME_CLEARING" --regime "$OME_REGIME" --news "$OME_NEWS" "${routes[@]}"

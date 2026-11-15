@@ -653,6 +653,18 @@ pub struct Position {
     pub symbol: Symbol,
     pub balance: Balance,
     pub unsettled: i64,
+    pub avg_cost: Price,
+    pub day_cost: Price,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChargesEstimate {
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: Qty,
+    pub price: Price,
+    pub cash_effect: i64,
+    pub charges: Charges,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
