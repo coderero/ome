@@ -11,7 +11,14 @@ use std::rc::Rc;
 pub use gpui_elements::editable_text::TextChanged;
 pub use gpui_elements::editable_text::actions::{DEFAULT_INPUT_CONTEXT, default_bindings};
 
-const BULLET: char = '•';
+fn mask(c: char) -> char {
+    match c.len_utf8() {
+        1 => '*',
+        2 => '·',
+        3 => '•',
+        _ => '🔒',
+    }
+}
 
 pub struct MaskedStorage {
     secret: Rc<RefCell<String>>,
@@ -21,7 +28,7 @@ pub struct MaskedStorage {
 
 impl MaskedStorage {
     pub fn new(secret: Rc<RefCell<String>>) -> Self {
-        let shown = BULLET.to_string().repeat(secret.borrow().chars().count());
+        let shown = secret.borrow().chars().map(mask).collect();
         Self {
             secret,
             shown,
@@ -40,19 +47,15 @@ impl UnicodeTextStorage for MaskedStorage {
     }
 
     fn len_utf16(&self) -> usize {
-        self.shown.chars().count()
+        self.shown.encode_utf16().count()
     }
 
     fn replace_range(&mut self, range: Range<usize>, text: &str) {
-        let width = BULLET.len_utf8();
-        let (from, to) = (range.start / width, range.end / width);
         let mut secret = self.secret.borrow_mut();
-        let chars: Vec<char> = secret.chars().collect();
-        let mut next: String = chars[..from.min(chars.len())].iter().collect();
-        next.push_str(text);
-        next.extend(chars[to.min(chars.len())..].iter());
-        *secret = next;
-        self.shown = BULLET.to_string().repeat(secret.chars().count());
+        let end = range.end.min(secret.len());
+        let start = range.start.min(end);
+        secret.replace_range(start..end, text);
+        self.shown = secret.chars().map(mask).collect();
         self.version = self.version.wrapping_add(1);
     }
 }
@@ -105,20 +108,50 @@ pub fn focus(state: &Entity<EditableTextState>, window: &mut Window, cx: &mut Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{EntityInputHandler, TestAppContext};
 
     #[test]
-    fn masked_storage_edits_the_secret_and_shows_only_bullets() {
+    fn masks_keep_the_byte_and_utf16_length_of_every_character() {
+        for c in ['a', 'ä', '€', '🔑'] {
+            assert_eq!(mask(c).len_utf8(), c.len_utf8(), "{c}");
+            assert_eq!(mask(c).len_utf16(), c.len_utf16(), "{c}");
+        }
+    }
+
+    struct Host {
+        state: Entity<EditableTextState>,
+    }
+
+    impl gpui::Render for Host {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    #[gpui::test]
+    fn typing_into_a_password_field_edits_the_secret_and_shows_only_masks(cx: &mut TestAppContext) {
         let secret = Rc::new(RefCell::new(String::new()));
-        let mut storage = MaskedStorage::new(secret.clone());
-        storage.replace_range(0..0, "pässwd");
-        assert_eq!(storage.content_utf8(), "••••••");
-        assert_eq!(*secret.borrow(), "pässwd");
-        let w = BULLET.len_utf8();
-        storage.replace_range(w..2 * w, "a");
-        assert_eq!(*secret.borrow(), "passwd");
-        storage.replace_range(5 * w..6 * w, "");
-        assert_eq!(*secret.borrow(), "passw");
-        assert_eq!(storage.len_utf16(), 5);
-        assert_eq!(storage.version(), 3);
+        let shared = secret.clone();
+        let window = cx.add_window(move |_, cx| Host {
+            state: secret_state(shared, cx),
+        });
+        window
+            .update(cx, |host, window, cx| {
+                host.state.update(cx, |state, cx| {
+                    for typed in ["p", "ä", "s", "€", "🔑", "w"] {
+                        state.replace_text_in_range(None, typed, window, cx);
+                    }
+                    assert_eq!(state.as_str(), "*·*•🔒*");
+                    let end = state.as_str().encode_utf16().count();
+                    state.replace_text_in_range(Some(end - 1..end), "", window, cx);
+                    state.replace_text_in_range(Some(1..2), "a", window, cx);
+                });
+            })
+            .unwrap();
+        assert_eq!(*secret.borrow(), "pas€🔑");
     }
 }
