@@ -33,9 +33,8 @@ pub struct NewsConfig {
     pub ops_name: String,
     pub ops_secret: String,
     pub exchange: Option<(String, String, String)>,
-    pub simctl: Option<(String, String)>,
     pub quarter_days: u64,
-    pub news_per_minute: f64,
+    pub news_per_day: f64,
     pub seed: Option<u64>,
     pub llm: Option<llm::LlmConfig>,
 }
@@ -44,12 +43,17 @@ pub enum NewsInbound {
     Client(Inbound),
     Market { phase: MarketPhase, day: u64 },
     Rewrite(links::Done),
+    Idea(links::IdeaDone),
 }
 
 impl From<Inbound> for NewsInbound {
     fn from(inbound: Inbound) -> Self {
         NewsInbound::Client(inbound)
     }
+}
+
+fn idea(done: links::IdeaDone) -> NewsInbound {
+    NewsInbound::Idea(done)
 }
 
 fn rewrite(done: links::Done) -> NewsInbound {
@@ -85,10 +89,6 @@ pub fn start(config: NewsConfig) -> Result<(SocketAddr, JoinHandle<Result<(), St
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_os_rng(),
     };
-    let fair_sink = config
-        .simctl
-        .clone()
-        .map(|(addr, secret)| links::sync_fair(addr, secret));
     let ops = OpsCredentials {
         secret: hash_secret(&config.ops_name, &config.ops_secret),
         name: config.ops_name.clone(),
@@ -99,8 +99,7 @@ pub fn start(config: NewsConfig) -> Result<(SocketAddr, JoinHandle<Result<(), St
         ops,
         Box::new(TemplateWriter),
         rng,
-        config.news_per_minute,
-        fair_sink,
+        config.news_per_day,
         last_ts,
     );
     let (tx, rx) = mpsc::channel::<NewsInbound>();
@@ -118,6 +117,10 @@ pub fn start(config: NewsConfig) -> Result<(SocketAddr, JoinHandle<Result<(), St
             llm_config.timeout.as_millis() as u64 + 500,
         );
         links::spawn_writer(llm, queue, tx.clone(), rewrite);
+        let (ideas, requests) = mpsc::channel();
+        gateway.use_ideas(ideas);
+        let patient = llm::LlmConfig { url: llm_config.url.clone(), model: llm_config.model.clone(), timeout: llm_config.timeout * 3 };
+        links::spawn_ideas(llm::Llm::new(&patient)?, requests, tx.clone(), idea);
     }
     gateway.start_up(now_ms());
     gateway.flush().map_err(|e| e.to_string())?;
@@ -165,5 +168,6 @@ fn handle(gateway: &mut Gateway, inbound: NewsInbound) {
         NewsInbound::Client(Inbound::Disconnected(id)) => gateway.disconnect(id),
         NewsInbound::Market { phase, day } => gateway.on_market(phase, day, now_ms()),
         NewsInbound::Rewrite(done) => gateway.on_rewrite(done, now_ms()),
+        NewsInbound::Idea(done) => gateway.on_idea(done),
     }
 }

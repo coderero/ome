@@ -455,7 +455,7 @@ impl Broker {
         {
             return Err(reject(reason));
         }
-        if !market.is_trading(symbol) {
+        if !market.accepts_orders(symbol) {
             return Err(reject(format!(
                 "{symbol} is halted: {}",
                 quote.info.halt_reason
@@ -2603,6 +2603,12 @@ pub mod tests {
             60,
             "allocations are idempotent"
         );
+        deliver(
+            &mut broker,
+            exchange_report(5, 0, issuer, Side::Sell, OrderStatus::Cancelled, (0, 0), 40, 100, 5),
+        );
+        let position = broker.ledger().get(issuer).unwrap().position(sym());
+        assert_eq!((position.available, position.reserved), (60, 0), "a closed offering hands the unsold shares back to the issuer");
     }
 
     #[test]

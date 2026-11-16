@@ -49,9 +49,9 @@ seed_market() {
   broker_admin prime-co create-account fund fund-pw quant 5000000
 
   local listings=(
-    "ACME 25.00 52000 Acme Robotics"
-    "NOVA 12.50 104000 Nova Energy"
-    "ZEN 80.00 16000 Zen Biotech"
+    "ACME 25.00 67000 Acme Robotics"
+    "NOVA 12.50 142000 Nova Energy"
+    "ZEN 80.00 21000 Zen Biotech"
   )
   for listing in "${listings[@]}"; do
     read -r symbol price shares name <<<"$listing"

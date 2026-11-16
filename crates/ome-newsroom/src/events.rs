@@ -15,59 +15,52 @@ pub struct EventType {
     pub sentiment: RangeInclusive<i64>,
     pub growth_bps: RangeInclusive<i64>,
     pub margin_rel_bps: RangeInclusive<i64>,
+    pub one_off_bps: RangeInclusive<i64>,
     pub weight: u32,
 }
 
-const fn company(
-    name: &'static str,
-    sentiment: RangeInclusive<i64>,
+struct Effect {
     growth_bps: RangeInclusive<i64>,
     margin_rel_bps: RangeInclusive<i64>,
-    weight: u32,
-) -> EventType {
+    one_off_bps: RangeInclusive<i64>,
+}
+
+const NONE: Effect = Effect { growth_bps: 0..=0, margin_rel_bps: 0..=0, one_off_bps: 0..=0 };
+
+const fn growth(range: RangeInclusive<i64>) -> Effect {
+    Effect { growth_bps: range, margin_rel_bps: 0..=0, one_off_bps: 0..=0 }
+}
+
+const fn event(name: &'static str, scope: Scope, sentiment: RangeInclusive<i64>, effect: Effect, weight: u32) -> EventType {
     EventType {
         name,
-        scope: Scope::Company,
+        scope,
         sentiment,
-        growth_bps,
-        margin_rel_bps,
+        growth_bps: effect.growth_bps,
+        margin_rel_bps: effect.margin_rel_bps,
+        one_off_bps: effect.one_off_bps,
         weight,
     }
 }
 
-const fn sector(
-    name: &'static str,
-    sentiment: RangeInclusive<i64>,
-    growth_bps: RangeInclusive<i64>,
-    margin_rel_bps: RangeInclusive<i64>,
-    weight: u32,
-) -> EventType {
-    EventType {
-        name,
-        scope: Scope::Sector,
-        sentiment,
-        growth_bps,
-        margin_rel_bps,
-        weight,
-    }
-}
+use Scope::{Company as C, Sector as S};
 
 pub const CATALOGUE: &[EventType] = &[
-    company("contract-win", 30..=70, 50..=150, 0..=0, 10),
-    company("product-launch", 20..=60, 30..=100, 0..=0, 8),
-    company("lawsuit", -60..=-25, 0..=0, -500..=-200, 6),
-    company("recall", -70..=-30, -50..=0, -800..=-300, 4),
-    company("exec-departure", -40..=-10, -40..=0, 0..=0, 5),
-    company("buyback", 20..=50, 0..=0, 100..=300, 5),
-    company("guidance-raise", 40..=80, 80..=200, 0..=0, 4),
-    company("guidance-cut", -80..=-40, -200..=-80, 0..=0, 4),
-    company("upgrade", 20..=50, 0..=0, 0..=0, 8),
-    company("downgrade", -50..=-20, 0..=0, 0..=0, 8),
-    company("merger-rumour", 50..=90, 0..=0, 0..=0, 2),
-    sector("regulation", -60..=-20, -80..=-30, 0..=0, 3),
-    sector("demand-boom", 30..=70, 50..=120, 0..=0, 3),
-    sector("supply-shock", -50..=-20, 0..=0, -500..=-150, 3),
-    sector("subsidy", 20..=60, 0..=0, 150..=400, 2),
+    event("contract-win", C, 30..=70, Effect { growth_bps: 0..=15, margin_rel_bps: 0..=0, one_off_bps: 20..=80 }, 10),
+    event("product-launch", C, 20..=60, growth(5..=25), 8),
+    event("lawsuit", C, -60..=-25, Effect { growth_bps: 0..=0, margin_rel_bps: 0..=0, one_off_bps: -150..=-25 }, 3),
+    event("recall", C, -70..=-30, Effect { growth_bps: -15..=0, margin_rel_bps: 0..=0, one_off_bps: -250..=-50 }, 2),
+    event("exec-departure", C, -40..=-10, growth(-15..=0), 5),
+    event("buyback", C, 20..=50, NONE, 5),
+    event("guidance-raise", C, 40..=80, growth(40..=150), 4),
+    event("guidance-cut", C, -80..=-40, growth(-150..=-40), 4),
+    event("upgrade", C, 20..=50, NONE, 8),
+    event("downgrade", C, -50..=-20, NONE, 8),
+    event("merger-rumour", C, 50..=90, NONE, 2),
+    event("regulation", S, -60..=-20, Effect { growth_bps: -15..=0, margin_rel_bps: -150..=-50, one_off_bps: 0..=0 }, 3),
+    event("demand-boom", S, 30..=70, growth(10..=40), 3),
+    event("supply-shock", S, -50..=-20, Effect { growth_bps: 0..=0, margin_rel_bps: -200..=-50, one_off_bps: 0..=0 }, 3),
+    event("subsidy", S, 20..=60, Effect { growth_bps: 0..=0, margin_rel_bps: 50..=150, one_off_bps: 0..=0 }, 2),
 ];
 
 pub fn find(name: &str) -> Option<&'static EventType> {
@@ -91,6 +84,7 @@ pub struct Draw {
     pub sentiment: i64,
     pub growth_bps: i64,
     pub margin_rel_bps: i64,
+    pub one_off_bps: i64,
 }
 
 impl EventType {
@@ -99,6 +93,7 @@ impl EventType {
             sentiment: rng.random_range(self.sentiment.clone()),
             growth_bps: rng.random_range(self.growth_bps.clone()),
             margin_rel_bps: rng.random_range(self.margin_rel_bps.clone()),
+            one_off_bps: rng.random_range(self.one_off_bps.clone()),
         }
     }
 }
@@ -118,7 +113,7 @@ mod tests {
             let draw = event.draw(&mut rng);
             assert!(event.sentiment.contains(&draw.sentiment));
             assert!(
-                draw.sentiment.signum() * (draw.growth_bps + draw.margin_rel_bps) >= 0,
+                draw.sentiment.signum() * (draw.growth_bps + draw.margin_rel_bps + draw.one_off_bps) >= 0,
                 "{} moves fundamentals against its tone",
                 event.name
             );

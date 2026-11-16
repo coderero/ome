@@ -125,7 +125,7 @@ fn record(tx: &mut Transaction<'_>, observation: &Observation) -> Result<(), pos
                 &[
                     &i.symbol.to_string(),
                     &i.name,
-                    &if i.status == InstrumentStatus::Halted { "halted" } else { "trading" },
+                    &match i.status { InstrumentStatus::Halted => "halted", InstrumentStatus::Paused => "paused", InstrumentStatus::Trading => "trading" },
                     &int(i.reference_price),
                     &i.last_price.map(int),
                     &int(i.low_limit),

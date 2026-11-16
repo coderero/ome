@@ -1,7 +1,8 @@
 use crate::company::{CompanySpec, Fundamentals, quarterly_eps_e4};
 use crate::economy::{Economy, Release, calendar};
-use crate::events::{self, EventType, Scope};
-use crate::writer::{Story, Writer};
+use crate::events::{self, Draw, EventType, Scope};
+use crate::llm::{Idea, IdeaContext};
+use crate::writer::{Copy, Story, Writer};
 use ome_core::price::{Price, format_price};
 use ome_core::symbol::Symbol;
 use ome_core::types::Timestamp;
@@ -18,6 +19,7 @@ pub enum Change {
     Company(Symbol, Fundamentals),
     Economy(Economy),
     Reading(Release, i64),
+    Cash(Symbol, i64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,7 @@ pub struct Filing {
 pub struct Newsroom {
     specs: Vec<CompanySpec>,
     fundamentals: BTreeMap<Symbol, Fundamentals>,
+    cash: BTreeMap<Symbol, i64>,
     economy: Economy,
     start: Economy,
     readings: BTreeMap<u8, i64>,
@@ -125,6 +128,7 @@ impl Newsroom {
         Self {
             specs,
             fundamentals,
+            cash: BTreeMap::new(),
             economy: Economy::default(),
             start: Economy::default(),
             readings: BTreeMap::new(),
@@ -166,6 +170,9 @@ impl Newsroom {
                         Change::Reading(release, value) => {
                             self.readings.insert(release_to(*release), *value);
                         }
+                        Change::Cash(symbol, cash) => {
+                            self.cash.insert(*symbol, *cash);
+                        }
                     }
                 }
                 if item.kind == NewsKind::Prospectus
@@ -206,18 +213,48 @@ impl Newsroom {
         self.fundamentals.get(&symbol).copied()
     }
 
+    pub fn cash(&self, symbol: Symbol) -> i64 {
+        self.cash.get(&symbol).copied().unwrap_or(0)
+    }
+
     pub fn fair(&self, symbol: Symbol) -> Option<Price> {
-        self.fair_with(symbol, &self.fundamentals, &self.economy)
+        self.fair_with(symbol, &self.fundamentals, &self.cash, &self.economy)
     }
 
     fn fair_with(
         &self,
         symbol: Symbol,
         fundamentals: &BTreeMap<Symbol, Fundamentals>,
+        cash: &BTreeMap<Symbol, i64>,
         economy: &Economy,
     ) -> Option<Price> {
         let spec = self.spec(symbol)?;
-        Some(spec.fair(fundamentals.get(&symbol)?, economy, &self.start))
+        let cash_e2 = cash.get(&symbol).copied().unwrap_or(0);
+        Some(spec.fair(fundamentals.get(&symbol)?, cash_e2, economy, &self.start))
+    }
+
+    pub fn fundamentals_data(&self, symbols: &[Symbol], changes: &[Change]) -> String {
+        let mut fundamentals = self.fundamentals.clone();
+        let mut cash = self.cash.clone();
+        for change in changes {
+            match change {
+                Change::Company(symbol, f) => {
+                    fundamentals.insert(*symbol, *f);
+                }
+                Change::Cash(symbol, c) => {
+                    cash.insert(*symbol, *c);
+                }
+                _ => {}
+            }
+        }
+        let entries: Vec<String> = symbols
+            .iter()
+            .filter_map(|s| {
+                let f = fundamentals.get(s)?;
+                Some(format!("{s}:{}:{}:{}", f.eps_e4, f.growth_bps, cash.get(s).copied().unwrap_or(0)))
+            })
+            .collect();
+        if entries.is_empty() { String::new() } else { format!(" fund={}", entries.join(";")) }
     }
 
     pub fn fairs(&self) -> Vec<(Symbol, Price)> {
@@ -374,11 +411,15 @@ impl Newsroom {
 
     fn impact(&self, before: &[(Symbol, Price)], changes: &[Change]) -> i64 {
         let mut fundamentals = self.fundamentals.clone();
+        let mut cash = self.cash.clone();
         let mut economy = self.economy;
         for change in changes {
             match change {
                 Change::Company(symbol, f) => {
                     fundamentals.insert(*symbol, *f);
+                }
+                Change::Cash(symbol, c) => {
+                    cash.insert(*symbol, *c);
                 }
                 Change::Economy(e) => economy = *e,
                 Change::Reading(..) => {}
@@ -387,7 +428,7 @@ impl Newsroom {
         let moves: Vec<f64> = before
             .iter()
             .filter_map(|(symbol, was)| {
-                let now = self.fair_with(*symbol, &fundamentals, &economy)?;
+                let now = self.fair_with(*symbol, &fundamentals, &cash, &economy)?;
                 Some((now as f64 / (*was).max(1) as f64 - 1.0) * 10_000.0)
             })
             .collect();
@@ -407,12 +448,28 @@ impl Newsroom {
         rng: &mut StdRng,
         writer: &mut dyn Writer,
     ) -> Fact {
+        self.publish_copy(story, affected, changes, now, rng, writer, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_copy(
+        &self,
+        story: Story,
+        affected: &[Symbol],
+        changes: Vec<Change>,
+        now: Timestamp,
+        rng: &mut StdRng,
+        writer: &mut dyn Writer,
+        written: Option<Copy>,
+    ) -> Fact {
         let before: Vec<(Symbol, Price)> = affected
             .iter()
             .filter_map(|s| Some((*s, self.fair(*s)?)))
             .collect();
         let impact_bps = self.impact(&before, &changes);
-        let copy = writer.write(&story, rng);
+        let mut data = story.data();
+        data.push_str(&self.fundamentals_data(affected, &changes));
+        let copy = written.unwrap_or_else(|| writer.write(&story, rng));
         Fact::Published {
             item: NewsItem {
                 seq: self.next_seq,
@@ -425,7 +482,7 @@ impl Newsroom {
                 sector: story.sector.clone(),
                 headline: copy.headline,
                 body: copy.body,
-                data: story.data(),
+                data,
             },
             changes,
         }
@@ -465,7 +522,7 @@ impl Newsroom {
             ("shares", spec.shares.to_string()),
             ("price", format_price(spec.price)),
         ]);
-        Some(self.publish(story, &[], vec![], now, rng, writer))
+        Some(self.publish(story, &[symbol], vec![], now, rng, writer))
     }
 
     pub fn decide_earnings(
@@ -480,10 +537,10 @@ impl Newsroom {
         let cycle = spec.beta_pct * (self.economy.growth_bps - 200) / 400;
         let growth_q = f.growth_bps / 4 + cycle + Economy::noisy(rng, 150.0);
         let revenue = ((f.revenue as i128 * (10_000 + growth_q) as i128 / 10_000).max(1)) as u64;
-        let margin_bps = (f.margin_bps + Economy::noisy(rng, 40.0)).clamp(100, 4_000);
+        let margin_bps = (f.margin_bps + (spec.margin_bps - f.margin_bps) / 4 + Economy::noisy(rng, 40.0)).clamp(100, 4_000);
         let eps_e4 = quarterly_eps_e4(revenue, margin_bps, spec.shares);
         let surprise_bps = (eps_e4 - f.consensus_e4) * 10_000 / f.consensus_e4.abs().max(1);
-        let growth_bps = f.growth_bps + (growth_q * 4 - f.growth_bps) / 4;
+        let growth_bps = f.growth_bps + (spec.growth_bps - f.growth_bps) / 4 + (growth_q * 4 - f.growth_bps) / 8;
         let analyst_error = Economy::noisy(rng, 150.0);
         let consensus_e4 =
             eps_e4 + eps_e4 * growth_bps / 40_000 + eps_e4.abs() * analyst_error / 10_000;
@@ -610,9 +667,73 @@ impl Newsroom {
         rng: &mut StdRng,
         writer: &mut dyn Writer,
     ) -> Option<Fact> {
-        let spec = self.spec(symbol)?;
         let draw = event.draw(rng);
-        let affected: Vec<Symbol> = match event.scope {
+        self.apply_draw(event.scope, event.name, symbol, draw, now, rng, writer, None)
+    }
+
+    pub fn decide_idea(
+        &self,
+        symbol: Symbol,
+        idea: &Idea,
+        now: Timestamp,
+        rng: &mut StdRng,
+        writer: &mut dyn Writer,
+    ) -> Option<Fact> {
+        let draw = Draw {
+            sentiment: idea.sentiment,
+            growth_bps: idea.growth_bps,
+            margin_rel_bps: idea.margin_rel_bps,
+            one_off_bps: idea.one_off_bps,
+        };
+        let scope = if idea.sector_wide { Scope::Sector } else { Scope::Company };
+        let copy = Copy { headline: idea.headline.clone(), body: idea.body.clone() };
+        self.apply_draw(scope, &idea.event, symbol, draw, now, rng, writer, Some(copy))
+    }
+
+    pub fn idea_context(&self, symbol: Symbol) -> Option<IdeaContext> {
+        let spec = self.spec(symbol)?;
+        let f = self.fundamentals(symbol)?;
+        let recent = self
+            .news
+            .iter()
+            .rev()
+            .filter(|n| n.symbol == Some(symbol) || (n.kind == NewsKind::Sector && n.sector == spec.sector))
+            .take(8)
+            .map(|n| n.headline.clone())
+            .collect();
+        let e = self.economy;
+        Some(IdeaContext {
+            company: spec.name.clone(),
+            symbol: symbol.to_string(),
+            sector: spec.sector.clone(),
+            revenue: f.revenue * 4,
+            margin_bps: f.margin_bps,
+            growth_bps: f.growth_bps,
+            recent,
+            economy: format!(
+                "policy rate {}, inflation {}, growth {}, risk appetite {}",
+                pct(e.rate_bps),
+                pct(e.inflation_bps),
+                pct(e.growth_bps),
+                e.risk_appetite
+            ),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_draw(
+        &self,
+        scope: Scope,
+        name: &str,
+        symbol: Symbol,
+        draw: Draw,
+        now: Timestamp,
+        rng: &mut StdRng,
+        writer: &mut dyn Writer,
+        written: Option<Copy>,
+    ) -> Option<Fact> {
+        let spec = self.spec(symbol)?;
+        let affected: Vec<Symbol> = match scope {
             Scope::Company => vec![symbol],
             Scope::Sector => self
                 .specs
@@ -621,17 +742,14 @@ impl Newsroom {
                 .map(|s| s.symbol)
                 .collect(),
         };
-        let changes: Vec<Change> = affected
-            .iter()
-            .filter(|_| draw.growth_bps != 0 || draw.margin_rel_bps != 0)
-            .filter_map(|s| {
-                let f = self.fundamentals(*s)?;
-                let margin = f.margin_bps + f.margin_bps * draw.margin_rel_bps / 10_000;
-                let margin_bps = margin.clamp(100, 4_000);
-                let growth_bps = (f.growth_bps + draw.growth_bps).clamp(-3_000, 5_000);
-                let shares = self.spec(*s)?.shares;
-                let eps_e4 = quarterly_eps_e4(f.revenue, margin_bps, shares);
-                Some(Change::Company(
+        let mut changes: Vec<Change> = Vec::new();
+        for s in &affected {
+            let (Some(f), Some(company)) = (self.fundamentals(*s), self.spec(*s)) else { continue };
+            if draw.growth_bps != 0 || draw.margin_rel_bps != 0 {
+                let margin_bps = (f.margin_bps + f.margin_bps * draw.margin_rel_bps / 10_000).clamp(100, 4_000);
+                let growth_bps = (f.growth_bps + draw.growth_bps).clamp(-1_000, 3_000);
+                let eps_e4 = quarterly_eps_e4(f.revenue, margin_bps, company.shares);
+                changes.push(Change::Company(
                     *s,
                     Fundamentals {
                         margin_bps,
@@ -640,21 +758,29 @@ impl Newsroom {
                         consensus_e4: eps_e4 + eps_e4 * growth_bps / 40_000,
                         ..f
                     },
-                ))
-            })
-            .collect();
-        let (kind, story_symbol) = match event.scope {
+                ));
+            }
+            if draw.one_off_bps != 0 {
+                let per_share = company.revenue_per_share_e2(&f) * draw.one_off_bps / 10_000;
+                changes.push(Change::Cash(*s, self.cash(*s) + per_share));
+            }
+        }
+        let (kind, story_symbol) = match scope {
             Scope::Company => (NewsKind::Company, Some(symbol)),
             Scope::Sector => (NewsKind::Sector, None),
         };
-        let mut story = self.story(kind, event.name, story_symbol, draw.sentiment);
+        let mut story = self.story(kind, name, story_symbol, draw.sentiment);
         story.sector = spec.sector.clone();
         story.facts = facts(&[
-            ("event", event.name.to_string()),
+            ("event", name.to_string()),
             ("growth_change", signed_pct(draw.growth_bps)),
             ("margin_change", signed_pct(draw.margin_rel_bps)),
+            ("one_off", signed_pct(draw.one_off_bps)),
         ]);
-        Some(self.publish(story, &affected, changes, now, rng, writer))
+        if written.is_some() {
+            story.facts.push(("source".into(), "llm".into()));
+        }
+        Some(self.publish_copy(story, &affected, changes, now, rng, writer, written))
     }
 
     pub fn decide_shock(
@@ -779,6 +905,60 @@ company BOLT sector=robotics price=40.00 shares=20000 eps=2.00 margin=15 growth=
     }
 
     #[test]
+    fn an_invented_event_is_published_with_its_own_text_and_checked_economics() {
+        let mut room = newsroom();
+        let mut rng = StdRng::seed_from_u64(8);
+        let mut w = TemplateWriter;
+        let ctx = room.idea_context(acme()).unwrap();
+        assert_eq!((ctx.company.as_str(), ctx.sector.as_str()), ("Acme Robotics", "robotics"));
+        let idea = Idea {
+            sector_wide: false,
+            event: "warehouse-deal".into(),
+            headline: "Acme Robotics lands a warehouse automation deal".into(),
+            body: "Acme Robotics will automate the warehouses of a regional grocer.".into(),
+            sentiment: 40,
+            growth_bps: 30,
+            margin_rel_bps: 0,
+            one_off_bps: 40,
+        };
+        let before = room.fundamentals(acme()).unwrap();
+        let item = run(&mut room, |r| r.decide_idea(acme(), &idea, 0, &mut rng, &mut w).unwrap());
+        assert_eq!(item.headline, idea.headline, "the model's own words, not a template");
+        assert!(item.data.contains("source=llm") && item.data.contains("event=warehouse-deal") && item.data.contains("fund=ACME:"));
+        assert_eq!(room.fundamentals(acme()).unwrap().growth_bps, before.growth_bps + 30);
+        assert!(room.cash(acme()) > 0 && item.impact_bps > 0 && item.impact_bps < 100, "{}", item.impact_bps);
+        assert!(room.idea_context(acme()).unwrap().recent.contains(&idea.headline), "the next prompt sees it as recent coverage");
+    }
+
+    #[test]
+    fn story_impacts_come_from_company_economics_and_stay_mostly_small() {
+        let mut room = newsroom();
+        let mut rng = StdRng::seed_from_u64(21);
+        let mut w = TemplateWriter;
+        let start = room.fair(acme()).unwrap();
+        let symbols = room.symbols();
+        let mut impacts = Vec::new();
+        for story in 0..2_000 {
+            let item = run(&mut room, |r| r.decide_random(0, &mut StdRng::seed_from_u64(rng.random()), &mut w).unwrap());
+            impacts.push(item.impact_bps.abs());
+            if story % 60 == 59 {
+                for symbol in &symbols {
+                    run(&mut room, |r| r.decide_earnings(*symbol, 0, &mut rng, &mut w).unwrap());
+                }
+            }
+        }
+        impacts.sort();
+        let at = |q: f64| impacts[((impacts.len() - 1) as f64 * q) as usize];
+        assert!(at(0.5) <= 60, "median story moves value under 0.6%: {}", at(0.5));
+        assert!(at(0.9) <= 200, "nine in ten under 2%: {}", at(0.9));
+        assert!(impacts[impacts.len() - 1] <= 600, "no single story beyond 6%: {}", impacts[impacts.len() - 1]);
+        let drifted = room.fair(acme()).unwrap() as f64 / start as f64;
+        let compounding = 1.09_f64.powf(33.0 / 4.0);
+        let relative = drifted / compounding;
+        assert!(relative > 0.6 && relative < 1.6, "after 33 quarters value follows the company's 9% growth ({compounding:.2}x), not a random walk: {drifted:.2}x");
+    }
+
+    #[test]
     fn prospectuses_are_filed_once_with_the_financial_baseline() {
         let mut room = newsroom();
         let mut rng = StdRng::seed_from_u64(1);
@@ -889,11 +1069,10 @@ company BOLT sector=robotics price=40.00 shares=20000 eps=2.00 margin=15 growth=
             "{lawsuit:?}"
         );
         let after = room.fundamentals(acme()).unwrap();
-        assert!(after.margin_bps < before.margin_bps);
-        assert!(
-            after.consensus_e4 < before.consensus_e4,
-            "analysts cut their estimate"
-        );
+        assert_eq!(after, before, "a settlement is a one-off cost, not a lasting change to the business");
+        assert!(room.cash(acme()) < 0, "the cost comes off the value per share");
+        assert!(lawsuit.impact_bps > -150, "sized against the company's revenue, so the hit is small: {}", lawsuit.impact_bps);
+        assert!(lawsuit.data.contains("fund=ACME:"), "the story carries the fundamentals: {}", lawsuit.data);
         let bolt = Symbol::parse("BOLT").unwrap();
         let bolt_growth = room.fundamentals(bolt).unwrap().growth_bps;
         let boom = run(&mut room, |r| {

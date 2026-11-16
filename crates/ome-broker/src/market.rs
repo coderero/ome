@@ -149,6 +149,12 @@ impl MarketCache {
             .is_some_and(|q| q.info.status == InstrumentStatus::Trading)
     }
 
+    pub fn accepts_orders(&self, symbol: Symbol) -> bool {
+        self.quotes
+            .get(&symbol)
+            .is_some_and(|q| matches!(q.info.status, InstrumentStatus::Trading | InstrumentStatus::Paused))
+    }
+
     pub fn last(&self, symbol: Symbol) -> Option<Price> {
         let quote = self.quotes.get(&symbol)?;
         quote.info.last_price.or(Some(quote.info.reference_price))

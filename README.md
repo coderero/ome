@@ -240,6 +240,15 @@ ome exchange stats ACME            # or: ome broker ... stats ACME
 #   wholesaler         687   10.8%
 ```
 
+**Limit up-limit down.** On top of the 10% price band and the 30% circuit breaker, a trade more than `--luld-bps` (default 5%) away from the average price of the last `--luld-window-ms` of trading pauses the symbol for `--luld-pause-ms` (default 15 s). The window defaults to 5 minutes, needs at least 5 trades and resets each trading day.
+- During the pause the symbol is `Paused`, not halted: orders are collected without matching, as in pre-open, and brokers accept them. Stops, algos and internal crosses wait.
+- When the pause ends, a reopening auction uncrosses the collected orders at one price. That price becomes the new reference, and the day's reference stays unchanged.
+- `--luld-bps 0` turns it off.
+
+**IPO close.** An IPO offering stays on the book through its first full trading day. At the next pre-open the exchange cancels whatever is unsold and the shares stay with the issuer, so no wall of unsold stock pins the price at the listing price.
+
+`ome exchange vol [SYMBOL]` reports what the market actually did: the typical and largest 1-minute move and the range over the exchange's recent candles. It only observes and never feeds back into the market.
+
 Exchange ops can name a **designated market maker** per symbol (`ome exchange dmm ACME lp-co`, `none` to clear). The DMM earns a better maker rebate in that symbol (0.35 tick per share instead of 0.25). In return it carries a quoting obligation: once a second during continuous trading, the exchange checks that the member shows a bid and an ask, at least 100 shares each summed over its accounts, no more than 2% apart. `ome exchange obligations` shows each DMM's current state and compliance rate. The demo designates `lp-co` for every listing.
 
 ## Algorithmic Orders
@@ -342,11 +351,15 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 | Tier | Strategies |
 |---|---|
 | HFT (DMA) | Avellaneda-Stoikov market making: spread widens with volatility, quotes skew away from inventory, two-sided quotes with market maker protection |
-| Liquidity providers | designated market maker quoting round lots within the 2% obligation |
-| Quant funds (prime) | pairs stat-arb executed with POV algos or in the dark pool; factor model (momentum, reversal, volatility) rebalanced with VWAP parents; value investing around fair value; news-driven funds trading fresh stories by tone and fair value impact, unwound after a minute |
+| Liquidity providers | designated market maker quoting round lots within the 2% obligation; quote size grows with capital and leans against inventory |
+| Quant funds (prime) | pairs stat-arb executed with POV algos or in the dark pool; factor model (momentum, reversal, volatility) rebalanced with VWAP parents; value investing from their own valuation of the published fundamentals; news-driven funds trading fresh stories by tone and fair value impact, unwound after a minute |
 | Slow money (prime) | pension funds rebalancing to target weights with slow VWAP parents |
 | Prop desks (prime) | momentum, breakout and mean reversion entries, each position protected by an OCO take-profit/stop |
 | Retail | day traders (protective stops, flat before the close), swing traders (brackets on dips), investors (GTT dip buys, after-market orders, trailing stops), ML personas, value-minded retail, noise traders |
+
+**Value investors** (`strategy=value`) value each company themselves. They take the prospectus (or the first price they saw) as an anchor, then rescale it by forward earnings and add one-off cash effects, using the fundamentals that every company story carries (`fund=SYMBOL:eps:growth:cash`). Each investor draws its own valuation bias (about ±4%) and reads news 2 to 30 seconds late. It rests a bid below and an offer above its own value, sized by capital, and refreshes them when its view moves or every 20 seconds. Nobody is told a "true" price: prices form from these disagreeing valuations and the order flow. `ome sim fair` remains an explicit operator override for scenarios.
+
+The demo starts close to balance: each IPO covers everyone's starting inventory plus 10%, and value funds keep half their capital in cash so that someone can buy a dip.
 
 **ML retail personas** (`strategy=ml-retail`, groups `ml-cautious` and `ml-bold`) each train their own online logistic regression on the live tape: features are the 5, 20 and 100-tick returns, volatility, z-score, news sentiment and the spread, and the label is whether the price is higher a horizon later. They stay out of the market until the model has seen enough samples, then trade the edge of the predicted probability over the model's base rate: a strong edge enters with a bracket, a moderate one with a GTT dip buy, holdings get a trailing stop, and a negative edge exits at market (often filled by the wholesaler). Every agent draws its own horizon, learning rate and sample subset, so agents watching the same tape learn different models. `style=cautious|balanced|bold` sets thresholds and size; `enter`, `strong`, `exit`, `horizon`, `lr`, `diversity` and others can be changed live, and the model is kept across changes. Each agent's status line shows samples seen, hit rate, base rate and its strongest feature. In a live run the models learned short-term mean reversion (a negative weight on the 5-tick return), as expected in a market anchored by value investors.
 
@@ -358,7 +371,7 @@ ome sim pause noise                   # cancel the group's open orders and stop 
 ome sim count swing 25                # scale a group; new accounts are opened automatically
 ome sim param hft-vega gamma=0.6      # live parameter change (rebuilt, except ML personas, which keep their model)
 ome sim fund daytrader 1000           # add cash to every account in a group
-ome sim fair ZEN 85.00 2              # fair value and drift in bps per minute, which value investors trade around
+ome sim fair ZEN 85.00 2              # operator override: value investors use this value (and drift in bps per minute) instead of their own
 ome sim crash ACME 15                 # flash crash: panic selling, liquidity withdraws, value buyers wait, then recover
 ome sim news NOVA -8                  # news shock, published by the newsroom as a story (-8% to earnings and fair value)
 ome sim drought 30 | volatility 30    # market-wide liquidity drought or activity burst
@@ -372,7 +385,7 @@ ome sim replay crash-drill 2          # re-issue the recording at twice the spee
 
 A recording starts with the settings in effect at that moment (group settings, fair values, active scenarios) as its baseline, then holds each operator command and speed change with its offset. The tape marks (last price and day volume per symbol at both ends, plus wall-clock times) tie it to the trades in PostgreSQL. Recordings live in the simctl journal, so they survive restarts. A replay sends the baseline first and then each step with its original spacing, scaled by the speed; replayed commands are journaled like any other command. A replay that is running when simctl restarts is not resumed.
 
-Fair values start at the listing prices (the seed script sets them). In a test run a flash crash took ACME from 24.60 to 23.06 and value buyers brought it back to 25.12 in the next session; a -8% news shock moved NOVA from 12.10 to its new fair value of 11.50 within 15 seconds.
+In a 6-minute fresh demo after these changes, prices stayed on the newsroom's fundamentals (ACME 24.48 vs 24.44, NOVA 11.69 vs 12.34, ZEN 80.00 vs 76.68). The typical 1-minute move (about one simulated trading day) was 2-4%, the range over 5 minutes was 6-12%, and there were 4 limit up-limit down pauses. The first version of these changes, before the starting balance was fixed, still moved ACME about 10% a minute with a 65% range.
 
 ## News, Fundamentals and the Economy
 
@@ -384,10 +397,44 @@ Fair values start at the listing prices (the seed script sets them). In a test r
 | earnings | pre-open, every `--quarter-days` trading days, staggered by company | new revenue, margin and EPS against the analyst consensus; the surprise sets the tone |
 | inflation (CPI), GDP | pre-open on a calendar | actual vs expected moves risk appetite |
 | central bank decision | pre-open on a calendar | hikes against inflation, cuts for weak growth, sometimes a surprise |
-| company news | during the session (`--news-per-minute`) | contract wins, launches, lawsuits, recalls, executive departures, buybacks, guidance changes, analyst ratings, takeover rumours |
+| company news | during the session, about `--news-per-day` stories per company per trading day (default 1; the open session length is measured from the exchange calendar) | contract wins, launches, lawsuits, recalls, executive departures, buybacks, guidance changes, analyst ratings, takeover rumours |
 | sector news | during the session | regulation, demand booms, supply shocks, subsidies for every company in the sector |
 
-Each story carries a structured sentiment (-100 to 100), its effect on fair value in bps and its numbers (`eps=0.63 consensus=0.65 ...`) next to the headline and body. Analyst ratings and rumours carry sentiment but do not change fundamentals. Fair value is the listing price scaled by forward earnings and a re-rating from rates, growth and risk appetite; the newsroom keeps ome-simctl's fair values in step, so value investors trade around them. ### LLM writer
+Each story carries a structured sentiment (-100 to 100), the newsroom's estimate of its effect on value in bps, and its numbers (`eps=0.63 consensus=0.65 ...`) next to the headline and body. It also carries the resulting fundamentals of every company affected (`fund=ACME:eps_e4:growth_bps:cash_e2`), which the agents use to value companies themselves.
+
+Effects are sized against the company's own numbers:
+- **Contract wins** add a one-off profit of 0.2-0.8% of annual revenue.
+- **Lawsuits and recalls** cost 0.25-2.5% of annual revenue once.
+- **Guidance changes** move growth by 0.4-1.5 points.
+- **Sector news** moves margins by 0.5-2%.
+- **Analyst ratings, rumours and buybacks** carry sentiment only.
+
+Growth and margins revert toward the company's normal level at each earnings report. The newsroom's value estimate is the listing price scaled by forward earnings (growth counts once) and a re-rating from rates and risk appetite, plus one-off cash per share.
+
+A unit test runs 2,000 stories with quarterly earnings. The median story moves value under 0.6% and nine in ten under 2%, and over 33 quarters value follows the company's growth instead of random-walking. The newsroom no longer sends values to ome-simctl. ### LLM-invented news
+
+With Ollama running, most company and sector stories are invented by the local model, not drawn from a fixed list. A background thread asks it for the next development about a company. The prompt gives:
+- the company's real numbers (revenue, margin, growth);
+- its last eight headlines, so it doesn't repeat itself;
+- the economy;
+- a good, bad, mixed or minor lean;
+- an angle drawn from sixteen (customers, suppliers, workforce, a plant, cyber security, pricing, a recall, financing and so on).
+
+The model replies with a headline, a body, a sentiment and three economic effects: change in growth, relative change in margin, and a one-off profit or cost as a share of revenue.
+
+The newsroom checks every reply before it can move any value:
+- the scope is valid and a company story names the company;
+- the text contains no figures (no invented numbers);
+- the tone does not contradict the effect;
+- no upbeat wording for bad news, or the reverse;
+- effects lie within realistic bounds: growth ±1 point, margin ±2%, one-off -2% to +0.8% of revenue. Replies far outside are refused and slightly large ones are trimmed;
+- the value effect is scaled to at most 3 bps per point of sentiment, so a mild story cannot carry a big move.
+
+Accepted ideas are journaled with the model's own text and `source=llm` in the story data. When Ollama is down or every reply is refused, the newsroom falls back to its event catalogue, so the feed never stops. `ome news status` shows how many stories were invented and how many ideas were refused. `scripts/demo.sh` now starts Ollama itself through `scripts/llm.sh up` when Docker is available (`OME_WRITER=templates` skips it).
+
+Docker only runs PostgreSQL, Redis and Ollama. The exchange, clearing house, brokers, venues, newsroom, simctl and trading agents are native Rust processes started by `scripts/demo.sh`. The covered companies come from `config/companies.conf`, and their listings from `scripts/seed.sh`. Companies arriving on their own is part of the primary-market phase (6).
+
+### LLM writer
 
 The engine decides every fact (what happened, the numbers, the tone, the effect on fair value); a local LLM only writes the words. `scripts/llm.sh up` starts Ollama in Docker (`docker-compose.yml` profile `llm`, plus `docker-compose.gpu.yml` when Docker has the NVIDIA runtime) and pulls `qwen2.5:1.5b`; `scripts/demo.sh` passes `--llm` to the newsroom when Ollama answers (`OME_WRITER=auto|llm|templates`).
 
@@ -453,7 +500,7 @@ cargo run --release -p ome-retail -- --user alice --secret alice-pw --interval 6
 - **Trade**:
   - *All Products*: a quote header, the Order Entry row with **Confirm and Send**, and Level II beside Time & Sales.
   - *Active Trader*: the price ladder with Buy MKT, Sell MKT, **Flatten** and Cancel orders.
-- **Charts**: 1s to 15m candles (1m and longer load history from PostgreSQL), volume, VWAP, SMA 20 and EMA 50, and a crosshair with an OHLCV readout.
+- **Charts**: 1s to 15m candles (1m and longer load history from PostgreSQL), volume, VWAP, SMA 20 and EMA 50, a crosshair with an OHLCV readout, the previous close as a dashed line, and a "new day" separator at every session start.
   - Drag the time axis to compress or expand bars, and drag the price axis to rescale ("manual" appears).
   - Drag the chart to pan back in time, scroll to zoom, and double-click to reset (double-click the price axis to go back to auto scale).
   - Bars keep their width, with a right margin after the last bar.
@@ -518,7 +565,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 266 tests
+cargo test --workspace     # 278 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
@@ -531,9 +578,10 @@ Done:
 - **3** newsroom: fundamentals, economy, earnings and news feed, news-driven agents, prospectus-gated listings, recorded news, local-LLM writer
 - **4** desktop prototype: UI kit, data layer, retail app with login and chart history (GPUI, replaced in 5a)
 - **5a** egui platform in the thinkorswim style: docked gadget workspaces, detachable windows, link colours, customisable sidebar and columns, draggable chart axes, setup, square off, headless GUI tests
+- **5b** market realism: economics-sized news, agents valuing companies themselves (no injected fair value), capital- and inventory-aware market makers, a balanced starting market, limit up-limit down pauses, a volatility report, day separators on charts
 
 Planned (open decisions first: IPO allotment rules, admin identity, warm-up history, short selling):
-- **5b-5c** market data v3 (server-side candles, history service, warm-up, charts with indicators, drawings and order/fill/news markers); retail platform with a full OMS (blotter, order detail timeline, cancel/replace, more order types, position actions, cash ledger and funds requests, statements, alerts, watchlists, scanner, company pages)
+- **5c-5d** market data v3 (server-side candles, history service, warm-up, charts with indicators, drawings and order/fill/news markers); retail platform with a full OMS (blotter, order detail timeline, cancel/replace, more order types, position actions, cash ledger and funds requests, statements, alerts, watchlists, scanner, company pages)
 - **6** primary market: issuer portal and organisation onboarding, prospectus filing and listing-desk review, book-building with fund blocking and live subscription, pricing, allotment with lottery and refunds, listing-day auction, agents bidding, news coverage
 - **7** back office: named admin users with roles, maker-checker and audit trail; broker desk (KYC, cash and share approvals, freezes and bans, limits); exchange ops console and clearing desk (member and listing approvals, halts, surveillance, collateral and defaults)
 - **8** institutional: OMS/EMS terminal (staging, baskets, pre-trade compliance, allocations, algo ticket with amend/pause), pre-trade cost and TCA, portfolio risk and an OME index, short selling and margin, HFT monitor, LP/DMM desk

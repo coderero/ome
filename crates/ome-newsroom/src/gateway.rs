@@ -1,9 +1,7 @@
 use crate::journal::Record;
-use crate::links::{Done, Job};
+use crate::links::{Done, IdeaDone, IdeaJob, Job};
 use crate::newsroom::{Fact, Filing, Newsroom};
 use crate::writer::Writer;
-use ome_core::price::Price;
-use ome_core::symbol::Symbol;
 use ome_core::types::Timestamp;
 use ome_net::auth::{SecretHash, hash_secret, valid_username, verify};
 use ome_net::{Outbox, SessionId, log};
@@ -42,16 +40,22 @@ pub struct Gateway {
     rng: StdRng,
     writer: Box<dyn Writer>,
     phase: MarketPhase,
-    news_per_minute: f64,
+    news_per_day: f64,
+    open_started: Option<Timestamp>,
+    open_ms: Timestamp,
     last_tick: Option<Timestamp>,
-    fair_sink: Option<Sender<Vec<(Symbol, Price)>>>,
-    pushed: BTreeMap<Symbol, Price>,
     filings: Option<Sender<Filing>>,
     rewriter: Option<Sender<Job>>,
     rewrite_wait_ms: Timestamp,
     pending: VecDeque<(u64, Timestamp, bool)>,
     published: u64,
     stats: WriterStats,
+    ideas: VecDeque<(ome_core::symbol::Symbol, crate::llm::Idea)>,
+    idea_jobs: Option<Sender<IdeaJob>>,
+    ideas_pending: usize,
+    ideas_used: u64,
+    ideas_rejected: u64,
+    idea_problem: String,
 }
 
 #[derive(Default)]
@@ -63,6 +67,8 @@ struct WriterStats {
     total_ms: u64,
     last_error: String,
 }
+
+pub const UNMEASURED_DAY_MS: Timestamp = 23_400_000;
 
 fn encode(message: &ServerMessage) -> Arc<[u8]> {
     frame(&message.encode()).into()
@@ -76,8 +82,7 @@ impl Gateway {
         ops: OpsCredentials,
         writer: Box<dyn Writer>,
         rng: StdRng,
-        news_per_minute: f64,
-        fair_sink: Option<Sender<Vec<(Symbol, Price)>>>,
+        news_per_day: f64,
         clock: Timestamp,
     ) -> Self {
         Self {
@@ -89,16 +94,22 @@ impl Gateway {
             rng,
             writer,
             phase: MarketPhase::Closed,
-            news_per_minute,
+            news_per_day,
+            open_started: None,
+            open_ms: UNMEASURED_DAY_MS,
             last_tick: None,
-            fair_sink,
-            pushed: BTreeMap::new(),
             filings: None,
             rewriter: None,
             rewrite_wait_ms: 0,
             pending: VecDeque::new(),
             published: 0,
             stats: WriterStats::default(),
+            ideas: VecDeque::new(),
+            idea_jobs: None,
+            ideas_pending: 0,
+            ideas_used: 0,
+            ideas_rejected: 0,
+            idea_problem: String::new(),
         }
         .caught_up()
     }
@@ -194,7 +205,8 @@ impl Gateway {
             let _ = sink.send(filing);
         }
         if let Fact::Published { item, .. } = &fact {
-            match &self.rewriter {
+            let invented = item.data.split_whitespace().any(|w| w == "source=llm");
+            match self.rewriter.as_ref().filter(|_| !invented) {
                 Some(rewriter) => {
                     let company = item
                         .symbol
@@ -243,7 +255,6 @@ impl Gateway {
         for id in dead {
             self.sessions.remove(&id);
         }
-        self.push_fairs();
     }
 
     fn release(&mut self, now: Timestamp) {
@@ -309,6 +320,45 @@ impl Gateway {
         self.rewrite_wait_ms = wait_ms;
     }
 
+    pub fn use_ideas(&mut self, jobs: Sender<IdeaJob>) {
+        self.idea_jobs = Some(jobs);
+    }
+
+    pub fn on_idea(&mut self, done: IdeaDone) {
+        self.ideas_pending = self.ideas_pending.saturating_sub(1);
+        match done.result {
+            Ok(idea) => {
+                log(&format!("LLM idea for {} in {} ms: {}", done.symbol, done.elapsed_ms, idea.headline));
+                self.ideas.push_back((done.symbol, idea));
+            }
+            Err(problem) => {
+                self.ideas_rejected += 1;
+                if self.idea_problem != problem {
+                    log(&format!("LLM idea for {} not used: {problem}", done.symbol));
+                }
+                self.idea_problem = problem;
+            }
+        }
+    }
+
+    fn request_ideas(&mut self) {
+        let Some(jobs) = &self.idea_jobs else {
+            return;
+        };
+        let symbols = self.room.symbols();
+        while !symbols.is_empty() && self.ideas.len() + self.ideas_pending < 2 {
+            let symbol = symbols[self.rng.random_range(0..symbols.len())];
+            let Some(context) = self.room.idea_context(symbol) else {
+                return;
+            };
+            if jobs.send(IdeaJob { symbol, context, seed: self.rng.random() }).is_err() {
+                self.idea_jobs = None;
+                return;
+            }
+            self.ideas_pending += 1;
+        }
+    }
+
     fn writer_status(&self) -> String {
         if self.stats.model.is_empty() {
             return self.writer.name();
@@ -319,8 +369,10 @@ impl Gateway {
             .checked_div(self.stats.written)
             .unwrap_or(0);
         format!(
-            "llm {} ({} written, avg {} ms, {} fallback(s), {} timeout(s){})",
+            "llm {} ({} invented, {} idea(s) refused, {} written, avg {} ms, {} fallback(s), {} timeout(s){})",
             self.stats.model,
+            self.ideas_used,
+            self.ideas_rejected,
             self.stats.written,
             average,
             self.stats.fallbacks,
@@ -341,28 +393,6 @@ impl Gateway {
         }
     }
 
-    pub fn push_fairs(&mut self) {
-        let Some(sink) = &self.fair_sink else {
-            return;
-        };
-        let changed: Vec<(Symbol, Price)> = self
-            .room
-            .fairs()
-            .into_iter()
-            .filter(|(s, p)| {
-                self.pushed
-                    .get(s)
-                    .is_none_or(|was| (*p as f64 / *was as f64 - 1.0).abs() >= 0.000_5)
-            })
-            .collect();
-        if changed.is_empty() {
-            return;
-        }
-        if sink.send(changed.clone()).is_ok() {
-            self.pushed.extend(changed);
-        }
-    }
-
     pub fn start_up(&mut self, now: Timestamp) {
         let now = self.advance(now);
         for symbol in self.room.unfiled() {
@@ -371,11 +401,15 @@ impl Gateway {
                     .decide_prospectus(symbol, now, &mut self.rng, self.writer.as_mut());
             self.commit(fact, now);
         }
-        self.push_fairs();
     }
 
     pub fn on_market(&mut self, phase: MarketPhase, day: u64, now: Timestamp) {
         let now = self.advance(now);
+        if phase == MarketPhase::Open {
+            self.open_started.get_or_insert(now);
+        } else if let Some(start) = self.open_started.take() {
+            self.open_ms = now.saturating_sub(start).max(5_000);
+        }
         self.phase = phase;
         let Some(started) = self.room.decide_day(day, &mut self.rng) else {
             return;
@@ -401,14 +435,22 @@ impl Gateway {
         self.release(now);
         let elapsed = now.saturating_sub(self.last_tick.unwrap_or(now));
         self.last_tick = Some(now);
-        if self.phase != MarketPhase::Open || self.news_per_minute <= 0.0 {
+        if self.news_per_day > 0.0 {
+            self.request_ideas();
+        }
+        if self.phase != MarketPhase::Open || self.news_per_day <= 0.0 {
             return;
         }
-        let chance = (self.news_per_minute * elapsed as f64 / 60_000.0).min(1.0);
+        let companies = self.room.symbols().len().max(1) as f64;
+        let chance = (self.news_per_day * companies * elapsed as f64 / self.open_ms as f64).min(1.0);
         if self.rng.random_bool(chance) {
-            let fact = self
-                .room
-                .decide_random(now, &mut self.rng, self.writer.as_mut());
+            let fact = match self.ideas.pop_front() {
+                Some((symbol, idea)) => {
+                    self.ideas_used += 1;
+                    self.room.decide_idea(symbol, &idea, now, &mut self.rng, self.writer.as_mut())
+                }
+                None => self.room.decide_random(now, &mut self.rng, self.writer.as_mut()),
+            };
             self.commit(fact, now);
         }
     }

@@ -23,6 +23,7 @@ const USAGE: &str = "usage:
       schedule <preopen> <open> <closing> <closed>        repeating trading day in seconds; `schedule off`
       dmm <SYMBOL> <member|none>                          designate a market maker (better maker rebate, quoting obligation)
       obligations                                         designated market makers: quoting now and compliance
+      vol [SYMBOL]                                        observed price moves: typical and largest 1-minute move, 10-minute range
       stats <SYMBOL>                                      open, high, low, VWAP and volume by venue
       instruments  |  watch <SYMBOL>
 
@@ -424,6 +425,18 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
             client.send_member(&MemberMessage::QueryInstruments)?;
             print_instruments(client)?;
         }
+        ["vol"] => {
+            client.send_member(&MemberMessage::QueryInstruments)?;
+            let ServerMessage::InstrumentList(list) =
+                client.wait_for(Duration::from_secs(5), |m| matches!(m, ServerMessage::InstrumentList(_)))?
+            else {
+                unreachable!()
+            };
+            for i in list {
+                print_vol(client, i.symbol)?;
+            }
+        }
+        ["vol", sym] => print_vol(client, symbol(sym)?)?,
         ["watch", sym] => {
             client.send_member(&MemberMessage::Subscribe {
                 symbol: symbol(sym)?,
@@ -1100,6 +1113,50 @@ fn print_conditional_replies(client: &mut Client, client_order_id: u64, legs: us
             _ => unreachable!(),
         }
     }
+    Ok(())
+}
+
+pub fn minute_moves(candles: &[ome_core::candles::Candle]) -> Vec<f64> {
+    let mut closes: Vec<(u64, u64)> = Vec::new();
+    for c in candles.iter().filter(|c| c.trades > 0) {
+        let minute = c.start / 60_000;
+        match closes.last_mut() {
+            Some((m, close)) if *m == minute => *close = c.close,
+            _ => closes.push((minute, c.close)),
+        }
+    }
+    closes
+        .windows(2)
+        .filter(|w| w[1].0 == w[0].0 + 1)
+        .map(|w| (w[1].1 as f64 / w[0].1 as f64 - 1.0) * 100.0)
+        .collect()
+}
+
+fn print_vol(client: &mut Client, symbol: Symbol) -> Result<()> {
+    client.send_member(&MemberMessage::Subscribe { symbol })?;
+    let ServerMessage::Candles(series) = client.wait_for(
+        Duration::from_secs(5),
+        |m| matches!(m, ServerMessage::Candles(c) if c.symbol == symbol),
+    )?
+    else {
+        unreachable!()
+    };
+    let traded: Vec<_> = series.candles.iter().filter(|c| c.trades > 0).collect();
+    let moves = minute_moves(&series.candles);
+    if traded.is_empty() || moves.is_empty() {
+        println!("{symbol:<6} not enough trading yet");
+        return Ok(());
+    }
+    let typical = (moves.iter().map(|m| m * m).sum::<f64>() / moves.len() as f64).sqrt();
+    let largest = moves.iter().fold(0.0_f64, |a, m| a.max(m.abs()));
+    let high = traded.iter().map(|c| c.high).max().unwrap_or(0);
+    let low = traded.iter().map(|c| c.low).min().unwrap_or(1).max(1);
+    println!(
+        "{symbol:<6} 1-minute moves: typical {typical:.2}%, largest {largest:.2}% over {} minutes   range {:.2}% over the last {} seconds of trading",
+        moves.len(),
+        (high as f64 / low as f64 - 1.0) * 100.0,
+        series.candles.len() * series.interval as usize / 1_000
+    );
     Ok(())
 }
 
@@ -1831,4 +1888,23 @@ fn resolve(client: &mut Client, account: &str) -> Result<AccountId> {
         .find(|a| a.username == account)
         .map(|a| a.account_id)
         .ok_or_else(|| format!("no account named '{account}'").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::minute_moves;
+    use ome_core::candles::Candle;
+
+    #[test]
+    fn minute_moves_compare_closes_of_consecutive_traded_minutes() {
+        let mut candles = Vec::new();
+        for (second, price) in [(0, 100_00), (59, 101_00), (60, 101_00), (119, 99_99), (300, 105_00)] {
+            let mut c = Candle::new(second * 1_000, price, 1);
+            c.update(price, 1);
+            candles.push(c);
+        }
+        let moves = minute_moves(&candles);
+        assert_eq!(moves.len(), 1, "the gap to minute 5 is not a 1-minute move");
+        assert!((moves[0] + 1.0).abs() < 0.01, "{moves:?}");
+    }
 }

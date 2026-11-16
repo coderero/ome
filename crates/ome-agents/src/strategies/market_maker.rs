@@ -25,6 +25,7 @@ pub struct MarketMaker {
     pub min_spread_bps: f64,
     pub max_spread_bps: f64,
     pub size: Qty,
+    pub size_pct: f64,
     pub requote_bps: f64,
     pub obligation: bool,
     books: BTreeMap<Symbol, Book>,
@@ -41,6 +42,7 @@ impl MarketMaker {
             min_spread_bps: params.f64("min_spread_bps", 6.0),
             max_spread_bps: params.f64("max_spread_bps", 160.0),
             size: params.u64("size", 100),
+            size_pct: params.f64("size_pct", 0.01),
             requote_bps: params.f64("requote_bps", 4.0),
             obligation,
             books: BTreeMap::new(),
@@ -145,14 +147,18 @@ impl Strategy for MarketMaker {
             if open == 2 && close_enough {
                 continue;
             }
-            let mut size = (self.size as f64 * rng.random_range(0.7..1.3)).round() as Qty;
+            let capital = (state.equity() as f64 * self.size_pct / fair.max(1) as f64) as Qty;
+            let mut size = (self.size.max(capital) as f64 * rng.random_range(0.7..1.3)).round() as Qty;
             if drought {
                 size = (size / 4).max(1);
             } else if self.obligation {
                 size = size.max(OBLIGATION_SIZE);
             }
-            let bid_qty = affordable(budget, bid, size.max(1));
-            let ask_qty = size.min(held.available);
+            let lean = (lots * 0.25).clamp(-0.8, 0.8);
+            let bid_size = ((size as f64 * (1.0 - lean)).round() as Qty).max(1);
+            let ask_size = ((size as f64 * (1.0 + lean)).round() as Qty).max(1);
+            let bid_qty = affordable(budget, bid, bid_size);
+            let ask_qty = ask_size.min(held.available);
             book.quoted = Some((bid, ask));
             actions.push(Action::Quote {
                 symbol,
@@ -184,6 +190,22 @@ mod tests {
 
     fn armed(mm: &mut MarketMaker, state: &crate::state::AgentState, rng: &mut StdRng) {
         assert!(matches!(mm.on_tick(state, rng)[0], Action::SetMmp { .. }));
+    }
+
+    #[test]
+    fn quote_size_follows_capital_and_leans_against_inventory() {
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut state = state_with(&[(acme(), 10_000)], 5_000_000_00);
+        hold(&mut state, acme(), 4_000);
+        let mut mm = MarketMaker::new(vec![acme()], &Params::default(), false);
+        armed(&mut mm, &state, &mut rng);
+        let (_, bid, ask) = quotes(&mm.on_tick(&state, &mut rng))[0];
+        let (bid, ask) = (bid.unwrap().1, ask.unwrap().1);
+        assert!(bid > 300 && ask > 300, "a well funded desk quotes more than the minimum: {bid} x {ask}");
+        hold(&mut state, acme(), 6_000);
+        let (_, bid, ask) = quotes(&mm.on_tick(&state, &mut rng))[0];
+        let (bid, ask) = (bid.unwrap().1, ask.unwrap().1);
+        assert!(bid * 2 < ask, "long inventory: it bids for less and offers more: {bid} x {ask}");
     }
 
     #[test]

@@ -21,8 +21,7 @@ company NOVA sector=energy price=12.50 shares=104000 eps=0.80 margin=8 growth=4 
 fn newsroom(
     journal: Option<PathBuf>,
     exchange: Option<SocketAddr>,
-    simctl: Option<SocketAddr>,
-    news_per_minute: f64,
+    news_per_day: f64,
 ) -> SocketAddr {
     start_newsroom(NewsConfig {
         listen: "127.0.0.1:0".into(),
@@ -31,9 +30,8 @@ fn newsroom(
         ops_name: "ops".into(),
         ops_secret: "ops".into(),
         exchange: exchange.map(|a| (a.to_string(), "ops".into(), "ops".into())),
-        simctl: simctl.map(|a| (a.to_string(), "sim".into())),
         quarter_days: 2,
-        news_per_minute,
+        news_per_day,
         seed: Some(7),
         llm: None,
     })
@@ -96,19 +94,7 @@ fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_v
             secret: "pw".into(),
         })
         .unwrap();
-    let simctl = start_simctl(SimConfig {
-        listen: "127.0.0.1:0".into(),
-        journal: None,
-        operator: ("operator".into(), "sim".into()),
-        runner: ("runner".into(), "runner".into()),
-        exchange_addr: exchange.to_string(),
-        exchange_name: "ops".into(),
-        exchange_secret: "ops".into(),
-        newsroom: None,
-    })
-    .unwrap()
-    .0;
-    let news = newsroom(None, Some(exchange), Some(simctl), 300.0);
+    let news = newsroom(None, Some(exchange), 5_000_000.0);
     let mut desk = ops(news);
     desk.request_member(&MemberMessage::CreateMember {
         kind: MemberKind::Broker,
@@ -221,36 +207,14 @@ fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_v
     assert!(earnings.value("eps").is_some() && earnings.day >= 1);
 
     let acme = Symbol::parse("ACME").unwrap();
-    let mut operator =
-        Client::connect_sim(&simctl.to_string(), SimRole::Operator, "operator", "sim").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let room_fair = status(&mut desk)
-            .companies
-            .iter()
-            .find(|c| c.symbol == Some(acme))
-            .unwrap()
-            .fair;
-        operator.send_sim(&SimMessage::QueryStatus).unwrap();
-        let ServerMessage::SimStatus(sim) = operator
-            .wait_for(Duration::from_secs(3), |m| {
-                matches!(m, ServerMessage::SimStatus(_))
-            })
-            .unwrap()
-        else {
-            unreachable!()
-        };
-        let sim_fair = sim.fair.iter().find(|(s, _, _)| *s == acme).map(|f| f.1);
-        let close = sim_fair.is_some_and(|f| (f as f64 / room_fair as f64 - 1.0).abs() < 0.001);
-        if close {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "simctl fair {sim_fair:?} vs newsroom {room_fair}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+    let valued = live.iter().filter(|i| i.data.contains("fund=")).count();
+    assert!(valued > 0, "stories carry fundamentals so agents can value companies themselves");
+    let prospectus = live.iter().find(|i| i.kind == NewsKind::Prospectus && i.symbol == Some(acme));
+    if let Some(p) = prospectus {
+        assert!(p.data.contains("fund=ACME:") && p.value("price") == Some("25.00"));
     }
+    let room_fair = status(&mut desk).companies.iter().find(|c| c.symbol == Some(acme)).unwrap().fair;
+    assert!(room_fair > 15_00 && room_fair < 40_00, "fair value stays in a sane range: {room_fair}");
     let s = status(&mut desk);
     assert!(s.day >= 1 && s.subscribers == 1, "{s:?}");
     assert_eq!(s.writer, "templates");
@@ -296,7 +260,7 @@ fn the_newsroom_recovers_from_its_journal_and_subscribers_resume_after_their_las
     std::fs::create_dir_all(&dir).unwrap();
     let journal = dir.join("newsroom.journal");
     let _ = std::fs::remove_file(&journal);
-    let first = newsroom(Some(journal.clone()), None, None, 0.0);
+    let first = newsroom(Some(journal.clone()), None, 0.0);
     let mut desk = ops(first);
     desk.request_member(&MemberMessage::CreateMember {
         kind: MemberKind::Broker,
@@ -317,7 +281,7 @@ fn the_newsroom_recovers_from_its_journal_and_subscribers_resume_after_their_las
     let before = status(&mut desk);
     assert_eq!(before.published, 5, "two prospectuses and three stories");
 
-    let second = newsroom(Some(journal.clone()), None, None, 0.0);
+    let second = newsroom(Some(journal.clone()), None, 0.0);
     let mut again = ops(second);
     let after = status(&mut again);
     assert_eq!(after.published, 5, "prospectuses are not filed twice");
@@ -422,9 +386,8 @@ fn an_llm_rewrites_stories_in_order_and_bad_replies_fall_back_to_the_template() 
             ops_name: "ops".into(),
             ops_secret: "ops".into(),
             exchange: None,
-            simctl: None,
             quarter_days: 2,
-            news_per_minute: 0.0,
+            news_per_day: 0.0,
             seed: Some(3),
             llm: Some(ome_newsroom::llm::LlmConfig {
                 url: format!("http://{llm}"),

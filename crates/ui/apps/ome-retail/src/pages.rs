@@ -223,8 +223,9 @@ impl Core {
             if col == 0 {
                 let name = info.map(|i| i.name.clone()).unwrap_or_default();
                 ui.add(Label::new(plain(symbol.to_string(), t.tone(net as f64))).selectable(false)).on_hover_text(name);
-                if info.is_some_and(|i| i.status != InstrumentStatus::Trading) {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| badge(ui, "H", t.base, t.warning).on_hover_text("Halted"));
+                if let Some(status) = info.map(|i| i.status).filter(|s| *s != InstrumentStatus::Trading) {
+                    let (mark, hover) = if status == InstrumentStatus::Paused { ("P", "Paused: collecting orders for a reopening auction") } else { ("H", "Halted") };
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| badge(ui, mark, t.base, t.warning).on_hover_text(hover));
                 }
             } else {
                 let pct = last.and_then(|l| format::change_pct(reference, l)).unwrap_or(0.0);
@@ -709,8 +710,10 @@ impl Core {
                 value(ui, &t, "Low", &format::price(s.low), t.strong);
                 value(ui, &t, "VWAP", &format::price(s.vwap), t.strong);
             }
-            if info.is_some_and(|i| i.status != InstrumentStatus::Trading) {
-                badge(ui, "HALTED", t.base, t.warning);
+            match info.as_ref().map(|i| i.status) {
+                Some(InstrumentStatus::Halted) => drop(badge(ui, "HALTED", t.base, t.warning)),
+                Some(InstrumentStatus::Paused) => drop(badge(ui, "PAUSED", t.base, t.warning)),
+                _ => {}
             }
         });
         self.link = link;
@@ -1099,6 +1102,7 @@ impl Core {
         });
         self.link = link;
         let candles = self.store.candles(symbol, self.interval);
+        let breaks: Vec<u64> = self.store.sessions.iter().copied().collect();
         let view = self.chart_views.entry(id).or_default();
         egui::Frame::new().inner_margin(Margin { left: 6, right: 0, top: 6, bottom: 4 }).show(ui, |ui| {
             Chart {
@@ -1107,6 +1111,7 @@ impl Core {
                 reference,
                 interval: self.interval,
                 studies: self.studies,
+                breaks: &breaks,
                 view,
             }
             .show(ui, &t);

@@ -38,6 +38,7 @@ pub struct MarketStore {
     pub connection: Connection,
     pub now: Timestamp,
     pub status: Option<MarketStatus>,
+    pub sessions: VecDeque<Timestamp>,
     pub instruments: BTreeMap<Symbol, InstrumentInfo>,
     pub books: BTreeMap<Symbol, BookSnapshot>,
     pub stats: BTreeMap<Symbol, MarketStats>,
@@ -105,7 +106,15 @@ impl MarketStore {
                 self.now = self.now.max(server_time);
             }
             ServerMessage::Heartbeat { server_time } => self.now = self.now.max(server_time),
-            ServerMessage::MarketStatus(status) => self.status = Some(status),
+            ServerMessage::MarketStatus(status) => {
+                if status.phase == MarketPhase::PreOpen && self.sessions.back() != Some(&status.since) {
+                    if self.sessions.len() == 64 {
+                        self.sessions.pop_front();
+                    }
+                    self.sessions.push_back(status.since);
+                }
+                self.status = Some(status);
+            }
             ServerMessage::InstrumentList(list) => {
                 for info in list {
                     self.instruments.insert(info.symbol, info);

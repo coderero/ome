@@ -97,6 +97,7 @@ pub struct Chart<'a> {
     pub reference: Option<Price>,
     pub interval: u64,
     pub studies: Studies,
+    pub breaks: &'a [u64],
     pub view: &'a mut ChartView,
 }
 
@@ -196,6 +197,16 @@ impl Chart<'_> {
                     painter.text(pos2(cx, plot.bottom() + 4.0), Align2::CENTER_TOP, time_label(c.start, self.interval), Theme::sans(11.0), t.muted);
                 }
             }
+        }
+        for &at in self.breaks {
+            let Some(k) = shown.iter().position(|c| c.start >= at) else { continue };
+            let i = start + k;
+            if i == 0 || self.candles[i - 1].start >= at {
+                continue;
+            }
+            let bx = x(i) - slot / 2.0;
+            plot_painter.extend(Shape::dashed_line(&[pos2(bx, plot.top()), pos2(bx, plot.bottom())], Stroke::new(1.0, t.divider), 3.0, 3.0));
+            painter.text(pos2(bx + 3.0, plot.top() + 2.0), Align2::LEFT_TOP, "new day", Theme::sans(10.5), t.muted);
         }
         let max_volume = shown.iter().map(|c| c.volume).max().unwrap_or(1).max(1) as f32;
         let body = (slot * 0.7).max(1.0);

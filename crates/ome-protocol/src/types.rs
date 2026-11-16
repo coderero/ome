@@ -148,6 +148,7 @@ impl OrderStatus {
 pub enum InstrumentStatus {
     Trading = 1,
     Halted = 2,
+    Paused = 3,
 }
 
 impl InstrumentStatus {
@@ -155,6 +156,7 @@ impl InstrumentStatus {
         match v {
             1 => Some(InstrumentStatus::Trading),
             2 => Some(InstrumentStatus::Halted),
+            3 => Some(InstrumentStatus::Paused),
             _ => None,
         }
     }

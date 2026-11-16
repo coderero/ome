@@ -1,7 +1,7 @@
 use ome_exchange::exchange::ExchangeConfig;
 use ome_exchange::{ServerConfig, start};
 
-const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET] [--require-prospectus]";
+const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET] [--require-prospectus]\n                    [--luld-bps BPS (0 = off)] [--luld-window-ms MS] [--luld-pause-ms MS]";
 
 fn parse_args() -> Result<ServerConfig, String> {
     let mut config = ServerConfig {
@@ -24,6 +24,9 @@ fn parse_args() -> Result<ServerConfig, String> {
             "--admin-name" => config.admin_name = value()?,
             "--admin-secret" => config.admin_secret = value()?,
             "--require-prospectus" => config.exchange.require_prospectus = true,
+            "--luld-bps" => config.exchange.luld_bps = value()?.parse().map_err(|_| "--luld-bps needs a number")?,
+            "--luld-window-ms" => config.exchange.luld_window_ms = value()?.parse().map_err(|_| "--luld-window-ms needs a number")?,
+            "--luld-pause-ms" => config.exchange.luld_pause_ms = value()?.parse().map_err(|_| "--luld-pause-ms needs a number")?,
             _ => return Err(USAGE.into()),
         }
     }

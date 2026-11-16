@@ -13,6 +13,7 @@ const PENDING_TTL: Timestamp = 3_000;
 #[derive(Debug, Clone, Default)]
 pub struct Market {
     pub trading: bool,
+    pub paused: bool,
     pub reference: Price,
     pub last: Option<Price>,
     pub bid: Option<Price>,
@@ -324,6 +325,7 @@ impl AgentState {
     fn apply_instrument(&mut self, info: &InstrumentInfo) {
         let market = self.markets.entry(info.symbol).or_default();
         market.trading = info.status == InstrumentStatus::Trading;
+        market.paused = info.status == InstrumentStatus::Paused;
         market.reference = info.reference_price;
         if info.last_price.is_some() && market.last.is_none() {
             market.last = info.last_price;
@@ -355,6 +357,7 @@ pub mod tests {
                 *symbol,
                 Market {
                     trading: true,
+                    paused: false,
                     reference: *price,
                     last: Some(*price),
                     bid: Some(price - 5),

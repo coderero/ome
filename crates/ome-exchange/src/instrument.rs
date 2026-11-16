@@ -5,6 +5,7 @@ use ome_core::risk::PriceBand;
 use ome_core::symbol::Symbol;
 use ome_core::tape::TradeTape;
 use ome_core::types::{Timestamp, Trade};
+use std::collections::VecDeque;
 use ome_protocol::{InstrumentInfo, InstrumentStatus, MarketStats, Venue};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,9 +35,19 @@ impl DayStats {
     }
 }
 
+pub const LULD_MIN_TRADES: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaltKind {
+    Manual,
+    Circuit,
+    Luld,
+}
+
 pub struct Halt {
     pub reason: String,
     pub auto_resume_at: Option<Timestamp>,
+    pub kind: HaltKind,
 }
 
 pub struct Instrument {
@@ -50,6 +61,8 @@ pub struct Instrument {
     pub volume: u64,
     pub halt: Option<Halt>,
     pub day: DayStats,
+    pub recent: VecDeque<(Timestamp, Price)>,
+    pub luld_anchor: Option<Price>,
 }
 
 impl Instrument {
@@ -72,6 +85,8 @@ impl Instrument {
             volume: 0,
             halt: None,
             day: DayStats::default(),
+            recent: VecDeque::new(),
+            luld_anchor: None,
         }
     }
 
@@ -94,6 +109,23 @@ impl Instrument {
         self.candles.record(trade.price, trade.qty, trade.timestamp);
         self.tape.push(trade.clone());
         self.day.record(trade.price, trade.qty, trade.venue);
+        self.recent.push_back((trade.timestamp, trade.price));
+    }
+
+    pub fn luld_reference(&mut self, now: Timestamp, window: Timestamp) -> Option<Price> {
+        while self.recent.front().is_some_and(|(at, _)| now.saturating_sub(*at) > window) {
+            self.recent.pop_front();
+        }
+        if self.recent.len() < LULD_MIN_TRADES + 1 {
+            return self.luld_anchor;
+        }
+        let all: Vec<Price> = self.recent.iter().map(|(_, p)| *p).collect();
+        let before_last = &all[..all.len() - 1];
+        Some(before_last.iter().sum::<Price>() / before_last.len() as Price)
+    }
+
+    pub fn paused(&self) -> bool {
+        self.halt.as_ref().is_some_and(|h| h.kind == HaltKind::Luld)
     }
 
     pub fn stats(&self) -> MarketStats {
@@ -119,7 +151,9 @@ impl Instrument {
         let (low_limit, high_limit) = self.circuit_limits(circuit_bps);
         InstrumentInfo {
             symbol: self.symbol,
-            status: if self.halt.is_some() {
+            status: if self.paused() {
+                InstrumentStatus::Paused
+            } else if self.halt.is_some() {
                 InstrumentStatus::Halted
             } else {
                 InstrumentStatus::Trading

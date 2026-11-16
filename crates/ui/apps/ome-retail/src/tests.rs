@@ -145,6 +145,12 @@ fn market() -> Vec<ServerMessage> {
     let acme = sym("ACME");
     let mut messages = vec![
         ServerMessage::MarketStatus(MarketStatus {
+            phase: MarketPhase::PreOpen,
+            day: 3,
+            since: T0 - 90_000,
+            next_change_at: T0 - 85_000,
+        }),
+        ServerMessage::MarketStatus(MarketStatus {
             phase: MarketPhase::Open,
             day: 3,
             since: T0 - 20_000,

@@ -8,6 +8,7 @@ const HALF_LIFE_MS: f64 = 45_000.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct NewsDesk {
+    pub valuations: crate::valuation::Valuations,
     sectors: BTreeMap<Symbol, String>,
     items: VecDeque<NewsItem>,
     last_seq: u64,
@@ -24,6 +25,7 @@ impl NewsDesk {
             return false;
         }
         self.last_seq = item.seq;
+        self.valuations.absorb(item);
         if self.items.len() == KEEP {
             self.items.pop_front();
         }

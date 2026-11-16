@@ -4,8 +4,7 @@ use ome_newsroom::{NewsConfig, start};
 const USAGE: &str = "usage: ome-newsroom [--listen ADDR] [--journal PATH] [--companies FILE]
                     [--ops-name NAME] [--ops-secret SECRET]
                     [--exchange ADDR] [--exchange-secret SECRET] [--no-exchange]
-                    [--simctl ADDR] [--sim-secret SECRET] [--no-simctl]
-                    [--quarter-days N] [--news-per-minute RATE] [--seed N]
+                    [--quarter-days N] [--news-per-day STORIES_PER_COMPANY] [--seed N]
                     [--llm http://HOST:PORT] [--llm-model MODEL] [--llm-timeout-ms MS]";
 
 fn parse_args() -> Result<NewsConfig, String> {
@@ -16,10 +15,6 @@ fn parse_args() -> Result<NewsConfig, String> {
         "ops".to_string(),
         env("OME_EXCHANGE_SECRET", "ops"),
     ));
-    let mut simctl = Some((
-        env("OME_SIMCTL", "127.0.0.1:7400"),
-        env("OME_SIM_SECRET", "sim"),
-    ));
     let mut config = NewsConfig {
         listen: "127.0.0.1:7500".into(),
         journal: None,
@@ -27,9 +22,8 @@ fn parse_args() -> Result<NewsConfig, String> {
         ops_name: "ops".into(),
         ops_secret: env("OME_NEWS_SECRET", "ops"),
         exchange: None,
-        simctl: None,
-        quarter_days: 5,
-        news_per_minute: 3.0,
+        quarter_days: 20,
+        news_per_day: 1.0,
         seed: None,
         llm: None,
     };
@@ -56,26 +50,15 @@ fn parse_args() -> Result<NewsConfig, String> {
                 }
             }
             "--no-exchange" => exchange = None,
-            "--simctl" => {
-                if let Some(s) = simctl.as_mut() {
-                    s.0 = value()?;
-                }
-            }
-            "--sim-secret" => {
-                if let Some(s) = simctl.as_mut() {
-                    s.1 = value()?;
-                }
-            }
-            "--no-simctl" => simctl = None,
             "--quarter-days" => {
                 config.quarter_days = value()?
                     .parse()
                     .map_err(|_| "--quarter-days needs a number")?
             }
-            "--news-per-minute" => {
-                config.news_per_minute = value()?
+            "--news-per-day" => {
+                config.news_per_day = value()?
                     .parse()
-                    .map_err(|_| "--news-per-minute needs a number")?
+                    .map_err(|_| "--news-per-day needs a number")?
             }
             "--llm" => llm_url = Some(value()?),
             "--llm-model" => llm_model = value()?,
@@ -97,7 +80,6 @@ fn parse_args() -> Result<NewsConfig, String> {
         timeout: std::time::Duration::from_millis(llm_timeout_ms),
     });
     config.exchange = exchange;
-    config.simctl = simctl;
     Ok(config)
 }
 

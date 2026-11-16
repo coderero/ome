@@ -106,19 +106,22 @@ impl CompanySpec {
         }
     }
 
-    pub fn fair(&self, now: &Fundamentals, economy: &Economy, start: &Economy) -> Price {
+    pub fn fair(&self, now: &Fundamentals, cash_e2: i64, economy: &Economy, start: &Economy) -> Price {
         let base = self.baseline();
-        let forward =
-            |f: &Fundamentals| f.eps_e4 as f64 * 4.0 * (1.0 + f.growth_bps as f64 / 10_000.0);
+        let forward = |f: &Fundamentals| {
+            f.eps_e4 as f64 * 4.0 * (1.0 + f.growth_bps.clamp(-2_000, 3_000) as f64 / 10_000.0)
+        };
         let base_forward = forward(&base).max(1.0);
         let earnings = (forward(now) / base_forward).max(0.05);
-        let capped = |g: i64| g.clamp(-2_000, 3_000) as f64 / 10_000.0;
         let beta = self.beta_pct as f64 / 100.0;
         let rerating = -6.0 * (economy.rate_bps - start.rate_bps) as f64 / 10_000.0
-            + 1.5 * (capped(now.growth_bps) - capped(base.growth_bps))
             + 0.15 * beta * (economy.risk_appetite - start.risk_appetite) as f64 / 100.0;
-        let fair = self.price as f64 * earnings * rerating.clamp(-1.5, 1.0).exp();
+        let fair = self.price as f64 * earnings * rerating.clamp(-1.5, 1.0).exp() + cash_e2 as f64;
         fair.round().max(1.0) as Price
+    }
+
+    pub fn revenue_per_share_e2(&self, f: &Fundamentals) -> i64 {
+        (f.revenue as i128 * 4 * 100 / self.shares.max(1) as i128) as i64
     }
 }
 
@@ -160,7 +163,7 @@ mod tests {
             base.eps_e4 * 4
         );
         let economy = Economy::default();
-        let fair = spec.fair(&base, &economy, &economy);
+        let fair = spec.fair(&base, 0, &economy, &economy);
         assert!((fair as i64 - 25_00).abs() <= 2, "{fair}");
     }
 
@@ -169,7 +172,7 @@ mod tests {
         let spec = acme();
         let start = Economy::default();
         let base = spec.baseline();
-        let fair = |f: &Fundamentals, e: &Economy| spec.fair(f, e, &start);
+        let fair = |f: &Fundamentals, e: &Economy| spec.fair(f, 0, e, &start);
         let better = Fundamentals {
             eps_e4: base.eps_e4 * 11 / 10,
             ..base
@@ -190,5 +193,13 @@ mod tests {
             ..base
         };
         assert!(fair(&loss, &start) >= 1);
+        let faster = Fundamentals {
+            growth_bps: base.growth_bps + 150,
+            ..base
+        };
+        let lift = fair(&faster, &start) as f64 / fair(&base, &start) as f64 - 1.0;
+        assert!(lift > 0.01 && lift < 0.02, "growth counts once, through forward earnings: {lift}");
+        assert_eq!(spec.fair(&base, 125, &start, &start), fair(&base, &start) + 125, "one-off value adds per share");
+        assert_eq!(spec.revenue_per_share_e2(&base) / 100, 10, "ACME sells about 10.4 a share a year");
     }
 }

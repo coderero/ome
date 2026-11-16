@@ -7,4 +7,5 @@ pub mod roster;
 pub mod runner;
 pub mod state;
 pub mod strategies;
+pub mod valuation;
 pub mod world;

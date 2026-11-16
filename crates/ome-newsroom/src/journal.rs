@@ -88,6 +88,7 @@ impl Entry for Record {
                         Change::Reading(release, value) => {
                             (3, None, release_to(*release) as u64, *value, 0, 0, 0, 0)
                         }
+                        Change::Cash(symbol, cash) => (4, Some(*symbol), 0, *cash, 0, 0, 0, 0),
                     };
                     e.u8(code)
                         .symbol(symbol)
@@ -165,6 +166,7 @@ impl Entry for Record {
                             growth_bps: c,
                             risk_appetite: e4,
                         }),
+                        (4, Some(symbol)) => Change::Cash(symbol, a),
                         (3, _) => Change::Reading(
                             release_from(x as u8).ok_or(DecodeError::Invalid("release"))?,
                             a,

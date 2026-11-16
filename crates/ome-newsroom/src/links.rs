@@ -2,13 +2,12 @@ use crate::llm::Llm;
 use crate::newsroom::Filing;
 use crate::writer::Copy;
 use ome_client::Client;
-use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_net::log;
 use ome_protocol::NewsItem;
-use ome_protocol::{MarketPhase, MemberMessage, ServerMessage, SimCommand, SimMessage, SimRole};
+use ome_protocol::{MarketPhase, MemberMessage, ServerMessage};
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -74,57 +73,42 @@ pub fn watch_exchange<T: Send + 'static>(
     });
 }
 
-fn push(
-    client: &mut Option<Client>,
-    addr: &str,
-    secret: &str,
-    pending: &mut BTreeMap<Symbol, Price>,
-) {
-    if client.is_none() {
-        *client = Client::connect_sim(addr, SimRole::Operator, "operator", secret).ok();
-    }
-    let Some(sim) = client.as_mut() else {
-        return;
-    };
-    while let Some((symbol, price)) = pending.first_key_value().map(|(s, p)| (*s, *p)) {
-        let command = SimCommand::SetFair {
-            symbol,
-            price,
-            drift_bps: 0,
-        };
-        match sim.request_sim(&SimMessage::Command(command)) {
-            Ok(_) => {
-                pending.remove(&symbol);
+pub struct IdeaJob {
+    pub symbol: Symbol,
+    pub context: crate::llm::IdeaContext,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdeaDone {
+    pub symbol: Symbol,
+    pub result: Result<crate::llm::Idea, String>,
+    pub elapsed_ms: u64,
+}
+
+pub fn spawn_ideas<T: Send + 'static>(llm: Llm, jobs: Receiver<IdeaJob>, events: Sender<T>, wrap: fn(IdeaDone) -> T) {
+    thread::spawn(move || {
+        let mut offline_until: Option<Instant> = None;
+        for job in jobs {
+            if let Some(until) = offline_until.take() {
+                thread::sleep(until.saturating_duration_since(Instant::now()));
             }
-            Err(e) => {
-                log(&format!("simctl refused fair value for {symbol}: {e}"));
-                *client = None;
+            let begun = Instant::now();
+            let result = {
+                let result = llm.idea(&job.context, job.seed);
+                if let Err(e) = &result
+                    && (e.contains("refused") || e.contains("resolve") || e.contains("no answer"))
+                {
+                    offline_until = Some(Instant::now() + Duration::from_secs(10));
+                }
+                result
+            };
+            let done = IdeaDone { symbol: job.symbol, result, elapsed_ms: begun.elapsed().as_millis() as u64 };
+            if events.send(wrap(done)).is_err() {
                 return;
             }
         }
-    }
-}
-
-pub fn sync_fair(addr: String, secret: String) -> Sender<Vec<(Symbol, Price)>> {
-    let (tx, rx): (_, Receiver<Vec<(Symbol, Price)>>) = mpsc::channel();
-    thread::spawn(move || {
-        let mut client = None;
-        let mut pending = BTreeMap::new();
-        loop {
-            match rx.recv_timeout(RETRY) {
-                Ok(batch) => pending.extend(batch),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            for batch in rx.try_iter() {
-                pending.extend(batch);
-            }
-            if !pending.is_empty() {
-                push(&mut client, &addr, &secret, &mut pending);
-            }
-        }
     });
-    tx
 }
 
 pub struct Job {

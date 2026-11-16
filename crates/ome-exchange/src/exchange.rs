@@ -1,5 +1,5 @@
 use crate::fees::FeeSchedule;
-use crate::instrument::{Halt, Instrument};
+use crate::instrument::{Halt, HaltKind, Instrument};
 use crate::members::Members;
 use crate::session::{Schedule, Session};
 use ome_core::price::{Price, format_price};
@@ -34,6 +34,9 @@ pub struct ExchangeConfig {
     pub feed_capacity: usize,
     pub fees: FeeSchedule,
     pub require_prospectus: bool,
+    pub luld_bps: u64,
+    pub luld_window_ms: Timestamp,
+    pub luld_pause_ms: Timestamp,
 }
 
 impl Default for ExchangeConfig {
@@ -50,6 +53,9 @@ impl Default for ExchangeConfig {
             feed_capacity: 100_000,
             fees: FeeSchedule::default(),
             require_prospectus: false,
+            luld_bps: 500,
+            luld_window_ms: 300_000,
+            luld_pause_ms: 15_000,
         }
     }
 }
@@ -257,6 +263,7 @@ pub struct Exchange {
     dmm: BTreeMap<Symbol, MemberId>,
     prospectuses: BTreeMap<Symbol, (u64, String)>,
     next_allocation_id: u64,
+    offerings: BTreeMap<Symbol, (MemberId, OrderId, u64)>,
 }
 
 fn owner_key(member: MemberId, account: AccountId) -> u64 {
@@ -298,6 +305,7 @@ impl Exchange {
             dmm: BTreeMap::new(),
             prospectuses: BTreeMap::new(),
             next_allocation_id: 1,
+            offerings: BTreeMap::new(),
         }
     }
 
@@ -383,8 +391,8 @@ impl Exchange {
                 *issuer_account,
                 now,
             ),
-            Command::Halt { symbol, reason } => self.halt(*symbol, reason.clone(), None),
-            Command::Resume { symbol } => self.resume(*symbol),
+            Command::Halt { symbol, reason } => self.halt(*symbol, reason.clone(), None, HaltKind::Manual),
+            Command::Resume { symbol } => self.resume(*symbol, now),
             Command::OpenCycle { cycle } => {
                 self.cycle = self.cycle.max(*cycle);
                 Ok(vec![])
@@ -558,8 +566,12 @@ impl Exchange {
                 instrument.reference_price =
                     instrument.last_price.unwrap_or(instrument.reference_price);
                 instrument.day = Default::default();
+                instrument.recent.clear();
+                instrument.luld_anchor = None;
                 events.push(Event::InstrumentChanged(instrument.symbol));
             }
+            let day = self.session.day + 1;
+            self.close_offerings(day, now, &mut events);
         }
         self.session.enter(phase, now);
         events.push(Event::SessionChanged);
@@ -744,15 +756,22 @@ impl Exchange {
     fn uncross_all(&mut self, now: Timestamp, events: &mut Vec<Event>) {
         let symbols: Vec<Symbol> = self.instruments.keys().copied().collect();
         for symbol in symbols {
-            let Some(instrument) = self.instruments.get_mut(&symbol) else {
-                continue;
-            };
-            if instrument.halt.is_some() {
-                continue;
+            if self.instruments.get(&symbol).is_some_and(|i| i.halt.is_none()) {
+                self.uncross(symbol, now, events);
+                self.check_circuit(symbol, events, now);
+                self.check_luld(symbol, events, now);
             }
+        }
+    }
+
+    fn uncross(&mut self, symbol: Symbol, now: Timestamp, events: &mut Vec<Event>) {
+        {
+            let Some(instrument) = self.instruments.get_mut(&symbol) else {
+                return;
+            };
             let reference = instrument.last_price.unwrap_or(instrument.reference_price);
             let Some(indication) = instrument.book.indicative(reference) else {
-                continue;
+                return;
             };
             let execution = instrument.book.uncross(indication.price, now);
             for trade in &execution.trades {
@@ -768,7 +787,6 @@ impl Exchange {
             }
             events.push(Event::BookChanged(symbol));
             self.enforce_mmp(now, events);
-            self.check_circuit(symbol, events, now);
         }
     }
 
@@ -1001,6 +1019,7 @@ impl Exchange {
         for clearing in self.clearing_members() {
             events.push(self.publish(clearing, ServerMessage::Allocation(allocation.clone())));
         }
+        let offer = self.next_order_id;
         events.extend(self.place(
             underwriter,
             0,
@@ -1012,7 +1031,28 @@ impl Exchange {
             shares,
             now,
         ));
+        if self.orders.contains_key(&offer) {
+            self.offerings.insert(symbol, (underwriter, offer, self.session.day));
+        }
         Ok(events)
+    }
+
+    fn close_offerings(&mut self, day: u64, now: Timestamp, events: &mut Vec<Event>) {
+        let due: Vec<Symbol> = self
+            .offerings
+            .iter()
+            .filter(|(_, (_, _, listed))| day >= listed + 2)
+            .map(|(symbol, _)| *symbol)
+            .collect();
+        for symbol in due {
+            if let Some((_, order, _)) = self.offerings.remove(&symbol)
+                && self.orders.contains_key(&order)
+                && self.instruments.get_mut(&symbol).and_then(|i| i.book.cancel(order)).is_some()
+            {
+                events.extend(self.close(order, OrderStatus::Cancelled, now, "IPO offering closed; unsold shares stay with the issuer"));
+                events.push(Event::BookChanged(symbol));
+            }
+        }
     }
 
     fn halt(
@@ -1020,6 +1060,7 @@ impl Exchange {
         symbol: Symbol,
         reason: String,
         auto_resume_at: Option<Timestamp>,
+        kind: HaltKind,
     ) -> Result<Vec<Event>, ExchangeError> {
         let instrument = self
             .instruments
@@ -1036,20 +1077,34 @@ impl Exchange {
         instrument.halt = Some(Halt {
             reason,
             auto_resume_at,
+            kind,
         });
         Ok(vec![Event::InstrumentChanged(symbol)])
     }
 
-    fn resume(&mut self, symbol: Symbol) -> Result<Vec<Event>, ExchangeError> {
+    fn resume(&mut self, symbol: Symbol, now: Timestamp) -> Result<Vec<Event>, ExchangeError> {
         let instrument = self
             .instruments
             .get_mut(&symbol)
             .ok_or(ExchangeError::UnknownSymbol(symbol))?;
-        if instrument.halt.take().is_none() {
+        let Some(halt) = instrument.halt.take() else {
             return Err(ExchangeError::NotHalted(symbol));
+        };
+        let mut events = vec![Event::InstrumentChanged(symbol)];
+        if halt.kind == HaltKind::Luld {
+            instrument.recent.clear();
+            if !self.session.phase.is_call() {
+                self.uncross(symbol, now, &mut events);
+            }
+            if let Some(instrument) = self.instruments.get_mut(&symbol) {
+                instrument.recent.clear();
+                instrument.luld_anchor = instrument.last_price;
+            }
+            events.push(Event::InstrumentChanged(symbol));
+        } else {
+            instrument.reference_price = instrument.last_price.unwrap_or(instrument.reference_price);
         }
-        instrument.reference_price = instrument.last_price.unwrap_or(instrument.reference_price);
-        Ok(vec![Event::InstrumentChanged(symbol)])
+        Ok(events)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1120,7 +1175,7 @@ impl Exchange {
         let Some(instrument) = self.instruments.get(&symbol) else {
             return Ok(reject(self, format!("unknown symbol {symbol}")));
         };
-        if let Some(halt) = &instrument.halt {
+        if let Some(halt) = instrument.halt.as_ref().filter(|h| h.kind != HaltKind::Luld) {
             let reason = format!("{symbol} is halted: {}", halt.reason);
             return Ok(reject(self, reason));
         }
@@ -1128,7 +1183,8 @@ impl Exchange {
         if phase == MarketPhase::Closed {
             return Ok(reject(self, "market is closed".to_string()));
         }
-        if phase.is_call() && tif.is_immediate() && kind != OrderKind::Market {
+        let call = phase.is_call() || instrument.paused();
+        if call && tif.is_immediate() && kind != OrderKind::Market {
             return Ok(reject(
                 self,
                 format!(
@@ -1138,7 +1194,7 @@ impl Exchange {
                 ),
             ));
         }
-        if tif == TimeInForce::Auction && !phase.is_call() {
+        if tif == TimeInForce::Auction && !call {
             return Ok(reject(
                 self,
                 "auction-only orders are accepted during pre-open and the closing auction"
@@ -1184,13 +1240,13 @@ impl Exchange {
             (OrderKind::Market, Side::Buy) => (high, immediate),
             (OrderKind::Market, Side::Sell) => (low, immediate),
         };
-        let tif = if phase.is_call() && tif.is_immediate() {
+        let tif = if call && tif.is_immediate() {
             TimeInForce::Day
         } else {
             tif
         };
         let book = &instrument.book;
-        if options.post_only && !phase.is_call() && book.would_cross(side, price) {
+        if options.post_only && !call && book.would_cross(side, price) {
             return Ok(reject(
                 self,
                 "post-only order would take liquidity".to_string(),
@@ -1267,10 +1323,10 @@ impl Exchange {
             .into_iter()
             .collect();
 
-        let calling = self.session.phase.is_call();
         let Some(instrument) = self.instruments.get_mut(&symbol) else {
             return events;
         };
+        let calling = self.session.phase.is_call() || instrument.paused();
         let order = Order::new(order_id, owner_key(member, account), side, price, qty, now)
             .with_display(options.display_qty);
         if calling {
@@ -1310,6 +1366,7 @@ impl Exchange {
         events.push(Event::BookChanged(symbol));
         self.enforce_mmp(now, &mut events);
         self.check_circuit(symbol, &mut events, now);
+        self.check_luld(symbol, &mut events, now);
         events
     }
 
@@ -1607,7 +1664,36 @@ impl Exchange {
             "circuit breaker: {change:+.1}% vs reference {}",
             format_price(reference)
         );
-        if let Ok(halted) = self.halt(symbol, reason, Some(now + self.config.halt_cooldown_ms)) {
+        if let Ok(halted) = self.halt(symbol, reason, Some(now + self.config.halt_cooldown_ms), HaltKind::Circuit) {
+            events.extend(halted);
+        }
+    }
+
+    fn check_luld(&mut self, symbol: Symbol, events: &mut Vec<Event>, now: Timestamp) {
+        let (bps, window, pause) = (self.config.luld_bps, self.config.luld_window_ms, self.config.luld_pause_ms);
+        if bps == 0 {
+            return;
+        }
+        let Some(instrument) = self.instruments.get_mut(&symbol) else {
+            return;
+        };
+        if instrument.halt.is_some() {
+            return;
+        }
+        let (Some(last), Some(reference)) = (instrument.last_price, instrument.luld_reference(now, window)) else {
+            return;
+        };
+        let (low, high) = PriceBand { bps }.limits(reference);
+        if last >= low && last <= high {
+            return;
+        }
+        let change = (last as f64 / reference as f64 - 1.0) * 100.0;
+        let reason = format!(
+            "limit up-limit down pause: {change:+.1}% vs the {}-second average {}",
+            window / 1_000,
+            format_price(reference)
+        );
+        if let Ok(halted) = self.halt(symbol, reason, Some(now + pause), HaltKind::Luld) {
             events.extend(halted);
         }
     }
@@ -2758,6 +2844,74 @@ mod tests {
             m.ex.instrument_info(sym("ACME")).unwrap().reference_price,
             27_00
         );
+    }
+
+    #[test]
+    fn limit_up_limit_down_pauses_a_fast_move_and_resumes_without_rebasing_the_day() {
+        let mut m = market_with(ExchangeConfig::default());
+        let (lp, broker) = (m.lp, m.broker);
+        fn at(m: &mut Market, member: MemberId, account: AccountId, side: Side, price: Price, now: Timestamp) {
+            m.ex.execute(
+                &Command::NewOrder {
+                    member,
+                    member_order_id: 9,
+                    account,
+                    symbol: sym("ACME"),
+                    side,
+                    kind: OrderKind::Limit(price),
+                    options: OrderOptions::tif(TimeInForce::Gtc),
+                    qty: 10,
+                },
+                now,
+            )
+            .unwrap();
+        }
+        order(&mut m, lp, 4, Side::Buy, 25_00, 1_000);
+        for (i, price) in [25_00, 25_10, 24_95, 25_05, 24_98, 25_02].into_iter().enumerate() {
+            let now = 1_000 * (i as Timestamp + 1);
+            at(&mut m, lp, 4, Side::Buy, price, now);
+            at(&mut m, broker, 7, Side::Sell, price, now);
+        }
+        assert_eq!(m.ex.instrument_info(sym("ACME")).unwrap().status, InstrumentStatus::Trading, "normal moves trade on");
+        at(&mut m, lp, 4, Side::Sell, 26_40, 5_000);
+        at(&mut m, broker, 7, Side::Buy, 26_40, 5_000);
+        let info = m.ex.instrument_info(sym("ACME")).unwrap();
+        assert_eq!(info.status, InstrumentStatus::Paused, "a pause, not a halt");
+        assert!(info.halt_reason.contains("limit up-limit down") && info.halt_reason.contains("+5.6%"), "{}", info.halt_reason);
+        at(&mut m, lp, 4, Side::Sell, 26_00, 6_000);
+        at(&mut m, broker, 7, Side::Buy, 26_10, 6_000);
+        assert_eq!(m.ex.instrument_info(sym("ACME")).unwrap().last_price, Some(26_40), "orders are collected during the pause, not matched");
+        assert!(m.ex.due_commands(19_999).is_empty(), "the pause lasts its full length");
+        let due = m.ex.due_commands(20_000);
+        assert_eq!(due, [Command::Resume { symbol: sym("ACME") }]);
+        m.ex.execute(&due[0], 20_000).unwrap();
+        let info = m.ex.instrument_info(sym("ACME")).unwrap();
+        assert_eq!((info.status, info.reference_price), (InstrumentStatus::Trading, 25_00), "the day's reference stays");
+        assert!(matches!(info.last_price, Some(p) if (26_00..=26_10).contains(&p)), "the reopening auction crossed the collected orders: {:?}", info.last_price);
+        at(&mut m, lp, 4, Side::Sell, 26_30, 21_000);
+        at(&mut m, broker, 7, Side::Buy, 26_30, 21_000);
+        assert_eq!(m.ex.instrument_info(sym("ACME")).unwrap().status, InstrumentStatus::Trading, "the reopening price is the new reference");
+    }
+
+    #[test]
+    fn an_ipo_offering_closes_after_its_first_full_day_and_unsold_shares_stay_with_the_issuer() {
+        let mut m = market();
+        let broker = m.broker;
+        order(&mut m, broker, 7, Side::Buy, 25_00, 400);
+        assert!(m.ex.instrument(sym("ACME")).unwrap().book.best_ask() == Some(25_00), "600 unsold shares rest at the listing price");
+        let phase = |m: &mut Market, phase, now| m.ex.execute(&Command::SetPhase { phase }, now).unwrap();
+        phase(&mut m, MarketPhase::Closed, 10);
+        let first = phase(&mut m, MarketPhase::PreOpen, 20);
+        assert!(reports_for(&first, broker).iter().all(|r| r.status != OrderStatus::Cancelled), "the offering stays open through the first day");
+        phase(&mut m, MarketPhase::Open, 30);
+        phase(&mut m, MarketPhase::Closed, 40);
+        let second = phase(&mut m, MarketPhase::PreOpen, 50);
+        let closed = reports_for(&second, broker);
+        assert!(
+            closed.iter().any(|r| r.status == OrderStatus::Cancelled && r.reason.contains("IPO offering closed") && r.leaves == 0),
+            "{closed:?}"
+        );
+        assert_eq!(m.ex.instrument(sym("ACME")).unwrap().book.best_ask(), None, "no unsold IPO wall left at the listing price");
     }
 
     #[test]
