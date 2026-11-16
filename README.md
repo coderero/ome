@@ -15,6 +15,8 @@ OME_RECORD=1 scripts/demo.sh --fresh   # also record the market into them
 scripts/llm.sh up             # Ollama with qwen2.5:1.5b (GPU when the NVIDIA runtime is installed); the newsroom then writes with it
 ```
 
+On a Mac, with or without Docker, follow [docs/macos.md](docs/macos.md).
+
 ```bash
 ome exchange members                                                          # who is connected
 ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw buy ACME mkt 5
