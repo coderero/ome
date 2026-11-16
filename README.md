@@ -79,7 +79,7 @@ crates/
 ├── ome-newsroom   news vendor: company fundamentals, economy, earnings and news feed (lib + `ome-newsroom`)
 ├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
-├── ui/ome-ui-kit  GPUI components: bundled fonts, theme, chart with studies, ladder, inputs, tables, dialogs
+├── ui/ome-ui      egui kit: bundled Open Sans, dark/light theme, tables, section strips, widgets, toasts, candle chart
 ├── ui/ome-ui-data data layer for the apps: broker link thread and the market/account/news store
 ├── ui/apps/ome-retail   OME Trader, the retail client's desktop platform
 └── ome-agents     trading firms from config/roster.conf: HFT, DMM, quant, pension, prop, retail personas
@@ -416,27 +416,67 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw news 5
 
 In a test run the newsroom published a hot CPI print (-56 bps on fair values), a rate hold, a Zen Biotech takeover rumour and a Zen earnings miss (0.63 vs 0.65, -63 bps); after a kill -9 it came back at the same day and story count, and an injected lawsuit (-199 bps on ACME) reached the brokers' clients with no duplicates.
 
-## Desktop Apps (GPUI)
+## Desktop Apps
 
-The desktop apps are built with GPUI (the community fork `gpui-ce`, since Zed's crates.io release no longer builds with current `libc`). There is one app per party, sharing `ome-ui-kit` (visual components, no networking) and `ome-ui-data` (connections and state, no drawing). Fonts are bundled: Inter for text and JetBrains Mono for numbers ship inside `ome-ui-kit/fonts` with their SIL Open Font Licence files and are compiled into every app, so nothing depends on installed fonts. Linux builds need `fontconfig-devel` and `libxkbcommon-x11-devel`.
+The desktop apps are written in pure Rust with [egui](https://github.com/emilk/egui) (eframe, egui_extras tables and egui_dock workspaces). There is one app per party. They share `ome-ui`, which handles the look: theme, bundled font, tables, collapsible sections, widgets, toasts and the candle chart. They also share `ome-ui-data`, which handles connections and state and draws nothing. Open Sans (regular and bold, Apache-2.0, licence file in `ome-ui/fonts`) is compiled into every app, so nothing depends on installed fonts.
+
+The look follows professional broker platforms such as thinkorswim:
+- regular-weight labels with bold values, on a pure black background;
+- grey strips for collapsible sections and gadget headers, and thin row lines, with almost no outlines;
+- main tabs whose gadgets can be docked side by side, and a sidebar of gadgets;
+- solid green and orange cells for ticks.
+
+A light theme is available too. A unit test checks text contrast (at least 4.5:1) in both themes.
 
 ```bash
 OME_RECORD=1 scripts/demo.sh --fresh       # with the recorder, brokers serve chart history from PostgreSQL
 cargo run --release -p ome-retail          # log in as alice / alice-pw at 127.0.0.1:7101
-cargo run --release -p ome-retail -- --user alice --secret alice-pw --tab charts --interval 60   # scripted start
+cargo run --release -p ome-retail -- --user alice --secret alice-pw --interval 60   # scripted start, 1m candles
 ```
 
-**OME Trader (`ome-retail`)** is the retail client's platform, laid out like a full broker desktop platform:
+**OME Trader (`ome-retail`)** is the retail client's platform:
 
-- **Login**: broker address, login ID and a masked password; a refused login says why, the broker address and login ID are remembered (`~/.config/ome/retail.conf`), the password never is; Log out returns here.
-- **Header**: account, net liquidating value, cash, buying power, day P/L, open P/L, unsettled cash, market session with a countdown.
-- **Sidebar gadgets**: watchlist (last, net and % change, ticks flash green/red, halts marked), time and sales with the venue of every print, live news.
-- **Trade**: quote header (last, change, bid × size, ask × size, volume, open/high/low, VWAP, status); the Active Trader ladder (volume at price, your buy orders, bid size, price, ask size, your sell orders): click a bid or ask size to place a limit there, drag your order to another price to move it or onto itself to cancel it, click a price to load it into the ticket; Level II; order entry (side, typed quantity, market/limit/stop/bracket, typed price with steppers and bid/ask fill, DAY/GTC, bracket target and stop %) with **Confirm and Send**, which opens an order confirmation priced by the broker's own fee engine (brokerage, exchange fee, taxes, GST, cash effect, buying power after); working orders and armed conditionals with Cancel. Confirmation can be switched to auto send on the ladder.
-- **Monitor**: account info, position statement (quantity, average trade price, mark, change, P/L open, P/L %, P/L day, value, unsettled) with totals, and activity: working orders and conditions, fills with charges, cancelled and rejected orders with the reason.
-- **Charts**: 1s to 15m candles (1m and longer load history from PostgreSQL through the broker), volume, VWAP, SMA 20, EMA 50, crosshair with an OHLCV readout, scroll to zoom.
-- **News**: every story with tone and fair-value impact, and a reader with the structured numbers.
+- **Login**: login ID and password (with Show), "Remember login ID", and the broker address under Connection. A refused login says why. The broker address and, if asked, the login ID are remembered in `~/.config/ome/retail.conf`; the password never is.
+- **Status strip** and **balances strip**: connection and data state, date and bold UTC time, the account box, the market phase with a countdown, then Stock BP, Net Liq, Cash, Unsettled, Day P/L and P/L Open. On the right are Shortcuts, Setup and Log out.
+- **Workspaces**: Monitor, Trade, Charts and MarketWatch each hold a dock of gadgets.
+  - Drag a gadget's tab to stack it, put it side by side, or split the area. The `+` on a tab bar adds a gadget there, and `×` closes one.
+  - Trade opens with the chart beside order entry and the ladder. `Layout` also has trading layouts: ladder beside chart; watchlist, chart and ladder; and ladder, chart, Level II and Time & Sales.
+  - `Layout` adds any gadget to the current tab, builds a chart grid (1, 2 side by side, or 2 × 2 with different timeframes), detaches a gadget into its own OS window (closing that window docks it back), or resets the tab.
+  - Gadgets: Activity and Positions, Account Statement, All Products, Active Trader, Chart, Level II, Time & Sales, Watchlist, Quote Board, News.
+- **Symbol links**: every gadget has a colour link (the `S` chip in its header, or right-click its tab). Gadgets with the same colour show the same symbol; the sidebar watchlist drives red.
+- **Sidebar** (resizable; ◀ hides it): Account Info, Watchlist, Quote Details and Live News. Add gadgets with `+` in the footer; each gadget's ☰ menu moves it up or down or removes it.
+- **Watchlist**: the Last cell is filled green on an uptick and red on a downtick, and Net Chng is filled green or red. Click a row to switch symbol.
+- **Monitor**:
+  - *Activity and Positions*: Working, Filled and Cancelled Orders, with each row tinted by side. The Position Statement shows overall totals, account status and available dollars, with Square off per position and Square off all.
+  - *Account Statement*: Cash Balance, Trade History with every charge, Profits and Losses, and an Account Summary.
+  - Every table's gear (⚙) chooses its columns.
+- **Trade**:
+  - *All Products*: a quote header, the Order Entry row with **Confirm and Send**, and Level II beside Time & Sales.
+  - *Active Trader*: the price ladder with Buy MKT, Sell MKT, **Flatten** and Cancel orders.
+- **Charts**: 1s to 15m candles (1m and longer load history from PostgreSQL), volume, VWAP, SMA 20 and EMA 50, and a crosshair with an OHLCV readout.
+  - Drag the time axis to compress or expand bars, and drag the price axis to rescale ("manual" appears).
+  - Drag the chart to pan back in time, scroll to zoom, and double-click to reset (double-click the price axis to go back to auto scale).
+  - Bars keep their width, with a right margin after the last bar.
+- **Order confirmation**: the order priced by the broker's own fee engine (brokerage, exchange fee, taxes, GST, cash effect and buying power after). It can be turned off in Setup; orders and ladder clicks then go out at once.
+- **Square off and Flatten**: a confirmation lists each symbol, the quantity, the bid and the estimated proceeds, and how many working orders and armed conditionals are cancelled first. As soon as no sell order still holds the shares, the whole position is sold at market. A symbol that is already being squared off is never sold twice.
+- **Setup** (`Ctrl+,`): dark or light theme, text size (90-125%), order confirmation on or off, default quantity and default time in force.
+- **Remembered per login**: every tab's dock layout, chart grids, link colours, detached windows, sidebar gadgets and their order, folded sections and hidden columns.
 
-Keys: `F1`-`F4` tabs, `↑` `↓` symbol, `B` / `S` open the ticket as a buy or sell, `Enter` confirms, `Esc` cancels, `C` recenters the ladder; letters are ignored while typing in a field.
+Keys: `B` / `S` review a buy or sell, `Enter` sends the order under review, `Esc` closes dialogs, `↑` `↓` change symbol, `C` recenters the ladder, `Ctrl+1`…`4` switch between Monitor, Trade, Charts and MarketWatch, and `?` or `F1` shows all shortcuts. Right-click a tab for its link colour and detach.
+
+The GUI is tested headless with `egui_kittest`. The tests click and type through the AccessKit tree against a fake broker session and render wgpu snapshots into `crates/ui/apps/ome-retail/tests/snapshots`. They cover:
+- login validation and refusal;
+- an order reviewed with charges, sent and filled;
+- square off of one position and of all positions, including the wait for a working sell to cancel;
+- Flatten on the ladder;
+- Setup;
+- docking, chart grids, adding and detaching gadgets, and the remembered layout;
+- link groups;
+- sidebar gadgets;
+- column choosers;
+- the shortcut overlay.
+
+Run `UPDATE_SNAPSHOTS=1 cargo test -p ome-retail` after a visual change and look at the PNGs.
 
 ## Storage: PostgreSQL and Redis
 
@@ -466,6 +506,8 @@ scripts/db.sh redis SUBSCRIBE ome:trades
 
 ## IPO Flow
 
+Today a listing is a single ops command that offers the whole issue at one price (a filed prospectus is required when the exchange runs with `--require-prospectus`). A full primary market (issuer onboarding, listing-desk approval, book-building with fund blocking, pricing, allotment with refunds, listing auction) is planned; see the roadmap.
+
 ```
 ome broker --addr <prime> create-account acme_ir <secret> issuer 0      →  account 3
 ome exchange ipo ACME 25.00 20000 prime-co 3 Acme Robotics          (needs a filed prospectus with --require-prospectus)
@@ -476,19 +518,26 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 249 tests
+cargo test --workspace     # 266 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
 
 ## Roadmap
 
-- **1f** ~~broker-held orders, broker risk controls, algorithmic orders (TWAP, VWAP, POV, iceberg slicer)~~ done
-- **1g** ~~off-exchange execution: internalization, tape reporting, wholesaler with PFOF, dark pool, market stats, designated market makers~~ done
-- **1h** ~~PostgreSQL (accounts, trades, settlements) and Redis (market data)~~ done
-- **2** ~~tiered agents (HFT, DMM, quant, pension, prop, rule-based and ML retail), simulation control plane with scenarios and record/replay~~ done
-- **3** ~~newsroom: fundamentals, economy, earnings and news feed, news-driven agents, prospectus-gated listings, recorded news, local-LLM writer~~ done
-- **4** GPUI desktop apps, one per party: ~~UI kit, data layer, retail platform with login and chart history (4a, 4b)~~ done; institutional terminal, HFT monitor, LP desk (4c); operator apps, simulation control, issuer portal (4d)
+Done:
+- **1** market structure: exchange, providers, clearing, sessions and auctions, exchange order types and member controls, broker-held orders, risk controls, algos, off-exchange execution, PostgreSQL/Redis recording
+- **2** tiered agents (HFT, DMM, quant, pension, prop, rule-based and ML retail), simulation control plane with scenarios and record/replay
+- **3** newsroom: fundamentals, economy, earnings and news feed, news-driven agents, prospectus-gated listings, recorded news, local-LLM writer
+- **4** desktop prototype: UI kit, data layer, retail app with login and chart history (GPUI, replaced in 5a)
+- **5a** egui platform in the thinkorswim style: docked gadget workspaces, detachable windows, link colours, customisable sidebar and columns, draggable chart axes, setup, square off, headless GUI tests
+
+Planned (open decisions first: IPO allotment rules, admin identity, warm-up history, short selling):
+- **5b-5c** market data v3 (server-side candles, history service, warm-up, charts with indicators, drawings and order/fill/news markers); retail platform with a full OMS (blotter, order detail timeline, cancel/replace, more order types, position actions, cash ledger and funds requests, statements, alerts, watchlists, scanner, company pages)
+- **6** primary market: issuer portal and organisation onboarding, prospectus filing and listing-desk review, book-building with fund blocking and live subscription, pricing, allotment with lottery and refunds, listing-day auction, agents bidding, news coverage
+- **7** back office: named admin users with roles, maker-checker and audit trail; broker desk (KYC, cash and share approvals, freezes and bans, limits); exchange ops console and clearing desk (member and listing approvals, halts, surveillance, collateral and defaults)
+- **8** institutional: OMS/EMS terminal (staging, baskets, pre-trade compliance, allocations, algo ticket with amend/pause), pre-trade cost and TCA, portfolio risk and an OME index, short selling and margin, HFT monitor, LP/DMM desk
+- **9** simulation control app and polish
 
 ## License
 

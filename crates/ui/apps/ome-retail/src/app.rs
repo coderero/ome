@@ -1,95 +1,26 @@
 use crate::prefs::Prefs;
+use crate::session::{Connection, Connector};
 use crate::ticket::{Kind, OrderForm, Quote, describe, priced};
-use gpui::{
-    Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton, Pixels, Point, Task, Window,
-    actions, div, prelude::*,
-};
-use gpui_elements::editable_text::EditableTextState;
-use gpui_elements::editable_text::actions::{Enter as FieldEnter, Tab as FieldTab};
+use crate::view::{Link, Saved, View};
 use ome_core::price::{Price, format_price};
 use ome_core::symbol::Symbol;
 use ome_core::types::Side;
-use ome_protocol::{ClientMessage, ServerMessage};
-use ome_ui_data::{
-    BrokerLink, Credentials, LinkUpdate, MarketData, MarketStore, OrderEntry, OrderRequest,
-};
-use ome_ui_kit::Theme;
-use ome_ui_kit::chart::Studies;
-use ome_ui_kit::input::{focus, plain_state, secret_state};
-use std::cell::RefCell;
+use ome_protocol::{ClientMessage, ConditionalStatus, OrderStatus, ServerMessage};
+use ome_ui::Theme;
+use std::path::PathBuf;
+use ome_ui::chart::Studies;
+use ome_ui::toast::{Level, Toasts};
+use ome_ui_data::{Credentials, LinkUpdate, MarketData, MarketStore, OrderRequest};
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-pub const CONTEXT: &str = "Retail";
-const KEYS: &str = "Retail && !EditableText";
-pub const FLASH: Duration = Duration::from_millis(600);
-
-actions!(
-    retail,
-    [
-        BuyKey,
-        SellKey,
-        NextSymbol,
-        PreviousSymbol,
-        ShowMonitor,
-        ShowTrade,
-        ShowCharts,
-        ShowNews,
-        Confirm,
-        Dismiss,
-        Recenter
-    ]
-);
-
-pub fn bind_keys(cx: &mut gpui::App) {
-    cx.bind_keys(
-        ome_ui_kit::input::default_bindings()
-            .as_keybindings(Some(ome_ui_kit::input::DEFAULT_INPUT_CONTEXT)),
-    );
-    let k = Some(KEYS);
-    let c = Some(CONTEXT);
-    cx.bind_keys([
-        KeyBinding::new("b", BuyKey, k),
-        KeyBinding::new("s", SellKey, k),
-        KeyBinding::new("down", NextSymbol, k),
-        KeyBinding::new("up", PreviousSymbol, k),
-        KeyBinding::new("c", Recenter, k),
-        KeyBinding::new("enter", Confirm, k),
-        KeyBinding::new("f1", ShowMonitor, c),
-        KeyBinding::new("f2", ShowTrade, c),
-        KeyBinding::new("f3", ShowCharts, c),
-        KeyBinding::new("f4", ShowNews, c),
-        KeyBinding::new("escape", Dismiss, c),
-    ]);
-}
+pub const FLASH: Duration = Duration::from_millis(700);
+pub const SQUARE_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Login,
     Trading,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Monitor,
-    Trade,
-    Charts,
-    News,
-}
-
-impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Monitor, Tab::Trade, Tab::Charts, Tab::News];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Tab::Monitor => "Monitor",
-            Tab::Trade => "Trade",
-            Tab::Charts => "Charts",
-            Tab::News => "News",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,259 +38,264 @@ pub struct Drag {
     pub price: Price,
 }
 
-pub struct Fields {
-    pub qty: Entity<EditableTextState>,
-    pub price: Entity<EditableTextState>,
-    pub target: Entity<EditableTextState>,
-    pub stop: Entity<EditableTextState>,
-}
-
-pub struct LoginForm {
-    pub broker: Entity<EditableTextState>,
-    pub user: Entity<EditableTextState>,
-    pub secret: Rc<RefCell<String>>,
-    pub secret_field: Entity<EditableTextState>,
+#[derive(Default)]
+pub struct Login {
+    pub broker: String,
+    pub user: String,
+    pub password: String,
     pub error: Option<String>,
     pub connecting: bool,
+    pub reveal: bool,
+    pub remember: bool,
+    pub advanced: bool,
 }
 
-pub struct RetailApp {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    One(Symbol),
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsDraft {
+    pub mode: ome_ui::theme::Mode,
+    pub scale: u32,
+    pub confirm: bool,
+    pub qty: String,
+    pub tif: ome_core::types::TimeInForce,
+    pub error: Option<String>,
+}
+
+pub struct Core {
     pub theme: Theme,
     pub prefs: Prefs,
+    pub prefs_file: Option<PathBuf>,
+    pub restyle: bool,
+    pub settings: Option<SettingsDraft>,
+    pub square_confirm: Option<Scope>,
+    pub squaring: Vec<(Symbol, Instant)>,
+    pub squared: Vec<(Symbol, Instant)>,
     pub screen: Screen,
-    pub login: LoginForm,
+    pub login: Login,
+    connector: Connector,
+    pub conn: Option<Connection>,
     pub store: MarketStore,
-    pub link: Option<BrokerLink>,
-    updates: Option<Receiver<LinkUpdate>>,
     pub user: String,
     pub selected: Option<Symbol>,
-    pub tab: Tab,
-    pub activity: usize,
     pub form: OrderForm,
     pub form_error: Option<String>,
-    pub fields: Fields,
     pub pending: Option<Pending>,
-    pub auto_send: bool,
-    pub ladder_center: Option<Price>,
-    pub drag: Option<Drag>,
+    pub toasts: Toasts,
+    pub ladder_centers: HashMap<Symbol, Price>,
+    pub groups: HashMap<Link, Symbol>,
+    pub link: Link,
+    pub form_symbol: Option<Symbol>,
     pub interval: u64,
     pub studies: Studies,
-    pub slot: f32,
-    pub hover: Option<Point<Pixels>>,
+    pub chart_views: HashMap<u32, ome_ui::chart::ChartView>,
+    pub view: View,
     pub news_selected: Option<u64>,
-    price_pending: bool,
+    pub show_shortcuts: bool,
     pub flashes: HashMap<Symbol, (bool, Instant)>,
     seen: HashMap<Symbol, Price>,
     requested: HashSet<(Symbol, u64)>,
-    focus: FocusHandle,
-    _pump: Task<()>,
+    price_pending: bool,
 }
 
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-impl RetailApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let prefs = Prefs::load();
-        let secret = Rc::new(RefCell::new(String::new()));
-        let login = LoginForm {
-            broker: plain_state(&prefs.broker, cx),
-            user: plain_state(&prefs.user, cx),
-            secret_field: secret_state(secret.clone(), cx),
-            secret,
-            error: None,
-            connecting: false,
+impl Core {
+    pub fn new(prefs: Prefs, prefs_file: Option<PathBuf>, connector: Connector) -> Self {
+        let form = OrderForm {
+            qty: prefs.qty.to_string(),
+            tif: prefs.tif,
+            ..OrderForm::default()
         };
-        let form = OrderForm::default();
-        let fields = Fields {
-            qty: plain_state(&form.qty, cx),
-            price: plain_state(&form.price, cx),
-            target: plain_state(&form.target_pct, cx),
-            stop: plain_state(&form.stop_pct, cx),
-        };
-        let focus_handle = cx.focus_handle();
-        if prefs.user.is_empty() {
-            focus(&login.user, window, cx);
-        } else {
-            focus(&login.secret_field, window, cx);
-        }
-        let pump = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(40))
-                    .await;
-                if this.update(cx, |app, cx| app.pump(cx)).is_err() {
-                    break;
-                }
-            }
-        });
         Self {
-            theme: Theme::dark(),
+            theme: Theme::of(prefs.mode),
+            prefs_file,
+            restyle: true,
+            settings: None,
+            square_confirm: None,
+            squaring: Vec::new(),
+            squared: Vec::new(),
+            login: Login {
+                broker: prefs.broker.clone(),
+                user: prefs.user.clone(),
+                remember: prefs.remember,
+                ..Login::default()
+            },
             prefs,
             screen: Screen::Login,
-            login,
+            connector,
+            conn: None,
             store: MarketStore::default(),
-            link: None,
-            updates: None,
             user: String::new(),
             selected: None,
-            tab: Tab::Trade,
-            activity: 0,
             form,
             form_error: None,
-            fields,
             pending: None,
-            auto_send: false,
-            ladder_center: None,
-            drag: None,
+            toasts: Toasts::default(),
+            ladder_centers: HashMap::new(),
+            groups: HashMap::new(),
+            link: Link::Red,
+            form_symbol: None,
             interval: 1_000,
             studies: Studies::default(),
-            slot: 8.0,
-            hover: None,
+            chart_views: HashMap::new(),
+            view: View::default(),
             news_selected: None,
-            price_pending: false,
+            show_shortcuts: false,
             flashes: HashMap::new(),
             seen: HashMap::new(),
             requested: HashSet::new(),
-            focus: focus_handle,
-            _pump: pump,
+            price_pending: false,
         }
     }
 
-    pub fn log_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn log_in(&mut self) {
         if self.login.connecting {
             return;
         }
-        let broker = self.login.broker.read(cx).as_str().trim().to_string();
-        let user = self.login.user.read(cx).as_str().trim().to_string();
-        let secret = self.login.secret.borrow().clone();
-        if broker.is_empty() || user.is_empty() || secret.is_empty() {
-            self.login.error =
-                Some("Enter the broker address, your username and your password.".into());
-            cx.notify();
+        let broker = self.login.broker.trim().to_string();
+        let user = self.login.user.trim().to_string();
+        if broker.is_empty() || user.is_empty() || self.login.password.is_empty() {
+            self.login.error = Some("Enter the broker address, your login ID and your password.".into());
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        self.link = Some(BrokerLink::start(
-            Credentials {
-                addr: broker.clone(),
-                user: user.clone(),
-                secret,
-            },
-            tx,
-        ));
-        self.updates = Some(rx);
-        self.login
-            .secret_field
-            .update(cx, |s, cx| s.emplace("", cx));
-        self.login.secret.borrow_mut().clear();
-        self.prefs = Prefs {
-            broker,
+        let secret = std::mem::take(&mut self.login.password);
+        self.conn = Some((self.connector)(Credentials {
+            addr: broker.clone(),
             user: user.clone(),
-        };
+            secret,
+        }));
+        self.prefs.broker = broker;
+        self.prefs.remember = self.login.remember;
+        self.prefs.user = if self.login.remember { user.clone() } else { String::new() };
         self.user = user;
         self.login.error = None;
         self.login.connecting = true;
-        window.focus(&self.focus, cx);
-        cx.notify();
     }
 
-    pub fn log_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.link = None;
-        self.updates = None;
+    pub fn log_out(&mut self) {
+        self.conn = None;
         self.store = MarketStore::default();
         self.screen = Screen::Login;
         self.selected = None;
+        self.groups.clear();
+        self.form_symbol = None;
         self.pending = None;
+        self.square_confirm = None;
+        self.squaring.clear();
+        self.squared.clear();
+        self.settings = None;
         self.requested.clear();
         self.seen.clear();
         self.flashes.clear();
         self.login.connecting = false;
-        self.login.secret.borrow_mut().clear();
-        self.login
-            .secret_field
-            .update(cx, |s, cx| s.emplace("", cx));
-        focus(&self.login.secret_field, window, cx);
-        cx.notify();
+        self.login.password.clear();
     }
 
-    fn pump(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
-        let mut stop = None;
-        if let Some(updates) = &self.updates {
-            while let Ok(update) = updates.try_recv() {
-                changed = true;
-                match update {
-                    LinkUpdate::Message(message) => {
-                        if matches!(message, ServerMessage::LogonAck { .. }) {
-                            self.screen = Screen::Trading;
-                            self.login.connecting = false;
-                            self.prefs.save();
-                        }
-                        self.store.apply(message);
+    pub fn pump(&mut self, now_ms: u64) -> bool {
+        let mut updates = Vec::new();
+        if let Some(conn) = &self.conn {
+            while let Ok(update) = conn.updates.try_recv() {
+                updates.push(update);
+            }
+        }
+        let changed = !updates.is_empty();
+        for update in updates {
+            match update {
+                LinkUpdate::Message(message) => {
+                    if matches!(message, ServerMessage::LogonAck { .. }) {
+                        self.screen = Screen::Trading;
+                        self.login.connecting = false;
+                        self.prefs.save(self.prefs_file.as_deref());
                     }
-                    LinkUpdate::Down(reason) => {
-                        if self.screen == Screen::Login {
-                            stop = Some(format!("Cannot reach the broker ({reason})."));
-                            break;
-                        }
-                        self.store.disconnected();
+                    if self.screen == Screen::Trading {
+                        self.notify(&message);
                     }
-                    LinkUpdate::Rejected(reason) => {
-                        stop = Some(format!("Login refused: {reason}."));
-                        break;
+                    self.store.apply(message);
+                }
+                LinkUpdate::Down(reason) => {
+                    if self.screen == Screen::Login {
+                        self.fail(format!("Cannot reach the broker ({reason})."));
+                        return true;
                     }
+                    self.store.disconnected();
+                    self.toasts.push(Level::Bad, "Connection lost", "Reconnecting to the broker…");
+                }
+                LinkUpdate::Rejected(reason) => {
+                    self.fail(format!("Login refused: {reason}."));
+                    return true;
                 }
             }
         }
-        if let Some(reason) = stop {
-            self.link = None;
-            self.updates = None;
-            self.login.connecting = false;
-            self.login.error = Some(reason);
-            self.screen = Screen::Login;
-        }
         if self.screen == Screen::Trading {
-            self.store.roll(now_ms());
+            self.store.roll(now_ms.max(self.store.now));
             if self.selected.is_none()
                 && let Some(first) = self.store.symbols().first().copied()
             {
-                self.select(first, cx);
+                self.select(first);
             }
-            self.track_flashes();
             if self.price_pending {
-                self.fill_from_book(cx);
+                self.fill_from_book();
             }
+            self.release_squares();
+            self.track_flashes();
         }
-        let flashing = self.flashes.values().any(|(_, at)| at.elapsed() < FLASH);
-        if changed || flashing {
-            cx.notify();
+        changed
+    }
+
+    fn fail(&mut self, reason: String) {
+        self.conn = None;
+        self.login.connecting = false;
+        self.login.error = Some(reason);
+        self.screen = Screen::Login;
+    }
+
+    fn notify(&mut self, message: &ServerMessage) {
+        let verb = |side: Side| if side == Side::Buy { "Bought" } else { "Sold" };
+        match message {
+            ServerMessage::Execution(r) if r.last_qty > 0 => {
+                let done = if r.status == OrderStatus::Filled { "filled" } else { "partially filled" };
+                self.toasts.push(
+                    Level::Good,
+                    format!("{} {} {} at {}", verb(r.side), r.last_qty, r.symbol, format_price(r.last_price)),
+                    format!("Order #{} {done}, {} of {}", r.order_id, r.filled, r.qty),
+                );
+            }
+            ServerMessage::Execution(r) if r.status == OrderStatus::Rejected => {
+                self.toasts.push(Level::Bad, format!("Order rejected · {}", r.symbol), r.reason.clone());
+            }
+            ServerMessage::ConditionalUpdate(c) if c.status == ConditionalStatus::Triggered => {
+                self.toasts.push(Level::Info, format!("Conditional triggered · {}", c.symbol), c.trigger.describe());
+            }
+            ServerMessage::ConditionalUpdate(c) if c.status == ConditionalStatus::Rejected => {
+                self.toasts.push(Level::Bad, format!("Conditional rejected · {}", c.symbol), c.reason.clone());
+            }
+            ServerMessage::Reject { reason, .. } => {
+                self.toasts.push(Level::Bad, "Request refused", reason.clone());
+            }
+            _ => {}
         }
     }
 
     fn track_flashes(&mut self) {
         for symbol in self.store.symbols() {
-            let Some(last) = self.store.last(symbol) else {
-                continue;
-            };
+            let Some(last) = self.store.last(symbol) else { continue };
             if let Some(previous) = self.seen.insert(symbol, last)
                 && previous != last
             {
-                self.flashes
-                    .insert(symbol, (last > previous, Instant::now()));
+                self.flashes.insert(symbol, (last > previous, Instant::now()));
             }
         }
     }
 
-    pub fn flash(&self, symbol: Symbol) -> Option<bool> {
-        self.flashes
-            .get(&symbol)
-            .filter(|(_, at)| at.elapsed() < FLASH)
-            .map(|(up, _)| *up)
+    pub fn tick(&self, symbol: Symbol) -> Option<bool> {
+        self.flashes.get(&symbol).map(|(up, _)| *up)
+    }
+
+    pub fn flashing(&self) -> bool {
+        self.flashes.values().any(|(_, at)| at.elapsed() < FLASH)
     }
 
     pub fn quote(&self, symbol: Symbol) -> Quote {
@@ -371,30 +307,25 @@ impl RetailApp {
         }
     }
 
-    pub fn select(&mut self, symbol: Symbol, cx: &mut Context<Self>) {
+    pub fn select(&mut self, symbol: Symbol) {
         self.selected = Some(symbol);
-        self.ladder_center = None;
+        self.ladder_centers.remove(&symbol);
         self.price_pending = true;
-        self.fill_from_book(cx);
+        self.fill_from_book();
         self.request_history();
-        cx.notify();
     }
 
-    fn fill_from_book(&mut self, cx: &mut Context<Self>) {
-        let Some(symbol) = self.selected else {
-            return;
-        };
+    fn fill_from_book(&mut self) {
+        let Some(symbol) = self.selected else { return };
         let quote = self.quote(symbol);
         if quote.bid.is_none() && quote.ask.is_none() && !self.form.price.is_empty() {
             return;
         }
         self.form.fill_price(quote);
-        let price = self.form.price.clone();
-        self.fields.price.update(cx, |s, cx| s.emplace(&price, cx));
         self.price_pending = quote.bid.is_none() && quote.ask.is_none();
     }
 
-    pub fn step_symbol(&mut self, delta: i64, cx: &mut Context<Self>) {
+    pub fn step_symbol(&mut self, delta: i64) {
         let symbols = self.store.symbols();
         if symbols.is_empty() {
             return;
@@ -403,16 +334,13 @@ impl RetailApp {
             .selected
             .and_then(|s| symbols.iter().position(|x| *x == s))
             .unwrap_or(0) as i64;
-        let next = (at + delta).rem_euclid(symbols.len() as i64) as usize;
-        self.select(symbols[next], cx);
+        self.select(symbols[(at + delta).rem_euclid(symbols.len() as i64) as usize]);
     }
 
     pub fn request_history(&mut self) {
-        let (Some(symbol), Some(link)) = (self.selected, &self.link) else {
-            return;
-        };
+        let (Some(symbol), Some(conn)) = (self.selected, &self.conn) else { return };
         if self.interval >= 60_000 && self.requested.insert((symbol, self.interval)) {
-            link.query(ClientMessage::QueryHistory {
+            conn.session.query(ClientMessage::QueryHistory {
                 symbol,
                 interval_ms: self.interval,
                 limit: 600,
@@ -420,67 +348,38 @@ impl RetailApp {
         }
     }
 
-    pub fn set_interval(&mut self, interval: u64, cx: &mut Context<Self>) {
-        self.interval = interval;
-        self.request_history();
-        cx.notify();
-    }
-
-    pub fn set_price(&mut self, price: Price, cx: &mut Context<Self>) {
+    pub fn set_price(&mut self, price: Price) {
         self.form.price = format_price(price);
-        let text = self.form.price.clone();
-        self.fields.price.update(cx, |s, cx| s.emplace(&text, cx));
-        cx.notify();
     }
 
-    pub fn sync_form(&mut self, cx: &mut Context<Self>) {
-        self.form.qty = self.fields.qty.read(cx).as_str().to_string();
-        self.form.price = self.fields.price.read(cx).as_str().to_string();
-        self.form.target_pct = self.fields.target.read(cx).as_str().to_string();
-        self.form.stop_pct = self.fields.stop.read(cx).as_str().to_string();
-    }
-
-    pub fn open_ticket(&mut self, side: Option<Side>, cx: &mut Context<Self>) {
-        self.sync_form(cx);
+    pub fn review(&mut self, side: Option<Side>) {
         if let Some(side) = side {
             self.form.side = side;
         }
-        let Some(symbol) = self.selected else {
-            return;
-        };
+        let Some(symbol) = self.selected else { return };
         match self.form.build(symbol) {
             Ok(request) => {
                 self.form_error = None;
-                self.stage(request, cx);
+                self.stage(request);
             }
-            Err(e) => {
-                self.form_error = Some(e);
-                cx.notify();
-            }
+            Err(e) => self.form_error = Some(e),
         }
     }
 
-    pub fn stage(&mut self, request: OrderRequest, cx: &mut Context<Self>) {
-        let Some(symbol) = self.selected else {
-            return;
-        };
-        if self.auto_send {
-            self.send(request, cx);
-            return;
-        }
+    pub fn stage(&mut self, request: OrderRequest) {
+        let Some(symbol) = self.selected else { return };
         let Some((side, qty, price)) = priced(&request, self.quote(symbol)) else {
             self.form_error = Some("No price yet for this symbol.".into());
-            cx.notify();
             return;
         };
+        if !self.prefs.confirm {
+            self.submit(request);
+            self.toasts.push(Level::Info, "Order sent", describe(&request));
+            return;
+        }
         self.store.estimate = None;
-        if let Some(link) = &self.link {
-            link.query(ClientMessage::EstimateCharges {
-                symbol,
-                side,
-                qty,
-                price,
-            });
+        if let Some(conn) = &self.conn {
+            conn.session.query(ClientMessage::EstimateCharges { symbol, side, qty, price });
         }
         self.pending = Some(Pending {
             text: describe(&request),
@@ -489,215 +388,164 @@ impl RetailApp {
             qty,
             price,
         });
-        cx.notify();
     }
 
-    pub fn send(&mut self, request: OrderRequest, cx: &mut Context<Self>) {
-        if let Some(link) = &self.link {
-            link.submit(request);
-        }
-        self.pending = None;
-        cx.notify();
-    }
-
-    pub fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.screen {
-            Screen::Login => self.log_in(window, cx),
-            Screen::Trading => match self.pending.take() {
-                Some(pending) => self.send(pending.request, cx),
-                None => self.open_ticket(None, cx),
-            },
+    pub fn send_pending(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.submit(pending.request);
+            self.toasts.push(Level::Info, "Order sent", pending.text);
         }
     }
 
-    pub fn ladder_order(&mut self, side: Side, price: Price, cx: &mut Context<Self>) {
-        let Some(symbol) = self.selected else {
-            return;
-        };
-        self.sync_form(cx);
+    pub fn submit(&mut self, request: OrderRequest) {
+        if let Some(conn) = &self.conn {
+            conn.session.submit(request);
+        }
+    }
+
+    pub fn ladder_order(&mut self, side: Side, price: Price) {
+        let Some(symbol) = self.selected else { return };
         match self.form.qty() {
-            Ok(qty) => self.stage(
-                OrderRequest::Limit {
-                    symbol,
-                    side,
-                    price,
-                    qty,
-                    tif: self.form.tif,
-                },
-                cx,
-            ),
-            Err(e) => {
-                self.form_error = Some(e);
-                cx.notify();
-            }
+            Ok(qty) => self.stage(OrderRequest::Limit {
+                symbol,
+                side,
+                price,
+                qty,
+                tif: self.form.tif,
+            }),
+            Err(e) => self.form_error = Some(e),
         }
     }
 
-    pub fn drop_on(&mut self, side: Side, price: Price, cx: &mut Context<Self>) {
-        let Some(drag) = self.drag.take() else {
-            return;
-        };
-        let (Some(symbol), Some(link)) = (self.selected, &self.link) else {
-            return;
-        };
-        if drag.side != side {
-            return;
+    pub fn market(&mut self, side: Side) {
+        let Some(symbol) = self.selected else { return };
+        match self.form.qty() {
+            Ok(qty) => {
+                self.form_error = None;
+                self.stage(OrderRequest::Market { symbol, side, qty });
+            }
+            Err(e) => self.form_error = Some(e),
         }
+    }
+
+    pub fn move_orders(&mut self, drag: Drag, price: Price) {
+        let Some(symbol) = self.selected else { return };
         let orders: Vec<(u64, u64)> = self
             .store
             .orders
             .values()
-            .filter(|o| o.symbol == symbol && o.side == side && o.price == drag.price)
+            .filter(|o| o.symbol == symbol && o.side == drag.side && o.price == drag.price)
             .map(|o| (o.order_id, o.leaves))
             .collect();
         for (id, leaves) in orders {
-            link.submit(OrderRequest::Cancel(id));
+            self.submit(OrderRequest::Cancel(id));
             if price != drag.price {
-                link.submit(OrderRequest::Limit {
+                self.submit(OrderRequest::Limit {
                     symbol,
-                    side,
+                    side: drag.side,
                     price,
                     qty: leaves,
                     tif: self.form.tif,
                 });
             }
         }
-        cx.notify();
     }
 
-    pub fn cancel_symbol(&mut self, cx: &mut Context<Self>) {
-        let (Some(symbol), Some(link)) = (self.selected, &self.link) else {
-            return;
-        };
-        link.submit(OrderRequest::CancelAll(Some(symbol)));
-        for c in self
+    pub fn cancel_symbol(&mut self) {
+        let Some(symbol) = self.selected else { return };
+        self.submit(OrderRequest::CancelAll(Some(symbol)));
+        let armed: Vec<u64> = self
             .store
             .conditionals
             .values()
             .filter(|c| c.symbol == symbol)
-        {
-            link.submit(OrderRequest::CancelConditional(c.cond_id));
+            .map(|c| c.cond_id)
+            .collect();
+        for id in armed {
+            self.submit(OrderRequest::CancelConditional(id));
         }
-        cx.notify();
     }
 
-    pub fn cancel(&mut self, request: OrderRequest, cx: &mut Context<Self>) {
-        if let Some(link) = &self.link {
-            link.submit(request);
-        }
-        cx.notify();
-    }
-
-    pub fn set_kind(&mut self, kind: Kind, cx: &mut Context<Self>) {
+    pub fn set_kind(&mut self, kind: Kind) {
         self.form.kind = kind;
         self.form_error = None;
-        cx.notify();
     }
 
-    pub fn show(&mut self, tab: Tab, cx: &mut Context<Self>) {
-        if self.screen == Screen::Trading {
-            self.tab = tab;
-            cx.notify();
-        }
-    }
-
-    pub fn prefill(&mut self, launch: crate::Launch, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(broker) = launch.broker {
-            self.login.broker.update(cx, |s, cx| s.emplace(&broker, cx));
-        }
-        if let Some(user) = launch.user {
-            self.login.user.update(cx, |s, cx| s.emplace(&user, cx));
-        }
-        if let Some(tab) = launch.tab.and_then(|name| {
-            Tab::ALL
-                .into_iter()
-                .find(|t| t.label().eq_ignore_ascii_case(&name))
-        }) {
-            self.tab = tab;
-        }
-        if let Some(interval) = launch.interval {
-            self.interval = interval.max(1_000);
-        }
-        if let Some(secret) = launch.secret {
-            *self.login.secret.borrow_mut() = secret;
-            self.log_in(window, cx);
-        }
-    }
-
-    fn cycle_login_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = |state: &Entity<EditableTextState>, window: &Window, cx: &Context<Self>| {
-            state.read(cx).focus_handle(cx).is_focused(window)
-        };
-        let next = if focused(&self.login.broker, window, cx) {
-            self.login.user.clone()
-        } else if focused(&self.login.user, window, cx) {
-            self.login.secret_field.clone()
-        } else {
-            self.login.broker.clone()
-        };
-        focus(&next, window, cx);
+    pub fn set_interval(&mut self, interval: u64) {
+        self.interval = interval;
+        self.request_history();
     }
 }
 
-impl Render for RetailApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = self.theme;
-        let content = match self.screen {
-            Screen::Login => self.render_login(cx).into_any_element(),
-            Screen::Trading => self.render_trading(window, cx).into_any_element(),
+pub struct RetailApp {
+    pub core: Core,
+    pub saved: Saved,
+    owner: Option<String>,
+}
+
+impl RetailApp {
+    pub fn new(prefs: Prefs, prefs_file: Option<PathBuf>, connector: Connector, saved: Saved) -> Self {
+        Self {
+            core: Core::new(prefs, prefs_file, connector),
+            saved,
+            owner: None,
+        }
+    }
+
+    pub fn adopt_view(&mut self) {
+        if self.owner.as_deref() == Some(self.core.user.as_str()) {
+            return;
+        }
+        self.persist();
+        self.core.view = self.saved.get(&self.core.user).cloned().unwrap_or_default();
+        self.owner = Some(self.core.user.clone());
+    }
+
+    pub fn persist(&mut self) {
+        if let Some(owner) = &self.owner {
+            self.saved.insert(owner.clone(), self.core.view.clone());
+        }
+    }
+}
+
+impl Core {
+    pub fn open_settings(&mut self) {
+        self.settings = Some(SettingsDraft {
+            mode: self.prefs.mode,
+            scale: self.prefs.scale,
+            confirm: self.prefs.confirm,
+            qty: self.prefs.qty.to_string(),
+            tif: self.prefs.tif,
+            error: None,
+        });
+    }
+
+    pub fn save_settings(&mut self) {
+        let Some(draft) = self.settings.as_mut() else { return };
+        let qty = match draft.qty.trim().replace(',', "").parse::<u64>() {
+            Ok(q) if q > 0 => q,
+            _ => {
+                draft.error = Some("Default quantity must be a whole number above zero.".into());
+                return;
+            }
         };
-        div()
-            .size_full()
-            .relative()
-            .bg(t.background)
-            .text_color(t.text)
-            .font_family(ome_ui_kit::theme::SANS)
-            .text_size(gpui::px(12.))
-            .key_context(CONTEXT)
-            .track_focus(&self.focus)
-            .on_action(cx.listener(|app, _: &BuyKey, _, cx| {
-                if app.screen == Screen::Trading {
-                    app.open_ticket(Some(Side::Buy), cx)
-                }
-            }))
-            .on_action(cx.listener(|app, _: &SellKey, _, cx| {
-                if app.screen == Screen::Trading {
-                    app.open_ticket(Some(Side::Sell), cx)
-                }
-            }))
-            .on_action(cx.listener(|app, _: &NextSymbol, _, cx| app.step_symbol(1, cx)))
-            .on_action(cx.listener(|app, _: &PreviousSymbol, _, cx| app.step_symbol(-1, cx)))
-            .on_action(cx.listener(|app, _: &Recenter, _, cx| {
-                app.ladder_center = None;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|app, _: &ShowMonitor, _, cx| app.show(Tab::Monitor, cx)))
-            .on_action(cx.listener(|app, _: &ShowTrade, _, cx| app.show(Tab::Trade, cx)))
-            .on_action(cx.listener(|app, _: &ShowCharts, _, cx| app.show(Tab::Charts, cx)))
-            .on_action(cx.listener(|app, _: &ShowNews, _, cx| app.show(Tab::News, cx)))
-            .on_action(cx.listener(|app, _: &Confirm, window, cx| app.confirm(window, cx)))
-            .on_action(cx.listener(|app, _: &FieldEnter, window, cx| app.confirm(window, cx)))
-            .on_action(cx.listener(|app, _: &FieldTab, window, cx| {
-                if app.screen == Screen::Login {
-                    app.cycle_login_focus(window, cx);
-                }
-            }))
-            .on_action(cx.listener(|app, _: &Dismiss, window, cx| {
-                app.pending = None;
-                app.drag = None;
-                if app.screen == Screen::Trading {
-                    window.focus(&app.focus, cx);
-                }
-                cx.notify();
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|app, _, _, cx| {
-                    if app.drag.take().is_some() {
-                        cx.notify();
-                    }
-                }),
-            )
-            .child(content)
+        let draft = self.settings.take().unwrap_or_else(|| unreachable!());
+        if draft.mode != self.prefs.mode || draft.scale != self.prefs.scale {
+            self.restyle = true;
+        }
+        if qty != self.prefs.qty {
+            self.form.qty = qty.to_string();
+        }
+        if draft.tif != self.prefs.tif {
+            self.form.tif = draft.tif;
+        }
+        self.prefs.mode = draft.mode;
+        self.prefs.scale = draft.scale;
+        self.prefs.confirm = draft.confirm;
+        self.prefs.qty = qty;
+        self.prefs.tif = draft.tif;
+        self.theme = Theme::of(draft.mode);
+        self.prefs.save(self.prefs_file.as_deref());
+        self.toasts.push(Level::Info, "Settings saved", "");
     }
 }

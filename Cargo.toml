@@ -16,13 +16,16 @@ ome-net = { path = "crates/ome-net" }
 ome-exchange = { path = "crates/ome-exchange" }
 ome-broker = { path = "crates/ome-broker" }
 ome-ui-data = { path = "crates/ui/ome-ui-data" }
-ome-ui-kit = { path = "crates/ui/ome-ui-kit" }
+ome-ui = { path = "crates/ui/ome-ui" }
 rand = "0.9"
 sha2 = "0.10"
 serde_json = "1"
-gpui = { package = "gpui-ce", version = "0.3.0" }
-gpui_elements = { package = "gpui_ce_elements", version = "0.3.0" }
-gpui_platform = { package = "gpui_ce_platform", version = "0.3.0" }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "persistence"] }
+egui = "0.36"
+egui_extras = "0.36"
+egui_dock = { version = "0.21", features = ["serde"] }
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.clippy]
 inconsistent_digit_grouping = "allow"
