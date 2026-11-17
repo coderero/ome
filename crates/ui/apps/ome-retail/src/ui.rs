@@ -111,11 +111,10 @@ impl RetailApp {
                 );
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     ui.add_space((ui.available_height() / 2.0 - 230.0).max(24.0));
-                    ui.horizontal(|ui| {
-                        ui.add_space((ui.available_width() - 250.0).max(0.0) / 2.0);
-                        ui.label(RichText::new("OME").font(Theme::bold(34.0)).color(t.strong));
-                        ui.label(RichText::new("Trader").font(Theme::sans(34.0)).color(t.text));
-                    });
+                    let mut wordmark = egui::text::LayoutJob::default();
+                    wordmark.append("OME", 0.0, egui::TextFormat::simple(Theme::bold(34.0), t.strong));
+                    wordmark.append("Trader", 10.0, egui::TextFormat::simple(Theme::sans(34.0), t.text));
+                    ui.add(egui::Label::new(wordmark).selectable(false));
                     ui.label(RichText::new("Log in to your brokerage account").color(t.muted));
                     ui.add_space(18.0);
                     Frame::new().fill(t.tab_bar).stroke(Stroke::new(1.0, t.divider)).inner_margin(Margin::same(20)).show(ui, |ui| {
