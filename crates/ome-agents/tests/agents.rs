@@ -1,4 +1,3 @@
-use ome_agents::provision::provision;
 use ome_agents::roster::parse;
 use ome_agents::runner::{AgentContext, supervise};
 use ome_broker::profile::{ProfileKind, Regime};
@@ -8,7 +7,6 @@ use ome_core::symbol::Symbol;
 use ome_exchange::exchange::ExchangeConfig;
 use ome_exchange::{ServerConfig, start as start_exchange};
 use ome_protocol::{ClientMessage, MemberKind, MemberMessage, Role, ServerMessage};
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +28,7 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str) -> SocketAdd
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        registry: None,
     })
     .unwrap()
     .0
@@ -43,6 +42,8 @@ fn roster_agents_provision_bootstrap_inventory_and_use_broker_held_orders() {
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: None,
     })
     .unwrap()
     .0;
@@ -88,16 +89,17 @@ fn roster_agents_provision_bootstrap_inventory_and_use_broker_held_orders() {
         group investor count=1 broker=retail-co role=retail strategy=investor cash=20000 activity=1
     ";
     let agents = parse(roster, 1.0).unwrap();
-    let brokers = BTreeMap::from([("retail-co".to_string(), retail.to_string())]);
-    assert_eq!(
-        provision(&agents, &brokers, "admin", "agent-pw").unwrap(),
-        2
-    );
-    assert_eq!(
-        provision(&agents, &brokers, "admin", "agent-pw").unwrap(),
-        0,
-        "idempotent"
-    );
+    let (mut retail_admin, _) = Client::connect_and_logon(&retail.to_string(), "admin", "admin").unwrap();
+    for agent in &agents {
+        retail_admin
+            .request(&ClientMessage::CreateAccount {
+                role: agent.role,
+                cash: agent.cash,
+                username: agent.name.clone(),
+                secret: "agent-pw".into(),
+            })
+            .unwrap();
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let threads: Vec<_> = agents

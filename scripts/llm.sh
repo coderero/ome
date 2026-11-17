@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-source scripts/env.sh
+OME_LLM="${OME_LLM:-http://127.0.0.1:11434}"
+OME_LLM_MODEL="${OME_LLM_MODEL:-qwen2.5:7b}"
 
 files=(-f docker-compose.yml)
 if docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then

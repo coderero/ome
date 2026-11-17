@@ -1,4 +1,4 @@
-use crate::economy::Economy;
+use crate::world::economy::Economy;
 use ome_core::price::{Price, parse_price};
 use ome_core::symbol::Symbol;
 
@@ -13,6 +13,73 @@ pub struct CompanySpec {
     pub margin_bps: i64,
     pub growth_bps: i64,
     pub beta_pct: i64,
+    pub underwriter: String,
+    pub dmm: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSpec {
+    pub username: String,
+    pub secret: String,
+    pub broker: String,
+    pub role: ome_protocol::Role,
+    pub cash: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorldSpec {
+    pub companies: Vec<CompanySpec>,
+    pub accounts: Vec<AccountSpec>,
+}
+
+pub fn parse_world(text: &str) -> Result<WorldSpec, String> {
+    let mut world = WorldSpec {
+        companies: parse_companies(text)?,
+        accounts: Vec::new(),
+    };
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        let at = |why: &str| format!("line {}: {why}", n + 1);
+        let mut words = line.split_whitespace();
+        match words.next() {
+            None | Some("company") => continue,
+            Some(w) if w.starts_with('#') => continue,
+            Some("account") => {}
+            Some(other) => return Err(at(&format!("unknown entry '{other}' (company or account)"))),
+        }
+        let username = words.next().ok_or_else(|| at("account needs a login name"))?.to_string();
+        if !ome_net::auth::valid_username(&username) {
+            return Err(at(&format!("'{username}' is not a valid login name")));
+        }
+        let mut account = AccountSpec {
+            secret: format!("{username}-pw"),
+            username,
+            broker: String::new(),
+            role: ome_protocol::Role::Retail,
+            cash: 0,
+        };
+        for pair in words {
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| at(&format!("expected key=value, got '{pair}'")))?;
+            let bad = || at(&format!("invalid {key} '{value}'"));
+            match key {
+                "broker" => account.broker = value.to_string(),
+                "secret" => account.secret = value.to_string(),
+                "role" => account.role = ome_protocol::Role::parse(value).ok_or_else(bad)?,
+                "cash" => account.cash = ome_core::price::parse_amount(value).ok_or_else(bad)?,
+                _ => return Err(at(&format!("unknown key '{key}'"))),
+            }
+        }
+        if account.broker.is_empty() {
+            return Err(at("account needs broker="));
+        }
+        if world.accounts.iter().any(|a| a.username == account.username && a.broker == account.broker) {
+            return Err(at(&format!("{} listed twice", account.username)));
+        }
+        world.accounts.push(account);
+    }
+    Ok(world)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +105,7 @@ pub fn parse_companies(text: &str) -> Result<Vec<CompanySpec>, String> {
     let mut companies = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if !line.starts_with("company ") {
             continue;
         }
         let at = |why: &str| format!("line {}: {why}", n + 1);
@@ -63,6 +130,8 @@ pub fn parse_companies(text: &str) -> Result<Vec<CompanySpec>, String> {
             margin_bps: 1_000,
             growth_bps: 500,
             beta_pct: 100,
+            underwriter: String::new(),
+            dmm: String::new(),
         };
         for pair in words {
             let (key, value) = pair
@@ -77,6 +146,8 @@ pub fn parse_companies(text: &str) -> Result<Vec<CompanySpec>, String> {
                 "margin" => spec.margin_bps = percent_bps(value).ok_or_else(bad)?,
                 "growth" => spec.growth_bps = percent_bps(value).ok_or_else(bad)?,
                 "beta" => spec.beta_pct = percent_bps(value).ok_or_else(bad)?,
+                "underwriter" => spec.underwriter = value.to_string(),
+                "dmm" => spec.dmm = value.to_string(),
                 _ => return Err(at(&format!("unknown key '{key}'"))),
             }
         }
@@ -149,6 +220,14 @@ mod tests {
         assert!(parse_companies("company ACME price=1 name=X").is_err());
         assert!(parse_companies("company ACME price=1 shares=1 eps=1").is_err());
         assert!(parse_companies("# comment\n\n").unwrap().is_empty());
+        let world = parse_world(
+            "company ACME price=1 shares=10 eps=0.10 underwriter=prime-co dmm=lp-co name=A\naccount alice broker=retail-co role=retail cash=25000 secret=alice-pw\n# note",
+        )
+        .unwrap();
+        assert_eq!((world.companies[0].underwriter.as_str(), world.companies[0].dmm.as_str()), ("prime-co", "lp-co"));
+        assert_eq!((world.accounts[0].username.as_str(), world.accounts[0].cash), ("alice", 25_000_00));
+        assert!(parse_world("account alice role=retail").is_err());
+        assert!(parse_world("listing ACME").is_err());
         let twice = "company A price=1 shares=10 eps=0.10 name=A\ncompany A price=1 shares=10 eps=0.10 name=A";
         assert!(parse_companies(twice).is_err());
     }

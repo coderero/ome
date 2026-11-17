@@ -7,12 +7,14 @@ Every price, balance and trade comes from real orders matching in the engine. No
 ## Quick Start
 
 ```bash
-scripts/demo.sh --fresh       # build; start exchange, clearing, simctl, newsroom, 2 venues, 4 providers; seed 3 IPOs; start agents
-scripts/stop.sh
+scripts/demo.sh --fresh       # build, then `omectl up --fresh`: preflight checks, start every service of config/topology.conf
+                              # under supervision, approve the declared members, wait until the market is ready
+target/release/omectl status  # live cluster view: health, dependencies and metrics reported by every service
+scripts/stop.sh               # `omectl down`
 
 scripts/db.sh up              # PostgreSQL + Redis in Docker
-OME_RECORD=1 scripts/demo.sh --fresh   # also record the market into them
-scripts/llm.sh up             # Ollama with qwen2.5:1.5b (GPU when the NVIDIA runtime is installed); the newsroom then writes with it
+OME_RECORD=1 scripts/demo.sh --fresh   # also record the market into them (omectl refuses to start if they are down)
+scripts/llm.sh up             # Ollama with qwen2.5:7b (GPU when the NVIDIA runtime is installed); the newsroom then writes with it
 ```
 
 On a Mac, with or without Docker, follow [docs/macos.md](docs/macos.md).
@@ -52,6 +54,54 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
        settlement reports (sequenced) ──► providers mark client trades settled
 ```
 
+## Workers and Masters
+
+Every service is either a **worker** or a **master**.
+
+- **Workers** behave like the real institutions and only use real interfaces: exchange, clearing house, brokers, venues, the newsroom (a news vendor), the recorder (a market data vendor) and the agents (participants). None of them knows it is part of a simulation.
+- **ome-simctl** is the simulation master. It owns the simulated world: the economy, the companies and what happens to them, the agent roster, scenarios, recordings and the trading-day speed. It acts on the workers only the way a real company, statistics office, operator or customer would: it files prospectuses and lists IPOs through the exchange, opens accounts through the brokers' account desks, and sends what happens to the newsroom as wire events.
+- **omectl** is the infrastructure master. It runs the topology, starts services in order, supervises them (restart on crash with backoff), keeps the service registry, runs preflight checks and approves the membership applications of the participants declared in the topology. It manages services, not markets.
+
+```
+          omectl (infrastructure)                        ome-simctl (simulation)
+  topology · start order · restart · registry      world · companies · events · roster · scenarios
+   preflight · admits declared members                    │           │              │
+          │ health, dependencies, metrics                  │ wire       │ prospectus,  │ accounts,
+          ▼ (every service reports each second)            ▼ events     ▼ IPO, DMM     ▼ agent assignments
+  ┌───────────────────────── workers (real interfaces only) ─────────────────────────────────────┐
+  │ newsroom (vendor) ─ news ─► brokers ◄── agents        exchange ◄── brokers, venues, clearing  │
+  └───────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Running the Market: omectl
+
+`omectl` reads `config/topology.conf`: one line per service (`<kind> <name> port=<port> [options]`) plus `set` lines for shared settings (host, data directory, registry port, regime, writer, trading day, default collateral). `OME_HOST`, `OME_DATA`, `OME_REGIME`, `OME_TRADING_DAY`, `OME_WRITER` and `OME_RECORD` override them.
+
+| Command | What it does |
+|---|---|
+| `omectl up [--fresh] [--record] [--no-build] [--writer auto\|llm\|templates]` | builds, runs the preflight checks (refuses on a failure), starts the supervisor in the background and waits until every service reports ready |
+| `omectl status` | the live cluster view from the registry: health, process, address, dependencies that are down, metrics |
+| `omectl logs <service> [-f]` · `omectl restart <service>` | a service's log; stop and start one service |
+| `omectl doctor` | preflight only: binaries, free ports, writable data directory, free disk, world and roster files, Ollama and the model, PostgreSQL and Redis when recording, Docker, default secrets on a non-loopback host |
+| `omectl admit` | approve pending applications of declared participants now (the supervisor does this every two seconds) |
+| `omectl down` | stops every service in reverse start order, then the supervisor |
+
+- **Start order**: exchange, clearing house, newsroom, venues, brokers, simctl, agent runners, recorder. Each waits until the previous one has registered (at most 20 seconds); services retry their own links anyway.
+- **Supervision**: a service that exits is restarted after 1, 2, 4 ... up to 30 seconds; the delay resets after a minute of uptime. Every service recovers from its journal, so a killed broker comes back with the same balances.
+- **Registry and health**: every service reports once a second to the registry that omectl runs (`OME_REGISTRY`, port 7600): its address, health (starting, ready, degraded, stopping), the state of each dependency (exchange link, clearing link, news feed, venues, LLM writer, databases), lag and metrics, and what it offers. A service that falls silent for five seconds shows as down. Services also find each other by name in the registry: the recorder and simctl discover brokers and venues as they join, and brokers resolve venue names.
+- **Writer**: with `writer=auto` omectl starts Ollama through `scripts/llm.sh up` when it is not running and Docker is available, and falls back to templates otherwise.
+- **Backends**: processes on this machine today, behind a `Backend` trait; Docker, SSH hosts and Kubernetes are planned (phase 10).
+
+## Membership Applications
+
+Brokers, venues and the clearing house are not wired together by scripts. Like real firms they apply:
+
+1. A firm that is refused at logon sends an `Apply` message (member kind, name, secret, a note) on the same connection. Its link keeps retrying, so it logs on by itself once approved.
+2. Exchange operations, clearing operations, each venue's operators and the newsroom's desk see pending applications (`ome exchange applications`, `ome clearing applications`, ...) and approve or refuse them (`approve <name>`, `refuse <name> [reason]`). A clearing approval can record the first collateral deposit (`ome clearing approve retail-co 2000000`).
+3. Approval journals the registration the service already had (exchange member, clearing member, venue routing member, news subscriber). Pending applications are kept in memory; an applicant whose application was lost in a restart simply applies again on its next logon.
+
+`omectl` approves the participants declared in the topology with the declared member kind, collateral, venue routes and news subscription. Anyone else, for example a broker started by hand, waits for an operator: `ome exchange approve my-broker`. The older direct commands (`ome exchange add-member`, `ome clearing register`, `ome venue register`, `ome news register`) still work.
+
 Responsibilities are split the way real markets split them:
 
 | Concern | Lives in |
@@ -70,22 +120,26 @@ Responsibilities are split the way real markets split them:
 ```
 crates/
 ├── ome-core       matching engine, risk checks, candles, trade tape, symbols (pure, no I/O)
-├── ome-protocol   SBE codec + SOFH framing; client, member and server message families
-├── ome-store      generic crash-safe journal (write-ahead log of SBE frames)
-├── ome-net        TCP session server, outbound back-pressure, auth hashing, logging
+├── ome-protocol   SBE codec + SOFH framing; client, member, server, simulation and registry message families
+├── ome-store      generic crash-safe journal (write-ahead log of SBE frames) behind the FactLog trait
+├── ome-net        TCP session server, outbound back-pressure, auth hashing, logging, membership applications,
+│                  registry reporter and name directory
+├── ome-llm        Ollama client behind the Model trait (the newsroom writes with it, simctl invents events with it)
+├── ome-ctl        omectl: topology, preflight, supervisor, service registry, admissions
 ├── ome-exchange   exchange service (lib + `ome-exchange` binary)
 ├── ome-clearing   clearing house (lib + `ome-clearing` binary)
 ├── ome-broker     provider service with retail / prime / dma / lp profiles (lib + `ome-broker`)
 ├── ome-venue      off-exchange venues: wholesaler and dark pool (lib + `ome-venue`)
-├── ome-simctl     simulation control plane for the artificial participants (lib + `ome-simctl`)
-├── ome-newsroom   news vendor: company fundamentals, economy, earnings and news feed (lib + `ome-newsroom`)
-├── ome-recorder   market recorder into PostgreSQL and Redis (lib + `ome-recorder`)
+├── ome-simctl     simulation master: world model, wire events, seeding, agent roster and scenarios (lib + `ome-simctl`)
+├── ome-newsroom   news vendor: takes wire events from contributors, writes and publishes stories (lib + `ome-newsroom`)
+├── ome-recorder   market recorder into PostgreSQL and Redis; finds brokers and venues in the registry (lib + `ome-recorder`)
 ├── ome-client     client library (sessions, background links) + `ome` CLI
 ├── ui/ome-ui      egui kit: bundled Open Sans, dark/light theme, tables, section strips, widgets, toasts, candle chart
 ├── ui/ome-ui-data data layer for the apps: broker link thread and the market/account/news store
 ├── ui/apps/ome-retail   OME Trader, the retail client's desktop platform
-└── ome-agents     trading firms from config/roster.conf: HFT, DMM, quant, pension, prop, retail personas
-scripts/  env.sh · demo.sh · seed.sh · agents.sh · stop.sh · db.sh · llm.sh
+└── ome-agents     agent runner: runs the strategies simctl assigns (HFT, DMM, quant, pension, prop, retail personas)
+config/   topology.conf (services for omectl) · world.conf (companies, demo accounts) · roster.conf (agent groups)
+scripts/  demo.sh (build + omectl up) · stop.sh (omectl down) · db.sh · llm.sh
 docker-compose.yml   PostgreSQL 16 + Redis 7 for the recorder, Ollama (profile llm) for the newsroom
 docker-compose.gpu.yml   GPU reservation for Ollama
 ```
@@ -120,8 +174,10 @@ SBE (schema 7, version 2) with SOFH framing on every connection. All integers ar
 | Family | Direction | Messages |
 |---|---|---|
 | client | agent → provider | Logon, NewOrder, Cancel, CancelAll, Quote, SetMmp, Conditional, Oco, Bracket, CancelConditional, AlgoOrder, CancelAlgo, Subscribe, QueryAccount, QueryInstruments; admin: CreateAccount, SetBalance, SetAccountStatus, SetRestricted, SetLossLimit, QueryAccounts |
-| member | provider → exchange | Logon (with `last_seq`), NewOrder (account ref + time in force), Cancel, CancelAll, Quote, SetMmp, TradeReport, Subscribe; ops: CreateMember, ListInstrument, Halt, Resume, QueryMembers |
-| server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, ConditionalUpdate, AlgoUpdate, ContractNote, Ack, Reject, Heartbeat |
+| member | provider → exchange, clearing, venues, newsroom | Logon (with `last_seq`), Apply (before logon), NewOrder (account ref + time in force), Cancel, CancelAll, Quote, SetMmp, TradeReport, Subscribe, Wire (contributor → newsroom); ops: CreateMember, QueryApplications, Decide, ListInstrument, FileProspectus, Halt, Resume, QueryMembers |
+| simulation | operator, runner → simctl | Logon, Command, Accelerate, QueryStatus, QueryWorld, Inject, Record, Replay, Groups (runner reports) |
+| registry | service, omectl CLI → registry | Announce (health, dependencies, metrics), Query, Control |
+| server | both directions back | LogonAck, MemberLogonAck, ReplayComplete, Execution, Allocation, Account, InstrumentList, Instrument, Book, Trade, Candles, AccountList, MemberList, Applications, WorldStatus, SimAssign, SimRetire, Services, ConditionalUpdate, AlgoUpdate, ContractNote, Ack, Reject, Heartbeat |
 
 Client and member templates never overlap; sending one family's message to the other service fails to decode (tested).
 
@@ -317,6 +373,7 @@ The exchange runs a trading day in four phases, either manually or on a repeatin
 - Orders carry a time in force: `gtc` (default for limits), `day`, or `ioc` (default for market orders).
 - The clearing house can follow the exchange calendar (`--cycle-ms 0`): each pre-open starts a new clearing cycle, so T+1 means the next trading day.
 - No schedule means the market is always open.
+- The exchange runs its own calendar from `--schedule PRE,OPEN,CLOSING,CLOSED` (seconds) when its journal has none yet; omectl passes `trading-day` from the topology. Changing it later is an operator request (`ome exchange schedule`, or `ome sim speed` from the simulation master), journaled like any command.
 
 ```bash
 ome exchange status                         # market open · trading day 2 · next change in 8s
@@ -348,7 +405,7 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 
 ## Trading Agents and the Simulation Control Plane
 
-`ome-agents` runs the firms listed in `config/roster.conf` (a group per line: broker, role, strategy, symbols, cash, starting inventory and strategy parameters). It opens their accounts through each broker's admin login, buys starting inventory with real orders, and then trades each firm through its broker with the order types of its tier:
+`config/roster.conf` lists the firms, a group per line: broker, role, strategy, symbols, cash, starting inventory and strategy parameters. `ome-simctl` owns the roster. Once the IPOs are listed it opens every agent's account through the broker's account desk (journaled, so a restart never opens it twice) and assigns the agents to the connected `ome-agents` runners, spreading them evenly; when a runner leaves, its agents go to the others. A runner only runs what it is given: it buys starting inventory with real orders and trades each firm through its broker with the order types of its tier:
 
 | Tier | Strategies |
 |---|---|
@@ -365,7 +422,7 @@ The demo starts close to balance: each IPO covers everyone's starting inventory 
 
 **ML retail personas** (`strategy=ml-retail`, groups `ml-cautious` and `ml-bold`) each train their own online logistic regression on the live tape: features are the 5, 20 and 100-tick returns, volatility, z-score, news sentiment and the spread, and the label is whether the price is higher a horizon later. They stay out of the market until the model has seen enough samples, then trade the edge of the predicted probability over the model's base rate: a strong edge enters with a bracket, a moderate one with a GTT dip buy, holdings get a trailing stop, and a negative edge exits at market (often filled by the wholesaler). Every agent draws its own horizon, learning rate and sample subset, so agents watching the same tape learn different models. `style=cautious|balanced|bold` sets thresholds and size; `enter`, `strong`, `exit`, `horizon`, `lr`, `diversity` and others can be changed live, and the model is kept across changes. Each agent's status line shows samples seen, hit rate, base rate and its strongest feature. In a live run the models learned short-term mean reversion (a negative weight on the 5-tick return), as expected in a market anchored by value investors.
 
-`ome-simctl` (port 7400) is the control plane for these artificial participants only; the exchange never sees it. Operators use `ome sim ...`, runners follow it with `--simctl`, and every command is journaled, so a restarted simctl or a reconnecting runner gets the current settings back.
+`ome-simctl` (port 7400) is the simulation master; workers never see it as anything but a customer, issuer or operator. Operators use `ome sim ...`, runners follow it with `--simctl`, and every command is journaled, so a restarted simctl or a reconnecting runner gets the current settings back. Settings sent before a group has agents on a runner still apply when its first agent arrives. Funding a group is done by simctl through the brokers' account desks.
 
 ```bash
 ome sim status                        # groups, running/target, paused, fills, equity, parameters, fair values, scenarios
@@ -387,22 +444,22 @@ ome sim replay crash-drill 2          # re-issue the recording at twice the spee
 
 A recording starts with the settings in effect at that moment (group settings, fair values, active scenarios) as its baseline, then holds each operator command and speed change with its offset. The tape marks (last price and day volume per symbol at both ends, plus wall-clock times) tie it to the trades in PostgreSQL. Recordings live in the simctl journal, so they survive restarts. A replay sends the baseline first and then each step with its original spacing, scaled by the speed; replayed commands are journaled like any other command. A replay that is running when simctl restarts is not resumed.
 
-In a 6-minute fresh demo after these changes, prices stayed on the newsroom's fundamentals (ACME 24.48 vs 24.44, NOVA 11.69 vs 12.34, ZEN 80.00 vs 76.68). The typical 1-minute move (about one simulated trading day) was 2-4%, the range over 5 minutes was 6-12%, and there were 4 limit up-limit down pauses. The first version of these changes, before the starting balance was fixed, still moved ACME about 10% a minute with a 65% range.
+In a 6-minute fresh demo in phase 5b, prices stayed on the published fundamentals (ACME 24.48 vs 24.44, NOVA 11.69 vs 12.34, ZEN 80.00 vs 76.68). The typical 1-minute move (about one simulated trading day) was 2-4%, the range over 5 minutes was 6-12%, and there were 4 limit up-limit down pauses. The first version of these changes, before the starting balance was fixed, still moved ACME about 10% a minute with a 65% range. In the first 6-minute run under omectl (phase 5c, with an injected lawsuit, a -8% NOVA shock and a broker killed and restarted) the typical 1-minute move was 7.5% for ACME, 6.3% for NOVA and 1.6% for ZEN; this is measured only, and the deep calibrated market of phase 5d works on it.
 
-## News, Fundamentals and the Economy
+## The World, the Wire and the News
 
-`ome-newsroom` (port 7500) is a news vendor. It follows the companies in `config/companies.conf` (sector, listing price, shares, EPS, net margin, revenue growth, sensitivity to the economy) and runs the economy behind them: policy rate, inflation, growth and risk appetite. It takes the trading calendar from the exchange and publishes:
+The world lives in `ome-simctl`. The newsroom only reports on it.
 
-| Story | When | Effect |
+**The world** (`ome-simctl`, companies in `config/world.conf`) holds the economy (policy rate, inflation, growth, risk appetite) and every company's fundamentals (sector, listing price, shares, revenue, net margin, growth, sensitivity to the economy). It follows the exchange's trading calendar and decides what happens:
+
+| Event | When | Effect |
 |---|---|---|
-| prospectus | when a company is first covered | financial baseline: revenue, margin, EPS, growth, shares, price |
+| prospectus | when the world starts | financial baseline: revenue, margin, EPS, growth, shares, price; simctl files it with the exchange |
 | earnings | pre-open, every `--quarter-days` trading days, staggered by company | new revenue, margin and EPS against the analyst consensus; the surprise sets the tone |
 | inflation (CPI), GDP | pre-open on a calendar | actual vs expected moves risk appetite |
 | central bank decision | pre-open on a calendar | hikes against inflation, cuts for weak growth, sometimes a surprise |
-| company news | during the session, about `--news-per-day` stories per company per trading day (default 1; the open session length is measured from the exchange calendar) | contract wins, launches, lawsuits, recalls, executive departures, buybacks, guidance changes, analyst ratings, takeover rumours |
-| sector news | during the session | regulation, demand booms, supply shocks, subsidies for every company in the sector |
-
-Each story carries a structured sentiment (-100 to 100), the newsroom's estimate of its effect on value in bps, and its numbers (`eps=0.63 consensus=0.65 ...`) next to the headline and body. It also carries the resulting fundamentals of every company affected (`fund=ACME:eps_e4:growth_bps:cash_e2`), which the agents use to value companies themselves.
+| company events | during the session, about `--news-per-day` per company per trading day (default 1; the open session is measured from the exchange calendar) | contract wins, launches, lawsuits, recalls, executive departures, buybacks, guidance changes, analyst ratings, takeover rumours |
+| sector events | during the session | regulation, demand booms, supply shocks, subsidies for every company in the sector |
 
 Effects are sized against the company's own numbers:
 - **Contract wins** add a one-off profit of 0.2-0.8% of annual revenue.
@@ -411,59 +468,39 @@ Effects are sized against the company's own numbers:
 - **Sector news** moves margins by 0.5-2%.
 - **Analyst ratings, rumours and buybacks** carry sentiment only.
 
-Growth and margins revert toward the company's normal level at each earnings report. The newsroom's value estimate is the listing price scaled by forward earnings (growth counts once) and a re-rating from rates and risk appetite, plus one-off cash per share.
+Growth and margins revert toward the company's normal level at each earnings report. The world's value estimate is the listing price scaled by forward earnings (growth counts once) and a re-rating from rates and risk appetite, plus one-off cash per share. A unit test runs 2,000 events with quarterly earnings: the median event moves value under 0.6% and nine in ten under 2%, and over 33 quarters value follows the company's growth instead of random-walking.
 
-A unit test runs 2,000 stories with quarterly earnings. The median story moves value under 0.6% and nine in ten under 2%, and over 33 quarters value follows the company's growth instead of random-walking. The newsroom no longer sends values to ome-simctl. ### LLM-invented news
+**Events invented by the local model.** With `--llm`, most company and sector events are invented by Ollama rather than drawn from the catalogue. The prompt gives the company's numbers, its last eight events (so it does not repeat itself), the economy, a good, bad, mixed or minor lean and one of sixteen angles (customers, suppliers, workforce, a plant, cyber security, pricing, a recall, financing ...). The model replies with a headline, a body, a sentiment and three economic effects (growth, relative margin, one-off profit or cost). simctl checks every reply before it can move any value: the scope is valid and a company event names the company; the text has no figures; the tone does not contradict the effect or the wording; effects lie within realistic bounds (growth ±1 point, margin ±2%, one-off -2% to +0.8% of revenue; far outside is refused, slightly large is trimmed); the value effect is at most 3 bps per point of sentiment. When Ollama is down or every reply is refused, the catalogue takes over, so the world never goes quiet.
 
-With Ollama running, most company and sector stories are invented by the local model, not drawn from a fixed list. A background thread asks it for the next development about a company. The prompt gives:
-- the company's real numbers (revenue, margin, growth);
-- its last eight headlines, so it doesn't repeat itself;
-- the economy;
-- a good, bad, mixed or minor lean;
-- an angle drawn from sixteen (customers, suppliers, workforce, a plant, cyber security, pricing, a recall, financing and so on).
+**The wire.** Every event is journaled in simctl and sent to the newsroom as a sequenced wire item (kind, company, sector, sentiment, the estimated effect on value, the facts, and the resulting fundamentals `fund=SYMBOL:eps_e4:growth_bps:cash_e2`). The newsroom tells the contributor at logon which event it expects next, so nothing is lost or published twice when either side restarts.
 
-The model replies with a headline, a body, a sentiment and three economic effects: change in growth, relative change in margin, and a one-off profit or cost as a share of revenue.
-
-The newsroom checks every reply before it can move any value:
-- the scope is valid and a company story names the company;
-- the text contains no figures (no invented numbers);
-- the tone does not contradict the effect;
-- no upbeat wording for bad news, or the reverse;
-- effects lie within realistic bounds: growth ±1 point, margin ±2%, one-off -2% to +0.8% of revenue. Replies far outside are refused and slightly large ones are trimmed;
-- the value effect is scaled to at most 3 bps per point of sentiment, so a mild story cannot carry a big move.
-
-Accepted ideas are journaled with the model's own text and `source=llm` in the story data. When Ollama is down or every reply is refused, the newsroom falls back to its event catalogue, so the feed never stops. `ome news status` shows how many stories were invented and how many ideas were refused. `scripts/demo.sh` now starts Ollama itself through `scripts/llm.sh up` when Docker is available (`OME_WRITER=templates` skips it).
-
-Docker only runs PostgreSQL, Redis and Ollama. The exchange, clearing house, brokers, venues, newsroom, simctl and trading agents are native Rust processes started by `scripts/demo.sh`. The covered companies come from `config/companies.conf`, and their listings from `scripts/seed.sh`. Companies arriving on their own is part of the primary-market phase (6).
+**The newsroom** (`ome-newsroom`, port 7500) is a news vendor with no market model of its own. Contributors log in with `--source NAME=SECRET` (simctl is `world`); the desk writes each event up (templates, or the local LLM) and publishes it to subscribers in order. Brokers subscribe with `--news` (they apply, or are registered with `ome news register`), resume after the last story they saw, cache recent stories and pass them to clients that ask (`ome broker ... news`). Everything is journaled, so a killed newsroom restarts with the same story numbers.
 
 ### LLM writer
 
-The engine decides every fact (what happened, the numbers, the tone, the effect on fair value); a local LLM only writes the words. `scripts/llm.sh up` starts Ollama in Docker (`docker-compose.yml` profile `llm`, plus `docker-compose.gpu.yml` when Docker has the NVIDIA runtime) and pulls `qwen2.5:1.5b`; `scripts/demo.sh` passes `--llm` to the newsroom when Ollama answers (`OME_WRITER=auto|llm|templates`).
+The world decides every fact (what happened, the numbers, the tone, the effect on value); the newsroom's local LLM only writes the words. `scripts/llm.sh up` starts Ollama in Docker (`docker-compose.yml` profile `llm`, plus `docker-compose.gpu.yml` when Docker has the NVIDIA runtime) and pulls `qwen2.5:7b` (`OME_LLM_MODEL` picks another); omectl passes `--llm` to the newsroom and simctl when Ollama answers (`writer=auto|llm|templates`).
 
-Each story is journaled at once with template text and handed to a writer thread, which asks the model for a JSON headline and body. The prompt gives the draft, the numbers that appear in it and the tone; the reply is rejected if it drops or changes a number, contradicts the tone ("exceeding expectations" in a miss), or is too short or long. Accepted copy is journaled as a `Rewritten` fact. Stories leave the newsroom strictly in order: a story waits for its rewrite at most `--llm-timeout-ms` (8 s) plus half a second, then goes out with the template text. If Ollama is down, the writer backs off for 10 seconds at a time and every story uses its template, so the feed never stalls. `ome news status` shows the writer: model, stories written, average latency, fallbacks, timeouts and the last problem.
+Each story is journaled at once with template text and handed to a writer thread, which asks the model for a JSON headline and body. The prompt gives the draft, the numbers that appear in it and the tone; the reply is rejected if it drops or changes a number, contradicts the tone ("exceeding expectations" in a miss), or is too short or long. Accepted copy is journaled as a `Rewritten` fact. Stories leave the newsroom strictly in order: a story waits for its rewrite at most `--llm-timeout-ms` (8 s) plus half a second, then goes out with the template text. Events the model invented keep their own text. If Ollama is down, the writer backs off for 10 seconds at a time and every story uses its template, so the feed never stalls. `ome news status` shows the writer: model, stories written, average latency, fallbacks, timeouts and the last problem.
 
-On the RTX 5070 Ti the model runs fully on the GPU at about 0.2-0.3 s per story. In a test run it wrote all of the first 23 stories with no fallbacks, for example "Zen Biotech Falls Short as Quarterly Profit Disappoints: Quarter 1 results: Zen Biotech earned 0.61 a share, down 5.89% from expectations of 0.65, on revenue of $58,632." With Ollama stopped, two stories went out with their template text without delay, and the writer was back within ten seconds of restarting it.
+On the RTX 5070 Ti, `qwen2.5:1.5b` ran fully on the GPU at about 0.2-0.3 s per story and wrote all of the first 23 stories of a test run with no fallbacks, for example "Zen Biotech Falls Short as Quarterly Profit Disappoints: Quarter 1 results: Zen Biotech earned 0.61 a share, down 5.89% from expectations of 0.65, on revenue of $58,632."
 
 How the market uses the news:
 - **Agents read it through their broker.** Every agent subscribes to its broker's news feed; a story about a symbol, its sector (learned from company stories) or the economy adds to that symbol's mood, weighted by relevance and fading with a 45-second half-life. The mood drives retail panic selling, value-investor caution, noise-trader tilt and the ML personas' sentiment feature, together with simctl scenarios.
 - **News-driven funds** (`strategy=news`, group `news-fund`) trade stories under 10 seconds old: tone plus fair-value impact sets direction and size, they cross the spread with a limit order and unwind the position after `hold_ms`.
-- **Listings need a prospectus.** With `--require-prospectus` (on in the demo) the exchange refuses an IPO until a prospectus has been filed for the symbol. The newsroom files every prospectus it publishes with the exchange, and files them again whenever it reconnects. `ome exchange ipo FOO ...` for a company the newsroom does not cover fails with "no prospectus has been filed for FOO".
-- **Simulation news shocks are stories.** With `--newsroom`, ome-simctl hands `ome sim news SYM pct` to the newsroom as a shock that scales the company's earnings, so the move reaches fair value, the feed and the agents through the same path as any other story (it falls back to the old direct shock if the newsroom is down). Recordings keep the shock and replays publish it again.
-
-In a test run a `-8%` shock on NOVA became story #8 ("Unexpected setback for Nova Energy", -803 bps) and NOVA traded from 12.74 to 11.62 within 20 seconds; the two news funds had 30 fills by then, and the recorder had every story in PostgreSQL and the `ome:news` stream.
-
-Brokers subscribe with `--news` (registered once with `ome news register`), resume after the last story they saw, cache recent stories and pass them to clients that ask (`ome broker ... news`). Everything is journaled, so a killed newsroom restarts with the same economy, fundamentals and story numbers.
+- **Listings need a prospectus.** With `--require-prospectus` (on by default under omectl) the exchange refuses an IPO until a prospectus has been filed for the symbol; simctl files each company's prospectus before it lists the IPO. `ome exchange ipo FOO ...` for a company nobody filed for fails with "no prospectus has been filed for FOO".
+- **Simulation shocks are world events.** `ome sim news SYM pct` scales the company's earnings in the world, so the move reaches value, the wire, the feed and the agents the same way as any other event. Recordings keep the shock and replays make it happen again.
 
 ```bash
-ome news status                       # economy, companies: fair value, EPS vs next estimate, margin, growth, next report day
+ome sim world                         # economy, companies: value, EPS vs next estimate, margin, growth, next report day; seeding progress
+ome sim event lawsuit ACME            # make something happen now (earnings, cpi, rates, gdp or any catalogue event)
+ome news status                       # stories, wire events received, subscribers, contributors, writer
 ome news list 20 ACME                 # recent stories about ACME, its sector and the economy
 ome news read 8                       # one story in full with its numbers
 ome news watch                        # follow the feed live
-ome news inject lawsuit ACME          # publish a story now (earnings, cpi, rates, gdp or any catalogue event)
 ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw news 5
 ```
 
-In a test run the newsroom published a hot CPI print (-56 bps on fair values), a rate hold, a Zen Biotech takeover rumour and a Zen earnings miss (0.63 vs 0.65, -63 bps); after a kill -9 it came back at the same day and story count, and an injected lawsuit (-199 bps on ACME) reached the brokers' clients with no duplicates.
+In a live run under omectl, `ome sim event lawsuit ACME` became world event #4 (-32 bps), `ome sim news NOVA -8` became #5 ("Unexpected setback for Nova Energy", -800 bps), and both reached alice's broker feed within a second. After `kill -9` of the retail broker, omectl restarted it within a second; it replayed its journal and its 56 agent sessions reconnected.
 
 ## Desktop Apps
 
@@ -529,7 +566,7 @@ Run `UPDATE_SNAPSHOTS=1 cargo test -p ome-retail` after a visual change and look
 
 ## Storage: PostgreSQL and Redis
 
-The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house, the venues and the newsroom as ops and to every provider as broker admin. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
+The services keep their own journals as the source of truth. `ome-recorder` is a separate observer that copies the market into databases for dashboards, analysis and the future desktop apps. It logs in to the exchange, the clearing house, the venues and the newsroom as ops and to every provider as broker admin; with a registry (`--registry`, set by omectl) it finds brokers and venues there and starts recording a new one as soon as it joins. It reports each database's state and its backlog as health. It subscribes to every listed symbol, polls the slow-moving state once a second, and writes batches every 500 ms. Snapshots are coalesced so only the latest book or account state per key is written.
 
 | Store | Holds | Keys / tables |
 |---|---|---|
@@ -552,10 +589,11 @@ scripts/db.sh redis SUBSCRIBE ome:trades
 - **Lost orders**: if a provider recorded an order but crashed before the exchange received it, the order is still pending after `ReplayComplete`. It is then abandoned and its reservation released.
 - **Providers**: an event-sourced journal of **facts** (account opened, order accepted, exchange report, allocation), not commands. Provider decisions read live market data, so replaying the original commands could decide differently; replaying facts always rebuilds the same state.
 - **Verified by crash tests**: with the full stack running, `kill -9` the retail broker and then the exchange; after each restart all account balances are identical (no lost or double settlements), and trading resumes on its own.
+- **Supervision**: under omectl a crashed service is restarted automatically (1 s, then doubling up to 30 s); the simulation master keeps its world, seeding progress and recordings in its own journal, and wire events are resent from the newsroom's last received sequence.
 
 ## IPO Flow
 
-Today a listing is a single ops command that offers the whole issue at one price (a filed prospectus is required when the exchange runs with `--require-prospectus`). A full primary market (issuer onboarding, listing-desk approval, book-building with fund blocking, pricing, allotment with refunds, listing auction) is planned; see the roadmap.
+Today a listing is a single ops command that offers the whole issue at one price (a filed prospectus is required when the exchange runs with `--require-prospectus`). In the demo, simctl does these steps for every company in `config/world.conf` once the brokers are members: it files the prospectus, opens the issuer account at the underwriter, lists the IPO and names the designated market maker, journaling each step so a restart never repeats one. A full primary market (issuer onboarding, listing-desk approval, book-building with fund blocking, pricing, allotment with refunds, listing auction) is planned; see the roadmap.
 
 ```
 ome broker --addr <prime> create-account acme_ir <secret> issuer 0      →  account 3
@@ -567,10 +605,10 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 278 tests
+cargo test --workspace     # 290 tests
 ```
 
-Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit.
+Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit. A world end-to-end test runs exchange, newsroom, three brokers and simctl: simctl files the prospectuses, lists both IPOs, names the DMM, opens the demo and agent accounts, assigns the agents to a runner, and its events (prospectuses, calendar news, an injected lawsuit, a shock) reach a retail client through the broker's feed; after a restart nothing is seeded twice. An onboarding test starts a broker that is not a member: it applies, exchange operations approve it, and it comes online.
 
 ## Roadmap
 
@@ -581,13 +619,17 @@ Done:
 - **4** desktop prototype: UI kit, data layer, retail app with login and chart history (GPUI, replaced in 5a)
 - **5a** egui platform in the thinkorswim style: docked gadget workspaces, detachable windows, link colours, customisable sidebar and columns, draggable chart axes, setup, square off, headless GUI tests
 - **5b** market realism: economics-sized news, agents valuing companies themselves (no injected fair value), capital- and inventory-aware market makers, a balanced starting market, limit up-limit down pauses, a volatility report, day separators on charts
+- **5c** architecture realignment: workers and masters (the world model, seeding and the agent roster move to simctl; the newsroom becomes a news vendor fed by a sequenced wire), membership applications instead of scripted registration, a service registry with health, dependencies and metrics from every service, discovery by name, and omectl (topology, preflight, start order, supervision, admissions) replacing the bash scripts
 
 Planned (open decisions first: IPO allotment rules, admin identity, warm-up history, short selling):
-- **5c-5d** market data v3 (server-side candles, history service, warm-up, charts with indicators, drawings and order/fill/news markers); retail platform with a full OMS (blotter, order detail timeline, cancel/replace, more order types, position actions, cash ledger and funds requests, statements, alerts, watchlists, scanner, company pages)
+- **5d** deep calibrated market: institutions and multi-level market makers, market order collars, calibration from local liquidity profiles, session presets, a capacity load test
+- **5e** strategy lab: a strategy SDK, backtests with the same interface, cost, impact and capacity reports
+- **5f** information model and operator event desk: consensus and surprises, gradual information diffusion, scheduled macro and corporate calendars, institutional flow commands
+- **5g** index, ETF and HFT strategies, latency classes and co-location; then a durable fast journal with an event bus
+- **5h-5i** market data v3 (TimescaleDB, server-side candles, warm-up, indicators, drawings, markers) and the retail OMS
 - **6** primary market: issuer portal and organisation onboarding, prospectus filing and listing-desk review, book-building with fund blocking and live subscription, pricing, allotment with lottery and refunds, listing-day auction, agents bidding, news coverage
-- **7** back office: named admin users with roles, maker-checker and audit trail; broker desk (KYC, cash and share approvals, freezes and bans, limits); exchange ops console and clearing desk (member and listing approvals, halts, surveillance, collateral and defaults)
-- **8** institutional: OMS/EMS terminal (staging, baskets, pre-trade compliance, allocations, algo ticket with amend/pause), pre-trade cost and TCA, portfolio risk and an OME index, short selling and margin, HFT monitor, LP/DMM desk
-- **9** simulation control app and polish
+- **7** back office with web consoles: named admin users with roles, maker-checker and audit trail; broker desk; exchange ops console and clearing desk; surveillance
+- **8** institutional terminal, short selling and margin; **9** futures and options; **10** deployment (containers, Helm, TLS, sharing, more omectl backends)
 
 ## License
 

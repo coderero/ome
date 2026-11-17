@@ -4,6 +4,7 @@ use ome_recorder::{RecorderConfig, start};
 const USAGE: &str = "usage: ome-recorder [--postgres URL] [--redis URL] [--exchange ADDR] [--exchange-secret S]
                     [--clearing ADDR] [--clearing-secret S] [--broker NAME=ADDR ...] [--broker-secret S]
                     [--venue NAME=ADDR ...] [--venue-secret S] [--news ADDR] [--news-secret S] [--poll-ms MS]
+                    [--registry ADDR]   (brokers and venues are discovered from the registry as they join)
   e.g. --postgres postgres://ome:ome@127.0.0.1/ome --redis redis://127.0.0.1/";
 
 fn endpoint(name: &str, addr: &str, user: &str, secret: &str) -> Endpoint {
@@ -32,6 +33,7 @@ fn parse_args() -> Result<RecorderConfig, String> {
     let mut postgres = None;
     let mut redis = None;
     let mut poll_ms = 1_000;
+    let mut registry = ome_net::registry::RegistryAccess::from_env();
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
         let mut value = || iter.next().ok_or(format!("{flag} needs a value"));
@@ -53,6 +55,11 @@ fn parse_args() -> Result<RecorderConfig, String> {
             "--venue-secret" => venue_secret = value()?,
             "--news" => news = Some(value()?),
             "--news-secret" => news_secret = value()?,
+            "--registry" => {
+                let addr = value()?;
+                let secret = registry.as_ref().map(|r| r.secret.clone()).unwrap_or_else(|| "cluster".into());
+                registry = Some(ome_net::registry::RegistryAccess { addr, secret });
+            }
             "--poll-ms" => {
                 poll_ms = value()?
                     .parse()
@@ -76,6 +83,9 @@ fn parse_args() -> Result<RecorderConfig, String> {
         postgres,
         redis,
         poll_ms,
+        registry,
+        broker_secret,
+        venue_secret,
     })
 }
 

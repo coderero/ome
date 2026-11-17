@@ -1,5 +1,7 @@
 use crate::{Link, LinkEvent};
 use ome_net::log;
+use ome_net::registry::{Directory, resolve_addr};
+use std::sync::Arc;
 use ome_protocol::{MemberId, MemberKind, MemberMessage, ServerMessage, template};
 use std::sync::mpsc::Sender;
 
@@ -24,18 +26,28 @@ pub struct TcpConnector<T> {
     addr: String,
     events: Sender<T>,
     wrap: fn(u64, LinkEvent) -> T,
+    directory: Option<Arc<dyn Directory>>,
 }
 
 impl<T> TcpConnector<T> {
     pub fn new(addr: String, events: Sender<T>, wrap: fn(u64, LinkEvent) -> T) -> Self {
-        Self { addr, events, wrap }
+        Self { addr, events, wrap, directory: None }
+    }
+
+    pub fn resolving(mut self, directory: Option<Arc<dyn Directory>>) -> Self {
+        self.directory = directory;
+        self
     }
 }
 
 impl<T: Send + 'static> Connector for TcpConnector<T> {
     fn connect(&mut self, generation: u64) -> Option<Box<dyn Uplink>> {
         let wrap = self.wrap;
-        Link::connect(&self.addr, self.events.clone(), move |event| {
+        let addr = match &self.directory {
+            Some(directory) => resolve_addr(directory.as_ref(), &self.addr)?,
+            None => self.addr.clone(),
+        };
+        Link::connect(&addr, self.events.clone(), move |event| {
             wrap(generation, event)
         })
         .ok()
@@ -76,6 +88,9 @@ pub struct Upstream {
     uplink: Option<Box<dyn Uplink>>,
     state: LinkState,
     generation: u64,
+    application: Option<(MemberKind, String)>,
+    applied: bool,
+    last_problem: String,
 }
 
 impl Upstream {
@@ -91,7 +106,27 @@ impl Upstream {
             uplink: None,
             state: LinkState::Down { retry_at: 0 },
             generation: 0,
+            application: None,
+            applied: false,
+            last_problem: String::new(),
         }
+    }
+
+    pub fn applying_as(mut self, kind: MemberKind, note: &str) -> Self {
+        self.application = Some((kind, note.to_string()));
+        self
+    }
+
+    pub fn label(&self) -> &'static str {
+        self.label
+    }
+
+    pub fn problem(&self) -> &str {
+        if self.is_ready() { "" } else { &self.last_problem }
+    }
+
+    pub fn awaiting_approval(&self) -> bool {
+        self.applied && !self.is_ready()
     }
 
     pub fn state(&self) -> LinkState {
@@ -128,6 +163,7 @@ impl Upstream {
                 if self.generation % 10 == 1 {
                     log(&format!("{} unreachable, retrying", self.label));
                 }
+                self.last_problem = "unreachable".into();
                 self.state = LinkState::Down {
                     retry_at: now + RECONNECT_MS,
                 };
@@ -146,6 +182,7 @@ impl Upstream {
         }
         let message = match event {
             LinkEvent::Closed => {
+                self.last_problem = "connection closed".into();
                 self.down(now, RECONNECT_MS, "connection closed");
                 return Some(UpstreamEvent::Down);
             }
@@ -162,6 +199,26 @@ impl Upstream {
                 ref_template: template::MEMBER_LOGON,
                 reason,
             } if self.state == LinkState::LoggingOn => {
+                if let (Some((kind, note)), Some(uplink)) = (&self.application, &self.uplink) {
+                    let apply = MemberMessage::Apply {
+                        kind: *kind,
+                        name: self.credentials.name.clone(),
+                        secret: self.credentials.secret.clone(),
+                        note: note.clone(),
+                    };
+                    if uplink.send(&apply) && !self.applied {
+                        log(&format!(
+                            "{} refused the logon of {}; applied for membership, awaiting approval",
+                            self.label, self.credentials.name
+                        ));
+                        self.applied = true;
+                    }
+                }
+                self.last_problem = if self.applied {
+                    "awaiting approval".into()
+                } else {
+                    format!("logon rejected: {reason}")
+                };
                 self.down(
                     now,
                     REJECTED_LOGON_RETRY_MS,
@@ -170,6 +227,10 @@ impl Upstream {
                 Some(UpstreamEvent::Down)
             }
             ServerMessage::ReplayComplete { next_seq } => {
+                if self.applied {
+                    log(&format!("{}: membership approved", self.label));
+                }
+                self.applied = false;
                 self.state = LinkState::Ready;
                 Some(UpstreamEvent::Ready { next_seq })
             }
@@ -296,6 +357,20 @@ mod tests {
                 retry_at: REJECTED_LOGON_RETRY_MS
             }
         );
+
+        let (applicant, sent) = upstream(true);
+        let mut applicant = applicant.applying_as(MemberKind::Broker, "retail broker");
+        applicant.tick(0, 0);
+        let reject = ServerMessage::Reject {
+            ref_template: template::MEMBER_LOGON,
+            reason: "invalid member or secret".into(),
+        };
+        applicant.on_event(1, LinkEvent::Message(reject), 0);
+        assert!(matches!(
+            &sent.0.lock().unwrap()[1],
+            MemberMessage::Apply { kind: MemberKind::Broker, name, .. } if name == "b"
+        ));
+        assert!(applicant.awaiting_approval() && applicant.problem() == "awaiting approval");
 
         let (mut unreachable, _) = upstream(false);
         unreachable.tick(0, 0);

@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -uo pipefail
 cd "$(dirname "$0")/.."
-source scripts/env.sh
-
-for name in recorder agents newsroom simctl retail-co prime-co dma-co lp-co wholesale-co ats-co clearing exchange; do
-  pidfile="$OME_DATA/$name.pid"
-  if [[ -f "$pidfile" ]]; then
-    pid="$(cat "$pidfile")"
-    kill "$pid" 2>/dev/null && echo "stopped $name (pid $pid)"
-    rm -f "$pidfile"
-  fi
+if [[ -x ./target/release/omectl ]]; then
+  exec ./target/release/omectl down
+fi
+for pidfile in "${OME_DATA:-data}"/*.pid; do
+  [[ -f "$pidfile" ]] || continue
+  kill "$(cat "$pidfile")" 2>/dev/null && echo "stopped $(basename "$pidfile" .pid)"
+  rm -f "$pidfile"
 done

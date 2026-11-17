@@ -17,6 +17,7 @@ ome-exchange = { path = "crates/ome-exchange" }
 ome-broker = { path = "crates/ome-broker" }
 ome-ui-data = { path = "crates/ui/ome-ui-data" }
 ome-ui = { path = "crates/ui/ome-ui" }
+ome-llm = { path = "crates/ome-llm" }
 rand = "0.9"
 sha2 = "0.10"
 serde_json = "1"

@@ -1,56 +1,34 @@
-use ome_broker::profile::{ProfileKind, Regime};
-use ome_broker::{BrokerConfig, start as start_broker};
 use ome_client::Client;
 use ome_core::symbol::Symbol;
-use ome_exchange::exchange::ExchangeConfig;
-use ome_exchange::{ServerConfig, start as start_exchange};
-use ome_newsroom::company::parse_companies;
 use ome_newsroom::{NewsConfig, start as start_newsroom};
-use ome_protocol::{
-    ClientMessage, MemberKind, MemberMessage, NewsItem, NewsKind, Role, ServerMessage, SimMessage,
-    SimRole,
-};
-use ome_simctl::{SimConfig, start as start_simctl};
+use ome_protocol::{MemberKind, MemberMessage, NewsItem, NewsKind, ServerMessage, WireItem};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const COMPANIES: &str = "company ACME sector=robotics price=25.00 shares=52000 eps=1.25 margin=12 growth=9 beta=1.2 name=Acme Robotics
-company NOVA sector=energy price=12.50 shares=104000 eps=0.80 margin=8 growth=4 beta=0.9 name=Nova Energy";
-
-fn newsroom(
-    journal: Option<PathBuf>,
-    exchange: Option<SocketAddr>,
-    news_per_day: f64,
-) -> SocketAddr {
+fn newsroom(journal: Option<PathBuf>, llm: Option<ome_llm::LlmConfig>) -> SocketAddr {
     start_newsroom(NewsConfig {
         listen: "127.0.0.1:0".into(),
         journal,
-        companies: parse_companies(COMPANIES).unwrap(),
         ops_name: "ops".into(),
         ops_secret: "ops".into(),
-        exchange: exchange.map(|a| (a.to_string(), "ops".into(), "ops".into())),
-        quarter_days: 2,
-        news_per_day,
+        sources: vec![("world".into(), "wire".into())],
         seed: Some(7),
-        llm: None,
+        llm,
+        registry: None,
     })
     .unwrap()
     .0
 }
 
 fn ops(addr: SocketAddr) -> Client {
-    Client::connect_member(&addr.to_string(), "ops", "ops")
-        .unwrap()
-        .0
+    Client::connect_member(&addr.to_string(), "ops", "ops").unwrap().0
 }
 
 fn status(client: &mut Client) -> ome_protocol::NewsroomStatus {
     client.send_member(&MemberMessage::QueryNewsroom).unwrap();
     match client
-        .wait_for(Duration::from_secs(3), |m| {
-            matches!(m, ServerMessage::NewsroomStatus(_))
-        })
+        .wait_for(Duration::from_secs(3), |m| matches!(m, ServerMessage::NewsroomStatus(_)))
         .unwrap()
     {
         ServerMessage::NewsroomStatus(s) => s,
@@ -63,245 +41,126 @@ fn collect(client: &Client, until: impl Fn(&[NewsItem]) -> bool) -> Vec<NewsItem
     let mut items = Vec::new();
     while !until(&items) {
         assert!(Instant::now() < deadline, "only got {items:#?}");
-        if let Ok(Some(ServerMessage::News(item))) = client.recv_timeout(Duration::from_millis(100))
-        {
+        if let Ok(Some(ServerMessage::News(item))) = client.recv_timeout(Duration::from_millis(100)) {
             items.push(item);
         }
     }
     items
 }
 
-#[test]
-fn stories_flow_from_the_newsroom_through_a_broker_and_fundamentals_drive_fair_values() {
-    let exchange = start_exchange(ServerConfig {
-        listen: "127.0.0.1:0".into(),
-        journal: None,
-        admin_name: "ops".into(),
-        admin_secret: "ops".into(),
-        exchange: ExchangeConfig {
-            require_prospectus: true,
-            ..ExchangeConfig::default()
-        },
-    })
-    .unwrap()
-    .0;
-    let (mut exchange_ops, _) =
-        Client::connect_member(&exchange.to_string(), "ops", "ops").unwrap();
-    exchange_ops
-        .request_member(&MemberMessage::CreateMember {
-            kind: MemberKind::Broker,
-            name: "retail-co".into(),
-            secret: "pw".into(),
-        })
-        .unwrap();
-    let news = newsroom(None, Some(exchange), 5_000_000.0);
-    let mut desk = ops(news);
-    desk.request_member(&MemberMessage::CreateMember {
-        kind: MemberKind::Broker,
-        name: "retail-co".into(),
-        secret: "pw".into(),
-    })
-    .unwrap();
-    assert!(
-        desk.request_member(&MemberMessage::InjectNews {
-            symbol: None,
-            event: "lawsuit".into()
-        })
-        .is_err()
-    );
-
-    let retail = start_broker(BrokerConfig {
-        listen: "127.0.0.1:0".into(),
-        journal: None,
-        profile: ProfileKind::Retail,
-        admin_name: "admin".into(),
-        admin_secret: "admin".into(),
-        exchange_addr: exchange.to_string(),
-        member_name: "retail-co".into(),
-        member_secret: "pw".into(),
-        clearing_addr: None,
-        regime: Regime::India,
-        wholesaler_addr: None,
-        ats_addr: None,
-        news_addr: Some(news.to_string()),
-        postgres: None,
-    })
-    .unwrap()
-    .0;
-    let listing = |symbol: &str| MemberMessage::ListInstrument {
-        symbol: Symbol::parse(symbol).unwrap(),
-        ipo_price: 25_00,
-        shares: 1_000,
-        underwriter: 2,
-        issuer_account: 1,
-        name: symbol.into(),
-    };
-    let refused = exchange_ops.request_member(&listing("ZZZ")).unwrap_err();
-    assert!(refused.to_string().contains("no prospectus"), "{refused}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while exchange_ops.request_member(&listing("ACME")).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "the newsroom never filed ACME's prospectus"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+fn wire(seq: u64, kind: NewsKind, event: &str, facts: &[(&str, &str)]) -> WireItem {
+    WireItem {
+        seq,
+        day: 2,
+        kind,
+        symbol: if kind == NewsKind::Macro { None } else { Symbol::parse("ACME") },
+        sentiment: if event == "lawsuit" { -40 } else { 35 },
+        impact_bps: if event == "lawsuit" { -80 } else { 40 },
+        event: event.into(),
+        sector: "robotics".into(),
+        company: "Acme Robotics".into(),
+        facts: facts.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        data: "fund=ACME:3125:900:0".into(),
+        headline: String::new(),
+        body: String::new(),
     }
-    let (mut admin, _) = Client::connect_and_logon(&retail.to_string(), "admin", "admin").unwrap();
-    admin
-        .request(&ClientMessage::CreateAccount {
-            role: Role::Retail,
-            cash: 1_000_00,
-            username: "alice".into(),
-            secret: "pw".into(),
-        })
-        .unwrap();
-    let (mut alice, _) = Client::connect_and_logon(&retail.to_string(), "alice", "pw").unwrap();
-    let prospectuses = {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            assert!(
-                Instant::now() < deadline,
-                "broker never received the backlog"
-            );
-            alice
-                .send(&ClientMessage::SubscribeNews { recent: 50 })
-                .ok();
-            let mut got = Vec::new();
-            let window = Instant::now() + Duration::from_millis(400);
-            while Instant::now() < window {
-                if let Ok(Some(ServerMessage::News(item))) =
-                    alice.recv_timeout(Duration::from_millis(50))
-                    && item.kind == NewsKind::Prospectus
-                {
-                    got.push(item);
-                }
-            }
-            if got.len() >= 2 {
-                break got;
-            }
-        }
-    };
-    assert_eq!(prospectuses[0].value("price"), Some("25.00"));
+}
 
-    exchange_ops
-        .request_member(&MemberMessage::SetSchedule {
-            pre_open_ms: 300,
-            continuous_ms: 1_200,
-            closing_ms: 200,
-            closed_ms: 300,
-        })
-        .unwrap();
-    let live = collect(&alice, |items| {
-        items.iter().any(|i| i.kind == NewsKind::Earnings)
-            && items.iter().any(|i| i.kind == NewsKind::Macro)
-            && items
-                .iter()
-                .any(|i| matches!(i.kind, NewsKind::Company | NewsKind::Sector))
-    });
-    let seqs: Vec<u64> = live.iter().map(|i| i.seq).collect();
-    assert!(
-        seqs.windows(2).all(|w| w[1] == w[0] + 1),
-        "gap-free {seqs:?}"
-    );
-    let earnings = live.iter().find(|i| i.kind == NewsKind::Earnings).unwrap();
-    assert!(earnings.value("eps").is_some() && earnings.day >= 1);
+fn wires() -> Vec<WireItem> {
+    vec![
+        wire(1, NewsKind::Prospectus, "prospectus", &[("revenue", "$875,000"), ("margin", "12.00%"), ("eps", "1.25"), ("growth", "9.00%"), ("shares", "67000"), ("price", "25.00")]),
+        wire(2, NewsKind::Company, "upgrade", &[("event", "upgrade")]),
+        wire(3, NewsKind::Company, "contract-win", &[("event", "contract-win")]),
+        wire(4, NewsKind::Company, "lawsuit", &[("event", "lawsuit")]),
+        wire(5, NewsKind::Earnings, "earnings", &[("eps", "0.33"), ("consensus", "0.31"), ("surprise", "+6.45%"), ("revenue", "$220,000"), ("margin", "12.00%"), ("quarter", "1")]),
+        wire(6, NewsKind::Macro, "cpi", &[("actual", "2.60%"), ("expected", "2.80%")]),
+    ]
+}
 
-    let acme = Symbol::parse("ACME").unwrap();
-    let valued = live.iter().filter(|i| i.data.contains("fund=")).count();
-    assert!(valued > 0, "stories carry fundamentals so agents can value companies themselves");
-    let prospectus = live.iter().find(|i| i.kind == NewsKind::Prospectus && i.symbol == Some(acme));
-    if let Some(p) = prospectus {
-        assert!(p.data.contains("fund=ACME:") && p.value("price") == Some("25.00"));
+fn source(addr: SocketAddr) -> (Client, u64) {
+    let mut client = Client::connect(&addr.to_string()).unwrap();
+    client.logon_member("world", "wire", 0).unwrap();
+    match client
+        .wait_for(Duration::from_secs(3), |m| matches!(m, ServerMessage::ReplayComplete { .. }))
+        .unwrap()
+    {
+        ServerMessage::ReplayComplete { next_seq } => (client, next_seq),
+        _ => unreachable!(),
     }
-    let room_fair = status(&mut desk).companies.iter().find(|c| c.symbol == Some(acme)).unwrap().fair;
-    assert!(room_fair > 15_00 && room_fair < 40_00, "fair value stays in a sane range: {room_fair}");
-    let s = status(&mut desk);
-    assert!(s.day >= 1 && s.subscribers == 1, "{s:?}");
-    assert_eq!(s.writer, "templates");
-
-    let steering = start_simctl(SimConfig {
-        listen: "127.0.0.1:0".into(),
-        journal: None,
-        operator: ("operator".into(), "sim".into()),
-        runner: ("runner".into(), "runner".into()),
-        exchange_addr: exchange.to_string(),
-        exchange_name: "ops".into(),
-        exchange_secret: "ops".into(),
-        newsroom: Some((news.to_string(), "ops".into())),
-    })
-    .unwrap()
-    .0;
-    let mut steer =
-        Client::connect_sim(&steering.to_string(), SimRole::Operator, "operator", "sim").unwrap();
-    let text = steer
-        .request_sim(&SimMessage::Command(ome_protocol::SimCommand::Scenario(
-            ome_protocol::Scenario::NewsShock {
-                symbol: acme,
-                move_bps: -800,
-                seconds: 30,
-            },
-        )))
-        .unwrap();
-    assert!(text.contains("newsroom story"), "{text}");
-    let shock = collect(&alice, |items| {
-        items.iter().any(|i| i.value("event") == Some("shock"))
-    });
-    let shock = shock
-        .iter()
-        .find(|i| i.value("event") == Some("shock"))
-        .unwrap();
-    assert_eq!((shock.symbol, shock.sentiment), (Some(acme), -80));
-    assert!((shock.impact_bps + 800).abs() <= 5);
 }
 
 #[test]
-fn the_newsroom_recovers_from_its_journal_and_subscribers_resume_after_their_last_story() {
+fn wire_events_reach_subscribers_admitted_by_application_once_and_after_a_restart() {
     let dir = std::env::temp_dir().join(format!("ome-newsroom-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let journal = dir.join("newsroom.journal");
     let _ = std::fs::remove_file(&journal);
-    let first = newsroom(Some(journal.clone()), None, 0.0);
-    let mut desk = ops(first);
-    desk.request_member(&MemberMessage::CreateMember {
-        kind: MemberKind::Broker,
-        name: "prime-co".into(),
-        secret: "pw".into(),
-    })
-    .unwrap();
-    let acme = Symbol::parse("ACME").unwrap();
-    for event in ["lawsuit", "earnings", "rates"] {
-        let text = desk
-            .request_member(&MemberMessage::InjectNews {
-                symbol: Some(acme),
-                event: event.into(),
-            })
-            .unwrap();
-        assert!(text.starts_with('#'), "{text}");
+    let news = newsroom(Some(journal.clone()), None);
+
+    let mut applicant = Client::connect(&news.to_string()).unwrap();
+    assert!(applicant.logon_member("prime-co", "pw", 0).is_err());
+    applicant
+        .request_member(&MemberMessage::Apply {
+            kind: MemberKind::Broker,
+            name: "prime-co".into(),
+            secret: "pw".into(),
+            note: "prime broker".into(),
+        })
+        .unwrap();
+    let mut desk = ops(news);
+    desk.send_member(&MemberMessage::QueryApplications).unwrap();
+    let pending = match desk
+        .wait_for(Duration::from_secs(3), |m| matches!(m, ServerMessage::Applications(_)))
+        .unwrap()
+    {
+        ServerMessage::Applications(list) => list,
+        _ => unreachable!(),
+    };
+    assert_eq!((pending[0].name.as_str(), pending[0].note.as_str()), ("prime-co", "prime broker"));
+    let text = desk
+        .request_member(&MemberMessage::Decide { name: "prime-co".into(), approve: true, amount: 0, note: String::new() })
+        .unwrap();
+    assert!(text.contains("admitted"), "{text}");
+    assert!(desk
+        .request_member(&MemberMessage::Decide { name: "prime-co".into(), approve: true, amount: 0, note: String::new() })
+        .is_err());
+
+    let mut subscriber = Client::connect(&news.to_string()).unwrap();
+    subscriber.logon_member("prime-co", "pw", 0).unwrap();
+    let (mut world, next) = source(news);
+    assert_eq!(next, 1);
+    for w in wires().into_iter().take(4) {
+        world.send_member(&MemberMessage::Wire(w)).unwrap();
     }
-    let before = status(&mut desk);
-    assert_eq!(before.published, 5, "two prospectuses and three stories");
+    let items = collect(&subscriber, |items| items.len() >= 4);
+    assert_eq!(items.iter().map(|i| i.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert!(items[0].body.contains("25.00") && items[0].value("price") == Some("25.00"), "{:?}", items[0]);
+    assert!(items[3].data.contains("fund=ACME:"), "the vendor passes the fundamentals on");
+    assert_eq!(items[3].impact_bps, -80);
+    drop(world);
 
-    let second = newsroom(Some(journal.clone()), None, 0.0);
-    let mut again = ops(second);
-    let after = status(&mut again);
-    assert_eq!(after.published, 5, "prospectuses are not filed twice");
-    assert_eq!(after.companies, before.companies);
-    assert_eq!(after.economy, before.economy);
+    let (mut world, next) = source(news);
+    assert_eq!(next, 5, "the source resumes after the last event the vendor took");
+    for w in wires() {
+        world.send_member(&MemberMessage::Wire(w)).unwrap();
+    }
+    let more = collect(&subscriber, |items| items.len() >= 2);
+    assert_eq!(more.iter().map(|i| i.seq).collect::<Vec<_>>(), vec![5, 6], "resent events are not published twice");
+    let s = status(&mut desk);
+    assert_eq!((s.published, s.received, s.subscribers, s.sources, s.day), (6, 6, 1, 1, 2));
 
-    let mut subscriber = Client::connect(&second.to_string()).unwrap();
-    subscriber.logon_member("prime-co", "pw", 3).unwrap();
+    let again = newsroom(Some(journal.clone()), None);
+    let mut resumed = Client::connect(&again.to_string()).unwrap();
+    resumed.logon_member("prime-co", "pw", 4).unwrap();
     let mut seqs = Vec::new();
-    while let Ok(Some(message)) = subscriber.recv_timeout(Duration::from_millis(300)) {
+    while let Ok(Some(message)) = resumed.recv_timeout(Duration::from_millis(300)) {
         if let ServerMessage::News(item) = message {
             seqs.push(item.seq);
         }
     }
-    assert_eq!(
-        seqs,
-        vec![4, 5],
-        "replay starts after the subscriber's last story"
-    );
-    assert!(Client::connect_member(&second.to_string(), "prime-co", "wrong").is_err());
+    assert_eq!(seqs, vec![5, 6], "replay starts after the subscriber's last story");
+    assert_eq!(source(again).1, 7);
+    assert!(Client::connect_member(&again.to_string(), "prime-co", "wrong").is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -378,27 +237,8 @@ fn an_llm_rewrites_stories_in_order_and_bad_replies_fall_back_to_the_template() 
     let journal = dir.join("newsroom.journal");
     let _ = std::fs::remove_file(&journal);
     let llm = fake_llm();
-    let start = |journal: PathBuf| {
-        start_newsroom(NewsConfig {
-            listen: "127.0.0.1:0".into(),
-            journal: Some(journal),
-            companies: parse_companies(COMPANIES).unwrap(),
-            ops_name: "ops".into(),
-            ops_secret: "ops".into(),
-            exchange: None,
-            quarter_days: 2,
-            news_per_day: 0.0,
-            seed: Some(3),
-            llm: Some(ome_newsroom::llm::LlmConfig {
-                url: format!("http://{llm}"),
-                model: "fake".into(),
-                timeout: Duration::from_secs(2),
-            }),
-        })
-        .unwrap()
-        .0
-    };
-    let news = start(journal.clone());
+    let config = ome_llm::LlmConfig { url: format!("http://{llm}"), model: "fake".into(), timeout: Duration::from_secs(2) };
+    let news = newsroom(Some(journal.clone()), Some(config.clone()));
     let mut desk = ops(news);
     desk.request_member(&MemberMessage::CreateMember {
         kind: MemberKind::Broker,
@@ -408,39 +248,21 @@ fn an_llm_rewrites_stories_in_order_and_bad_replies_fall_back_to_the_template() 
     .unwrap();
     let mut subscriber = Client::connect(&news.to_string()).unwrap();
     subscriber.logon_member("prime-co", "pw", 0).unwrap();
-    let acme = Symbol::parse("ACME").unwrap();
-    for event in ["upgrade", "contract-win", "lawsuit", "earnings"] {
-        desk.request_member(&MemberMessage::InjectNews {
-            symbol: Some(acme),
-            event: event.into(),
-        })
-        .unwrap();
+    let (mut world, _) = source(news);
+    for w in wires() {
+        world.send_member(&MemberMessage::Wire(w)).unwrap();
     }
     let items = collect(&subscriber, |items| items.len() >= 6);
     let seqs: Vec<u64> = items.iter().map(|i| i.seq).collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6], "published strictly in order");
-    let rewritten = items
-        .iter()
-        .filter(|i| i.headline.starts_with("Wire: "))
-        .count();
-    assert!(
-        (3..=5).contains(&rewritten),
-        "{rewritten} of 6 rewritten: {items:#?}"
-    );
+    let rewritten = items.iter().filter(|i| i.headline.starts_with("Wire: ")).count();
+    assert!((3..=5).contains(&rewritten), "{rewritten} of 6 rewritten: {items:#?}");
     let writer = status(&mut desk).writer;
-    assert!(
-        writer.starts_with("llm fake") && writer.contains("fallback"),
-        "{writer}"
-    );
+    assert!(writer.starts_with("llm fake") && writer.contains("fallback"), "{writer}");
 
-    let again = start(journal.clone());
+    let again = newsroom(Some(journal.clone()), Some(config));
     let mut reader = ops(again);
-    reader
-        .send_member(&MemberMessage::QueryNews {
-            limit: 10,
-            symbol: None,
-        })
-        .unwrap();
+    reader.send_member(&MemberMessage::QueryNews { limit: 10, symbol: None }).unwrap();
     let mut replayed = Vec::new();
     while let Ok(Some(message)) = reader.recv_timeout(Duration::from_millis(500)) {
         match message {

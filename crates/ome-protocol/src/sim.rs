@@ -377,6 +377,84 @@ pub fn get_recordings(d: &mut Decoder) -> Result<Vec<RecordingInfo>, DecodeError
     Ok(recordings)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorldStatus {
+    pub day: u64,
+    pub quarter: u64,
+    pub events: u64,
+    pub economy: crate::news::MacroInfo,
+    pub companies: Vec<crate::news::CompanyInfo>,
+    pub provisioning: String,
+    pub ideas: String,
+}
+
+pub fn put_world(e: &mut Encoder, w: &WorldStatus) {
+    e.u64(w.day)
+        .u64(w.quarter)
+        .u64(w.events)
+        .i64(w.economy.rate_bps)
+        .i64(w.economy.inflation_bps)
+        .i64(w.economy.growth_bps)
+        .i64(w.economy.risk_appetite)
+        .end_block();
+    crate::news::put_companies(e, &w.companies);
+    e.var(&w.provisioning).var(&w.ideas);
+}
+
+pub fn get_world(d: &mut Decoder) -> Result<WorldStatus, DecodeError> {
+    let day = d.u64()?;
+    let quarter = d.u64()?;
+    let events = d.u64()?;
+    let economy = crate::news::MacroInfo {
+        rate_bps: d.i64()?,
+        inflation_bps: d.i64()?,
+        growth_bps: d.i64()?,
+        risk_appetite: d.i64()?,
+    };
+    d.end_block()?;
+    Ok(WorldStatus {
+        day,
+        quarter,
+        events,
+        economy,
+        companies: crate::news::get_companies(d)?,
+        provisioning: d.var()?,
+        ideas: d.var()?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub name: String,
+    pub group: String,
+    pub broker: String,
+    pub addr: String,
+    pub secret: String,
+    pub spec: String,
+}
+
+pub fn put_assignment(e: &mut Encoder, a: &Assignment) {
+    e.end_block()
+        .var(&a.name)
+        .var(&a.group)
+        .var(&a.broker)
+        .var(&a.addr)
+        .var(&a.secret)
+        .var(&a.spec);
+}
+
+pub fn get_assignment(d: &mut Decoder) -> Result<Assignment, DecodeError> {
+    d.end_block()?;
+    Ok(Assignment {
+        name: d.var()?,
+        group: d.var()?,
+        broker: d.var()?,
+        addr: d.var()?,
+        secret: d.var()?,
+        spec: d.var()?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimMessage {
     Logon {
@@ -405,6 +483,11 @@ pub enum SimMessage {
     QueryRecordings {
         name: String,
     },
+    QueryWorld,
+    Inject {
+        event: String,
+        symbol: Option<Symbol>,
+    },
 }
 
 impl SimMessage {
@@ -419,6 +502,8 @@ impl SimMessage {
             SimMessage::Replay { .. } => SIM_REPLAY,
             SimMessage::StopReplay => SIM_STOP_REPLAY,
             SimMessage::QueryRecordings { .. } => SIM_QUERY_RECORDINGS,
+            SimMessage::QueryWorld => SIM_QUERY_WORLD,
+            SimMessage::Inject { .. } => SIM_INJECT,
         }
     }
 
@@ -445,7 +530,7 @@ impl SimMessage {
                     .u64(*closed_s)
                     .end_block();
             }
-            SimMessage::QueryStatus | SimMessage::StopReplay => {
+            SimMessage::QueryStatus | SimMessage::StopReplay | SimMessage::QueryWorld => {
                 e.end_block();
             }
             SimMessage::Record { name, start } => {
@@ -456,6 +541,9 @@ impl SimMessage {
             }
             SimMessage::QueryRecordings { name } => {
                 e.end_block().var(name);
+            }
+            SimMessage::Inject { event, symbol } => {
+                e.symbol(*symbol).end_block().var(event);
             }
         }
         e.finish()
@@ -519,6 +607,18 @@ impl SimMessage {
             SIM_QUERY_RECORDINGS => {
                 d.end_block()?;
                 SimMessage::QueryRecordings { name: d.var()? }
+            }
+            SIM_QUERY_WORLD => {
+                d.end_block()?;
+                SimMessage::QueryWorld
+            }
+            SIM_INJECT => {
+                let symbol = d.optional_symbol()?;
+                d.end_block()?;
+                SimMessage::Inject {
+                    event: d.var()?,
+                    symbol,
+                }
             }
             other => return Err(DecodeError::UnknownTemplate(other)),
         })
@@ -608,6 +708,15 @@ mod tests {
             SimMessage::StopReplay,
             SimMessage::QueryRecordings {
                 name: String::new(),
+            },
+            SimMessage::QueryWorld,
+            SimMessage::Inject {
+                event: "lawsuit".into(),
+                symbol: Some(acme()),
+            },
+            SimMessage::Inject {
+                event: "cpi".into(),
+                symbol: None,
             },
         ];
         messages.extend(commands().into_iter().map(SimMessage::Command));

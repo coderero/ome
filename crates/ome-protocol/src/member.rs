@@ -78,10 +78,20 @@ pub enum MemberMessage {
         limit: u32,
         symbol: Option<Symbol>,
     },
-    InjectNews {
-        symbol: Option<Symbol>,
-        event: String,
+    Apply {
+        kind: MemberKind,
+        name: String,
+        secret: String,
+        note: String,
     },
+    QueryApplications,
+    Decide {
+        name: String,
+        approve: bool,
+        amount: u64,
+        note: String,
+    },
+    Wire(crate::news::WireItem),
     FileProspectus {
         symbol: Symbol,
         reference: u64,
@@ -162,7 +172,10 @@ impl MemberMessage {
             MemberMessage::QueryObligations => QUERY_OBLIGATIONS,
             MemberMessage::QueryNewsroom => QUERY_NEWSROOM,
             MemberMessage::QueryNews { .. } => QUERY_NEWS,
-            MemberMessage::InjectNews { .. } => INJECT_NEWS,
+            MemberMessage::Apply { .. } => APPLY,
+            MemberMessage::QueryApplications => QUERY_APPLICATIONS,
+            MemberMessage::Decide { .. } => DECIDE,
+            MemberMessage::Wire(_) => WIRE,
             MemberMessage::FileProspectus { .. } => FILE_PROSPECTUS,
             MemberMessage::SetMemberStatus { .. } => SET_MEMBER_STATUS,
             MemberMessage::SetCancelOnDisconnect { .. } => SET_CANCEL_ON_DISCONNECT,
@@ -197,15 +210,30 @@ impl MemberMessage {
             | MemberMessage::QueryClearing
             | MemberMessage::QueryVenue
             | MemberMessage::QueryObligations
-            | MemberMessage::QueryNewsroom => {
+            | MemberMessage::QueryNewsroom
+            | MemberMessage::QueryApplications => {
                 e.end_block();
             }
             MemberMessage::QueryNews { limit, symbol } => {
                 e.u32(*limit).symbol(*symbol).end_block();
             }
-            MemberMessage::InjectNews { symbol, event } => {
-                e.symbol(*symbol).end_block().var(event);
+            MemberMessage::Apply {
+                kind,
+                name,
+                secret,
+                note,
+            } => {
+                e.u8(*kind as u8).end_block().var(name).var(secret).var(note);
             }
+            MemberMessage::Decide {
+                name,
+                approve,
+                amount,
+                note,
+            } => {
+                e.u8(*approve as u8).u64(*amount).end_block().var(name).var(note);
+            }
+            MemberMessage::Wire(item) => crate::news::put_wire(&mut e, item),
             MemberMessage::FileProspectus {
                 symbol,
                 reference,
@@ -531,14 +559,32 @@ impl MemberMessage {
                     name: d.var()?,
                 }
             }
-            INJECT_NEWS => {
-                let symbol = d.optional_symbol()?;
+            APPLY => {
+                let kind = member_kind_from(d.u8()?)?;
                 d.end_block()?;
-                MemberMessage::InjectNews {
-                    symbol,
-                    event: d.var()?,
+                MemberMessage::Apply {
+                    kind,
+                    name: d.var()?,
+                    secret: d.var()?,
+                    note: d.var()?,
                 }
             }
+            QUERY_APPLICATIONS => {
+                d.end_block()?;
+                MemberMessage::QueryApplications
+            }
+            DECIDE => {
+                let approve = d.u8()? != 0;
+                let amount = d.u64()?;
+                d.end_block()?;
+                MemberMessage::Decide {
+                    name: d.var()?,
+                    approve,
+                    amount,
+                    note: d.var()?,
+                }
+            }
+            WIRE => MemberMessage::Wire(crate::news::get_wire(&mut d)?),
             MEMBER_SET_MMP => {
                 let account = d.u64()?;
                 let window_ms = d.u64()?;
@@ -753,10 +799,34 @@ pub mod tests {
                 limit: 20,
                 symbol: Some(sym("ACME")),
             },
-            MemberMessage::InjectNews {
-                symbol: None,
-                event: "rate-hike".into(),
+            MemberMessage::Apply {
+                kind: MemberKind::Broker,
+                name: "retail-co".into(),
+                secret: "pw".into(),
+                note: "retail broker".into(),
             },
+            MemberMessage::QueryApplications,
+            MemberMessage::Decide {
+                name: "retail-co".into(),
+                approve: true,
+                amount: 2_000_000_00,
+                note: String::new(),
+            },
+            MemberMessage::Wire(crate::news::WireItem {
+                seq: 4,
+                day: 2,
+                kind: crate::news::NewsKind::Macro,
+                symbol: None,
+                sentiment: -20,
+                impact_bps: -35,
+                event: "rates".into(),
+                sector: String::new(),
+                company: String::new(),
+                facts: vec![("rate".into(), "4.75%".into()), ("expected".into(), "a hold".into())],
+                data: "fund=ACME:3100:900:0".into(),
+                headline: String::new(),
+                body: String::new(),
+            }),
             MemberMessage::FileProspectus {
                 symbol: sym("ACME"),
                 reference: 1,

@@ -3,7 +3,7 @@ use ome_broker::{BrokerConfig, start};
 use ome_client::DEFAULT_EXCHANGE_ADDR;
 
 const USAGE: &str = "usage: ome-broker --profile retail|prime|dma|lp --member NAME --member-secret SECRET
-                  [--regime us|india] [--wholesaler ADDR] [--ats ADDR] [--news ADDR] [--postgres URL] [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
+                  [--regime us|india] [--wholesaler ADDR|NAME] [--ats ADDR|NAME] [--news ADDR|NAME] [--registry ADDR] [--postgres URL] [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
 
 fn parse_args() -> Result<BrokerConfig, String> {
     let mut config = BrokerConfig {
@@ -22,6 +22,7 @@ fn parse_args() -> Result<BrokerConfig, String> {
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        registry: ome_net::registry::RegistryAccess::from_env(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -46,6 +47,11 @@ fn parse_args() -> Result<BrokerConfig, String> {
             "--member" => config.member_name = value()?,
             "--member-secret" => config.member_secret = value()?,
             "--clearing" => config.clearing_addr = Some(value()?),
+            "--registry" => {
+                let addr = value()?;
+                let secret = config.registry.as_ref().map(|r| r.secret.clone()).unwrap_or_else(|| "cluster".into());
+                config.registry = Some(ome_net::registry::RegistryAccess { addr, secret });
+            }
             _ => return Err(USAGE.into()),
         }
     }

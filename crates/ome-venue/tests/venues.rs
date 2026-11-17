@@ -39,6 +39,8 @@ fn venue(kind: Venue, exchange: SocketAddr, member: &str) -> SocketAddr {
             accept_pct: 100,
             ..WholesalerConfig::default()
         },
+        member_kind: None,
+        registry: None,
     })
     .unwrap()
     .0
@@ -65,6 +67,7 @@ fn broker(
         ats_addr: venues.1.map(|a| a.to_string()),
         news_addr: None,
         postgres: None,
+        registry: None,
     })
     .unwrap()
     .0
@@ -121,6 +124,8 @@ fn retail_flow_fills_at_the_wholesaler_and_institutions_meet_in_the_dark_pool() 
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: None,
     })
     .unwrap()
     .0;

@@ -1,5 +1,7 @@
 pub mod auth;
 pub mod feed;
+pub mod onboard;
+pub mod registry;
 pub mod throttle;
 
 use ome_protocol::framing::read_frame;
@@ -36,13 +38,21 @@ impl Outbox for ChannelOutbox {
 }
 
 pub fn listen<T: From<Inbound> + Send + 'static>(listener: TcpListener, inbound: Sender<T>) {
+    accept(listener, inbound, false);
+}
+
+pub fn listen_quietly<T: From<Inbound> + Send + 'static>(listener: TcpListener, inbound: Sender<T>) {
+    accept(listener, inbound, true);
+}
+
+fn accept<T: From<Inbound> + Send + 'static>(listener: TcpListener, inbound: Sender<T>, quiet: bool) {
     thread::spawn(move || {
         let mut next_id: SessionId = 0;
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     next_id += 1;
-                    if let Err(e) = serve(next_id, stream, inbound.clone()) {
+                    if let Err(e) = serve(next_id, stream, inbound.clone(), quiet) {
                         log(&format!("session {next_id} setup failed: {e}"));
                     }
                 }
@@ -56,6 +66,7 @@ fn serve<T: From<Inbound> + Send + 'static>(
     id: SessionId,
     stream: TcpStream,
     inbound: Sender<T>,
+    quiet: bool,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let peer = stream
@@ -70,7 +81,9 @@ fn serve<T: From<Inbound> + Send + 'static>(
     {
         return Ok(());
     }
-    log(&format!("session {id} connected from {peer}"));
+    if !quiet {
+        log(&format!("session {id} connected from {peer}"));
+    }
 
     thread::spawn(move || write_loop(writer_stream, rx));
     thread::spawn(move || {

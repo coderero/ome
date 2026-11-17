@@ -48,6 +48,13 @@ pub enum ServerMessage {
     News(crate::news::NewsItem),
     ChargesEstimate(ChargesEstimate),
     NewsroomStatus(crate::news::NewsroomStatus),
+    Applications(Vec<crate::onboard::Application>),
+    WorldStatus(crate::sim::WorldStatus),
+    SimAssign(crate::sim::Assignment),
+    SimRetire {
+        name: String,
+    },
+    Services(Vec<crate::registry::ServiceInfo>),
     SettlementReport(SettlementReport),
     ClearingStatus(ClearingStatus),
     MarketStatus(MarketStatus),
@@ -87,6 +94,11 @@ impl ServerMessage {
             ServerMessage::News(_) => NEWS,
             ServerMessage::ChargesEstimate(_) => CHARGES_ESTIMATE,
             ServerMessage::NewsroomStatus(_) => NEWSROOM_STATUS,
+            ServerMessage::Applications(_) => APPLICATIONS,
+            ServerMessage::WorldStatus(_) => WORLD_STATUS,
+            ServerMessage::SimAssign(_) => SIM_ASSIGN,
+            ServerMessage::SimRetire { .. } => SIM_RETIRE,
+            ServerMessage::Services(_) => SERVICES,
             ServerMessage::SettlementReport(_) => SETTLEMENT_REPORT,
             ServerMessage::ClearingStatus(_) => CLEARING_STATUS,
             ServerMessage::MarketStatus(_) => MARKET_STATUS,
@@ -281,6 +293,13 @@ impl ServerMessage {
                 e.end_block();
             }
             ServerMessage::NewsroomStatus(status) => crate::news::put_status(&mut e, status),
+            ServerMessage::Applications(list) => crate::onboard::put_applications(&mut e, list),
+            ServerMessage::WorldStatus(w) => crate::sim::put_world(&mut e, w),
+            ServerMessage::SimAssign(a) => crate::sim::put_assignment(&mut e, a),
+            ServerMessage::SimRetire { name } => {
+                e.end_block().var(name);
+            }
+            ServerMessage::Services(list) => crate::registry::put_services(&mut e, list),
             ServerMessage::SimStatus(s) => {
                 e.u32(s.runners).end_block();
                 crate::sim::put_groups(&mut e, &s.groups);
@@ -748,6 +767,14 @@ impl ServerMessage {
                 })
             }
             NEWSROOM_STATUS => ServerMessage::NewsroomStatus(crate::news::get_status(&mut d)?),
+            APPLICATIONS => ServerMessage::Applications(crate::onboard::get_applications(&mut d)?),
+            WORLD_STATUS => ServerMessage::WorldStatus(crate::sim::get_world(&mut d)?),
+            SIM_ASSIGN => ServerMessage::SimAssign(crate::sim::get_assignment(&mut d)?),
+            SIM_RETIRE => {
+                d.end_block()?;
+                ServerMessage::SimRetire { name: d.var()? }
+            }
+            SERVICES => ServerMessage::Services(crate::registry::get_services(&mut d)?),
             SIM_RECORDINGS => {
                 d.end_block()?;
                 ServerMessage::SimRecordings(crate::sim::get_recordings(&mut d)?)
@@ -1378,9 +1405,22 @@ mod tests {
             }),
             ServerMessage::NewsroomStatus(crate::news::NewsroomStatus {
                 day: 4,
-                quarter: 1,
                 published: 30,
                 subscribers: 2,
+                sources: 1,
+                received: 31,
+                writer: "templates".into(),
+            }),
+            ServerMessage::Applications(vec![crate::onboard::Application {
+                name: "retail-co".into(),
+                kind: MemberKind::Broker,
+                received_at: 77,
+                note: "retail broker".into(),
+            }]),
+            ServerMessage::WorldStatus(crate::sim::WorldStatus {
+                day: 4,
+                quarter: 1,
+                events: 12,
                 economy: crate::news::MacroInfo {
                     rate_bps: 450,
                     inflation_bps: 280,
@@ -1399,8 +1439,19 @@ mod tests {
                     name: "Acme Robotics".into(),
                     sector: "robotics".into(),
                 }],
-                writer: "templates".into(),
+                provisioning: "3/3 listings".into(),
+                ideas: "templates".into(),
             }),
+            ServerMessage::SimAssign(crate::sim::Assignment {
+                name: "noise-1".into(),
+                group: "noise".into(),
+                broker: "retail-co".into(),
+                addr: "127.0.0.1:7101".into(),
+                secret: "agent-pw".into(),
+                spec: "group noise count=1 broker=retail-co role=retail strategy=noise".into(),
+            }),
+            ServerMessage::SimRetire { name: "noise-1".into() },
+            ServerMessage::Services(vec![crate::registry::ServiceInfo::new("exchange", "exchange", "127.0.0.1:7000")]),
             ServerMessage::SimRecordings(vec![crate::sim::RecordingInfo {
                 name: "crash-drill".into(),
                 started_at: 1_000,

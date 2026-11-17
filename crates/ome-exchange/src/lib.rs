@@ -26,17 +26,21 @@ pub struct ServerConfig {
     pub admin_name: String,
     pub admin_secret: String,
     pub exchange: ExchangeConfig,
+    pub schedule: Option<session::Schedule>,
+    pub registry: Option<ome_net::registry::RegistryAccess>,
 }
 
 pub fn start(config: ServerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
-    let mut exchange = Exchange::new(config.exchange);
+    let mut exchange = Exchange::new(config.exchange.clone());
     let mut last_ts = 0;
+    let mut scheduled = false;
     let journal = match &config.journal {
         Some(path) => {
             let started = Instant::now();
             let (journal, records) = Journal::<Record>::open(path)
                 .map_err(|e| format!("cannot open journal {}: {e}", path.display()))?;
             for record in &records {
+                scheduled |= matches!(record.command, exchange::Command::SetSchedule { .. });
                 let _ = exchange.execute(&record.command, record.timestamp);
                 last_ts = record.timestamp;
             }
@@ -46,13 +50,23 @@ pub fn start(config: ServerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
                 path.display(),
                 started.elapsed()
             ));
-            Some(journal)
+            Some(ome_store::boxed(journal))
         }
         None => None,
     };
 
     let mut gateway = Gateway::new(exchange, journal, last_ts);
     gateway.ensure_admin(&config.admin_name, &config.admin_secret, now_ms())?;
+    if let Some(schedule) = config.schedule.filter(|_| !scheduled) {
+        gateway.start_schedule(schedule, now_ms())?;
+        log(&format!(
+            "trading calendar: pre-open {}s, open {}s, closing auction {}s, closed {}s",
+            schedule.pre_open_ms / 1_000,
+            schedule.continuous_ms / 1_000,
+            schedule.closing_ms / 1_000,
+            schedule.closed_ms / 1_000
+        ));
+    }
     gateway.flush().map_err(|e| e.to_string())?;
 
     let listener = TcpListener::bind(&config.listen)
@@ -64,11 +78,22 @@ pub fn start(config: ServerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
         gateway.exchange().instrument_list().len()
     ));
 
+    let mut info = ome_protocol::ServiceInfo::new("exchange", "exchange", &addr.to_string());
+    info.capabilities = format!(
+        "require_prospectus={} luld_bps={}",
+        config.exchange.require_prospectus, config.exchange.luld_bps
+    );
+    let reporter = ome_net::registry::Reporter::start(config.registry.clone(), info);
     let (tx, rx) = mpsc::channel::<Inbound>();
     listen(listener, tx);
     let handle = thread::spawn(move || {
         let mut next_tick = Instant::now() + TICK;
+        let mut next_report = Instant::now();
         loop {
+            if Instant::now() >= next_report {
+                next_report = Instant::now() + Duration::from_secs(1);
+                reporter.report(gateway.health());
+            }
             match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
                 Ok(first) => {
                     handle(&mut gateway, first);

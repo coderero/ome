@@ -14,7 +14,7 @@ use ome_protocol::framing::frame;
 use ome_protocol::{
     ClientMessage, Decoder, MarketPhase, MemberMessage, Role, ServerMessage, Venue, template,
 };
-use ome_store::Journal;
+use ome_store::FactLog;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ struct Session {
 pub struct Gateway {
     broker: Broker,
     market: MarketCache,
-    journal: Option<Journal<Record>>,
+    journal: Option<Box<dyn FactLog<Record>>>,
     sessions: BTreeMap<SessionId, Session>,
     dropped: BTreeSet<SessionId>,
     exchange: Upstream,
@@ -50,7 +50,7 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(
         broker: Broker,
-        journal: Option<Journal<Record>>,
+        journal: Option<Box<dyn FactLog<Record>>>,
         exchange: Upstream,
         clearing: Option<Upstream>,
         venues: BTreeMap<Venue, Upstream>,
@@ -133,6 +133,30 @@ impl Gateway {
             _ => {}
         }
         self.drop_slow_sessions();
+    }
+
+    pub fn health(&self) -> ome_net::registry::Report {
+        let mut report = ome_net::registry::Report::default();
+        let mut link = |name: &str, up: &Upstream| {
+            report.dep(name, up.is_ready(), up.problem());
+        };
+        link("exchange", &self.exchange);
+        if let Some(clearing) = &self.clearing {
+            link("clearing", clearing);
+        }
+        if let Some(news) = &self.news {
+            link("news", news);
+        }
+        for (venue, up) in &self.venues {
+            link(venue.label(), up);
+        }
+        report.metric("accounts", self.broker.ledger().accounts().count() as i64);
+        report.metric("sessions", self.sessions.values().filter(|s| s.login.is_some()).count() as i64);
+        let mut report = report.ready_unless(&["exchange"]);
+        if self.exchange.awaiting_approval() {
+            report.detail = "membership application awaiting exchange approval".into();
+        }
+        report
     }
 
     pub fn broker(&self) -> &Broker {

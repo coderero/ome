@@ -39,6 +39,7 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str) -> SocketAdd
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        registry: None,
     })
     .unwrap()
     .0
@@ -93,6 +94,8 @@ fn stop_loss_fires_on_an_exchange_trade_and_sells_into_the_bid() {
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: None,
     })
     .unwrap()
     .0;

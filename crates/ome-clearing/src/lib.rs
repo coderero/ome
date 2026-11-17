@@ -28,6 +28,7 @@ pub struct ServiceConfig {
     pub member_name: String,
     pub member_secret: String,
     pub clearing: ClearingConfig,
+    pub registry: Option<ome_net::registry::RegistryAccess>,
 }
 
 pub enum ClearingInbound {
@@ -65,7 +66,7 @@ pub fn start(
                 path.display(),
                 started.elapsed()
             ));
-            Some(journal)
+            Some(ome_store::boxed(journal))
         }
         None => None,
     };
@@ -76,7 +77,8 @@ pub fn start(
         name: config.member_name.clone(),
         secret: config.member_secret.clone(),
     };
-    let upstream = Upstream::new("exchange", Box::new(connector), credentials);
+    let upstream = Upstream::new("exchange", Box::new(connector), credentials)
+        .applying_as(ome_protocol::MemberKind::Clearing, "clearing house");
     let ops = OpsCredentials {
         secret: hash_secret(&config.ops_name, &config.ops_secret),
         name: config.ops_name.clone(),
@@ -94,11 +96,19 @@ pub fn start(
         config.clearing.settlement_lag,
         config.clearing.margin_bps
     ));
+    let mut info = ome_protocol::ServiceInfo::new(&config.member_name, "clearing", &addr.to_string());
+    info.capabilities = format!("cycle_ms={} settlement_lag={} margin_bps={}", config.clearing.cycle_ms, config.clearing.settlement_lag, config.clearing.margin_bps);
+    let reporter = ome_net::registry::Reporter::start(config.registry.clone(), info);
     listen(listener, tx);
 
     let handle = thread::spawn(move || {
         let mut next_tick = Instant::now();
+        let mut next_report = Instant::now();
         loop {
+            if Instant::now() >= next_report {
+                next_report = Instant::now() + Duration::from_secs(1);
+                reporter.report(gateway.health());
+            }
             match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
                 Ok(first) => {
                     handle(&mut gateway, first);

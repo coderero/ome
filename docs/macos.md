@@ -2,13 +2,13 @@
 
 This guide covers running the whole simulated market on a Mac (Apple Silicon or Intel), with or without Docker.
 
-> OME has not been tested on macOS yet. Everything below follows from how the code and scripts are built: no Linux-specific system calls and no OpenSSL. One known script issue (bash 3.2) has a workaround in step 1. Please report anything that behaves differently.
+> OME has not been tested on macOS yet. Everything below follows from how the code and scripts are built: no Linux-specific system calls and no OpenSSL. The market is started by `omectl`, a Rust program, so the bash 3.2 that ships with macOS is enough for the small wrapper scripts. Please report anything that behaves differently.
 
 ## What runs where
 
 | Part | How it runs | Needed? |
 |---|---|---|
-| Exchange, clearing house, brokers, venues, newsroom, simctl, trading agents | native Rust programs started by `scripts/demo.sh` | always |
+| Exchange, clearing house, brokers, venues, newsroom, simctl, trading agents | native Rust programs started and supervised by `omectl` (`scripts/demo.sh` builds and runs it) | always |
 | Desktop trading app (`ome-retail`) | native window, drawn with Metal | optional |
 | PostgreSQL and Redis | Docker, or Homebrew | only for recording (`OME_RECORD=1`) and 1-minute chart history |
 | Ollama (local LLM for news) | native app (recommended on Mac), or Docker | optional; without it the newsroom uses its event catalogue |
@@ -21,17 +21,13 @@ Docker is never required. On a Mac, Ollama should run natively: Docker on macOS 
 xcode-select --install                 # compiler and linker
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"   # Homebrew, if missing
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh     # Rust
-brew install bash                      # bash 4 or newer for the scripts
 ```
 
 Open a new terminal, then check:
 
 ```bash
 rustc --version      # a recent stable toolchain; the code uses the 2024 edition (Rust 1.88 or newer)
-bash --version       # must say 4.x or 5.x, not 3.2
 ```
-
-**Why the newer bash:** macOS ships bash 3.2 at `/bin/bash`. `scripts/seed.sh` uses `${symbol,,}` (lower-casing), which needs bash 4, so a fresh demo would stop at seeding with `bad substitution`. The scripts start with `#!/usr/bin/env bash`, so they use the first `bash` on your `PATH`. On Apple Silicon, Homebrew installs it at `/opt/homebrew/bin/bash`, which comes first once Homebrew's shell setup has run (`eval "$(/opt/homebrew/bin/brew shellenv)"` in `~/.zprofile`).
 
 ## 2. Get the code and build
 
@@ -52,7 +48,7 @@ The first build takes a few minutes. `scripts/demo.sh` also builds, so you can s
 OME_WRITER=templates scripts/demo.sh --fresh
 ```
 
-The full market starts: exchange, clearing house, four brokers, wholesaler, dark pool, newsroom, simctl and about 80 trading agents. News comes from the built-in event catalogue with template text.
+`omectl` checks the machine first (binaries, free ports, data directory, disk, config files), then starts the full market: exchange, clearing house, four brokers, wholesaler, dark pool, newsroom, simctl and about 80 trading agents. The brokers apply for membership and omectl approves the ones listed in `config/topology.conf`; simctl lists the three IPOs and opens the accounts. Events come from the built-in catalogue with template text.
 
 ### B. LLM news without Docker (recommended on Mac)
 
@@ -61,11 +57,11 @@ Install and start Ollama natively; it uses the Apple GPU through Metal:
 ```bash
 brew install ollama          # or install the Ollama app from ollama.com
 ollama serve                 # leave running in its own terminal (the app does this for you)
-ollama pull qwen2.5:1.5b     # small and fast
+ollama pull qwen2.5:7b       # the default model; on an 8 GB Mac use qwen2.5:1.5b with OME_LLM_MODEL
 scripts/demo.sh --fresh
 ```
 
-The demo checks `http://127.0.0.1:11434` first. When native Ollama answers, it is used and Docker is not touched. With Ollama running, the local model invents most company and sector stories, and the newsroom checks every story before it can move any price.
+omectl checks `http://127.0.0.1:11434` first. When native Ollama answers with the model, it is used and Docker is not touched. With Ollama running, the local model invents most company and sector events in simctl (checked before they can move any value) and writes the newsroom's stories.
 
 Bigger models write better stories. Pick by unified memory:
 
@@ -76,8 +72,8 @@ Bigger models write better stories. Pick by unified memory:
 | 32 GB or more | `qwen2.5:7b` or `qwen2.5:14b` (better, slower) |
 
 ```bash
-ollama pull qwen2.5:7b
-OME_LLM_MODEL=qwen2.5:7b scripts/demo.sh --fresh
+ollama pull qwen2.5:1.5b
+OME_LLM_MODEL=qwen2.5:1.5b scripts/demo.sh --fresh
 ```
 
 ### C. With Docker (Docker Desktop, OrbStack or Colima)
@@ -89,7 +85,7 @@ scripts/db.sh up
 OME_RECORD=1 scripts/demo.sh --fresh
 ```
 
-If Docker is running and no native Ollama answers, `scripts/demo.sh` starts Ollama in Docker by itself (`scripts/llm.sh up`). That works, but on a Mac it runs on the CPU and is slow. Start native Ollama first (option B), or set `OME_WRITER=templates` to skip the LLM.
+If Docker is running and no native Ollama answers, omectl starts Ollama in Docker by itself (`scripts/llm.sh up`). That works, but on a Mac it runs on the CPU and is slow. Start native Ollama first (option B), or set `OME_WRITER=templates` to skip the LLM.
 
 ### D. Recording without Docker (Homebrew PostgreSQL and Redis)
 
@@ -135,19 +131,23 @@ The window draws with Metal. Where things are stored:
 ## 5. Everyday commands
 
 ```bash
-scripts/stop.sh                                   # stop everything (journals are kept)
+scripts/stop.sh                                   # stop everything (journals are kept); same as omectl down
 scripts/demo.sh                                   # start again and resume from the journals
 scripts/demo.sh --fresh                           # wipe the journals in OME_DATA and start a new market
+./target/release/omectl status                    # every service's health, dependencies and metrics
+./target/release/omectl logs retail-co -f         # follow one service's log
+./target/release/omectl doctor                    # preflight checks only
 
 ./target/release/ome exchange instruments         # symbols, prices, halts and pauses
 ./target/release/ome exchange vol                 # observed price moves
-./target/release/ome news status                  # economy, companies, LLM writer statistics
+./target/release/ome sim world                    # economy, companies, seeding progress
+./target/release/ome news status                  # stories, subscribers, LLM writer statistics
 ./target/release/ome news list 20                 # recent stories
 ./target/release/ome sim status                   # agent groups, fills, equity
 ./target/release/ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw buy ACME mkt 5
 ```
 
-Logs and journals live in `data/` (or `OME_DATA`), one `.log` and one `.journal` per service.
+Logs and journals live in `data/` (or `OME_DATA`), one `.log` and one `.journal` per service, plus `omectl.log` for the supervisor. Services and ports are listed in `config/topology.conf`.
 
 ## 6. Settings (environment variables)
 
@@ -156,7 +156,7 @@ Logs and journals live in `data/` (or `OME_DATA`), one `.log` and one `.journal`
 | `OME_DATA` | `data` | where journals, logs and pid files go; point it elsewhere for a separate market |
 | `OME_WRITER` | `auto` | `auto` uses Ollama when it answers, `llm` always tries it, `templates` never uses it |
 | `OME_LLM` | `http://127.0.0.1:11434` | Ollama address |
-| `OME_LLM_MODEL` | `qwen2.5:1.5b` | model for invented and rewritten stories |
+| `OME_LLM_MODEL` | `qwen2.5:7b` | model for invented events and rewritten stories |
 | `OME_RECORD` | `0` | `1` records the market into PostgreSQL and Redis |
 | `OME_POSTGRES` / `OME_REDIS` | local `ome` database / local Redis | recorder and chart history connections |
 | `OME_TRADING_DAY` | `5 45 5 5` | seconds of pre-open, open, closing auction and closed; `off` keeps the market always open |
@@ -177,6 +177,7 @@ All services listen on `127.0.0.1` only.
 | 7301 / 7302 | wholesaler and dark pool |
 | 7400 | simulation control (simctl) |
 | 7500 | newsroom |
+| 7600 | service registry (omectl) |
 | 5432 / 6379 | PostgreSQL / Redis (recording only) |
 | 11434 | Ollama |
 
@@ -184,10 +185,11 @@ All services listen on `127.0.0.1` only.
 
 | Symptom | Fix |
 |---|---|
-| `bad substitution` while seeding | the scripts ran under bash 3.2; install bash 4+ (step 1) and open a new terminal |
-| `already running` or `address already in use` | run `scripts/stop.sh`; if a port is still taken, `lsof -i :7000` shows who holds it |
-| no price movement after start | give agents a minute to buy their starting inventory; check `data/agents.log` |
+| `omectl up` stops with `FAIL` lines | fix what they name; `omectl doctor` re-checks without starting anything |
+| `ports in use` | run `scripts/stop.sh`; if a port is still taken, `lsof -i :7000` shows who holds it |
+| a service shows `starting` with `awaiting approval` | it is not declared in `config/topology.conf`; approve it with `ome exchange approve <name>` (and the clearing house, venue or newsroom it applied to) |
+| no price movement after start | give agents a minute to buy their starting inventory; `ome sim world` shows seeding progress, `data/agents.log` the runner |
 | news is all template text | Ollama is not answering; check `curl http://127.0.0.1:11434/api/tags` and `ome news status` |
 | news is slow or mostly from the catalogue | the model is too big for the machine, or Ollama runs in Docker on the CPU; use native Ollama and a smaller model |
 | the app window opens but stays on the login screen | the market is not running, or the broker address under Connection is wrong |
-| strange state after changing `config/companies.conf` or `config/roster.conf` | start a new market with `scripts/demo.sh --fresh` |
+| strange state after changing `config/world.conf` or `config/roster.conf` | start a new market with `scripts/demo.sh --fresh` |

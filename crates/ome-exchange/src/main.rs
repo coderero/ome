@@ -1,7 +1,7 @@
 use ome_exchange::exchange::ExchangeConfig;
 use ome_exchange::{ServerConfig, start};
 
-const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET] [--require-prospectus]\n                    [--luld-bps BPS (0 = off)] [--luld-window-ms MS] [--luld-pause-ms MS]";
+const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET] [--require-prospectus] [--registry ADDR]\n                    [--schedule PRE,OPEN,CLOSING,CLOSED seconds, used when the journal has no calendar yet]\n                    [--luld-bps BPS (0 = off)] [--luld-window-ms MS] [--luld-pause-ms MS]";
 
 fn parse_args() -> Result<ServerConfig, String> {
     let mut config = ServerConfig {
@@ -14,6 +14,8 @@ fn parse_args() -> Result<ServerConfig, String> {
         admin_name: "ops".into(),
         admin_secret: std::env::var("OME_EXCHANGE_SECRET").unwrap_or_else(|_| "ops".into()),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: ome_net::registry::RegistryAccess::from_env(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -23,6 +25,28 @@ fn parse_args() -> Result<ServerConfig, String> {
             "--journal" => config.journal = Some(value()?.into()),
             "--admin-name" => config.admin_name = value()?,
             "--admin-secret" => config.admin_secret = value()?,
+            "--registry" => {
+                let addr = value()?;
+                let secret = config.registry.as_ref().map(|r| r.secret.clone()).unwrap_or_else(|| "cluster".into());
+                config.registry = Some(ome_net::registry::RegistryAccess { addr, secret });
+            }
+            "--schedule" => {
+                let text = value()?;
+                let parts: Vec<u64> = text
+                    .split([',', ' '])
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.parse::<u64>().map_err(|_| "--schedule needs four numbers of seconds"))
+                    .collect::<Result<_, _>>()?;
+                let [pre, open, closing, closed] = parts[..] else {
+                    return Err("--schedule needs four numbers of seconds".into());
+                };
+                config.schedule = (pre + open + closing + closed > 0).then_some(ome_exchange::session::Schedule {
+                    pre_open_ms: pre * 1_000,
+                    continuous_ms: open * 1_000,
+                    closing_ms: closing * 1_000,
+                    closed_ms: closed * 1_000,
+                });
+            }
             "--require-prospectus" => config.exchange.require_prospectus = true,
             "--luld-bps" => config.exchange.luld_bps = value()?.parse().map_err(|_| "--luld-bps needs a number")?,
             "--luld-window-ms" => config.exchange.luld_window_ms = value()?.parse().map_err(|_| "--luld-window-ms needs a number")?,

@@ -3,7 +3,7 @@ use crate::world::World;
 use ome_protocol::{GroupInfo, SimCommand};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 pub const ALL: &str = "*";
@@ -60,31 +60,70 @@ pub struct AgentStats {
 }
 
 pub struct Shared {
-    pub groups: BTreeMap<String, Arc<GroupControl>>,
+    groups: RwLock<BTreeMap<String, Arc<GroupControl>>>,
+    history: Mutex<Vec<SimCommand>>,
     pub world: Mutex<World>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Followup {
-    Fund { group: String, amount: u64 },
-}
+const HISTORY: usize = 2_000;
 
 impl Shared {
     pub fn new(groups: BTreeMap<String, Arc<GroupControl>>) -> Self {
         Self {
-            groups,
+            groups: RwLock::new(groups),
+            history: Mutex::new(Vec::new()),
             world: Mutex::new(World::default()),
         }
     }
 
-    fn matching(&self, group: &str) -> Vec<&Arc<GroupControl>> {
+    pub fn group(&self, name: &str) -> Option<Arc<GroupControl>> {
+        self.groups.read().expect("groups lock").get(name).cloned()
+    }
+
+    pub fn ensure(&self, name: &str, strategy: &str, broker: &str, params: Params) -> Arc<GroupControl> {
+        if let Some(group) = self.group(name) {
+            return group;
+        }
+        let group = Arc::new(GroupControl::new(name, strategy, broker, 0, params));
+        for command in self.history.lock().expect("history lock").iter() {
+            Self::apply_to(&group, command);
+        }
         self.groups
+            .write()
+            .expect("groups lock")
+            .entry(name.to_string())
+            .or_insert(group)
+            .clone()
+    }
+
+    fn matching(&self, group: &str) -> Vec<Arc<GroupControl>> {
+        self.groups
+            .read()
+            .expect("groups lock")
             .values()
             .filter(|g| group == ALL || g.name == group)
+            .cloned()
             .collect()
     }
 
-    pub fn apply(&self, command: &SimCommand, now: Instant) -> Option<Followup> {
+    fn apply_to(g: &GroupControl, command: &SimCommand) {
+        match command {
+            SimCommand::Pause { group } | SimCommand::Resume { group } if group == ALL || *group == g.name => {
+                g.paused.store(matches!(command, SimCommand::Pause { .. }), Ordering::Relaxed);
+            }
+            SimCommand::SetParam { group, key, value } if group == ALL || *group == g.name => g.set_param(key, value),
+            _ => {}
+        }
+    }
+
+    pub fn apply(&self, command: &SimCommand, now: Instant) {
+        if matches!(command, SimCommand::Pause { .. } | SimCommand::Resume { .. } | SimCommand::SetParam { .. }) {
+            let mut history = self.history.lock().expect("history lock");
+            if history.len() >= HISTORY {
+                history.remove(0);
+            }
+            history.push(command.clone());
+        }
         match command {
             SimCommand::Pause { group } | SimCommand::Resume { group } => {
                 let paused = matches!(command, SimCommand::Pause { .. });
@@ -92,31 +131,22 @@ impl Shared {
                     g.paused.store(paused, Ordering::Relaxed);
                 }
             }
-            SimCommand::SetCount { group, count } => {
-                for g in self.matching(group) {
-                    g.target.store(*count, Ordering::Relaxed);
-                }
-            }
+            SimCommand::SetCount { .. } | SimCommand::Fund { .. } => {}
             SimCommand::SetParam { group, key, value } => {
                 for g in self.matching(group) {
                     g.set_param(key, value);
                 }
             }
-            SimCommand::Fund { group, amount } => {
-                return Some(Followup::Fund {
-                    group: group.clone(),
-                    amount: *amount,
-                });
-            }
             SimCommand::SetFair { .. } | SimCommand::Scenario(_) => {
                 self.world.lock().expect("world lock").apply(command, now)
             }
         }
-        None
     }
 
     pub fn report(&self, stats: &BTreeMap<String, Vec<Arc<AgentStats>>>) -> Vec<GroupInfo> {
         self.groups
+            .read()
+            .expect("groups lock")
             .values()
             .map(|g| {
                 let agents = stats.get(&g.name).map(Vec::as_slice).unwrap_or_default();
@@ -166,51 +196,26 @@ mod tests {
     }
 
     #[test]
-    fn commands_reach_the_matching_groups() {
+    fn commands_reach_the_matching_groups_and_groups_created_later() {
         let shared = shared();
         let now = Instant::now();
         shared.apply(&SimCommand::Pause { group: ALL.into() }, now);
-        assert!(shared.groups.values().all(|g| g.is_paused()));
+        assert!(shared.matching(ALL).iter().all(|g| g.is_paused()));
+        shared.apply(&SimCommand::Resume { group: "swing".into() }, now);
+        assert!(!shared.group("swing").unwrap().is_paused() && shared.group("noise").unwrap().is_paused());
         shared.apply(
-            &SimCommand::Resume {
-                group: "swing".into(),
-            },
+            &SimCommand::SetParam { group: "noise".into(), key: "activity".into(), value: "0.9".into() },
             now,
         );
-        assert!(!shared.groups["swing"].is_paused() && shared.groups["noise"].is_paused());
-        shared.apply(
-            &SimCommand::SetParam {
-                group: "noise".into(),
-                key: "activity".into(),
-                value: "0.9".into(),
-            },
-            now,
-        );
-        assert_eq!(shared.groups["noise"].generation(), 1);
-        assert_eq!(shared.groups["noise"].params().f64("activity", 0.0), 0.9);
-        shared.apply(
-            &SimCommand::SetCount {
-                group: "swing".into(),
-                count: 7,
-            },
-            now,
-        );
-        assert_eq!(shared.groups["swing"].target.load(Ordering::Relaxed), 7);
-        assert_eq!(
-            shared.apply(
-                &SimCommand::Fund {
-                    group: "noise".into(),
-                    amount: 100
-                },
-                now
-            ),
-            Some(Followup::Fund {
-                group: "noise".into(),
-                amount: 100
-            })
-        );
+        assert_eq!(shared.group("noise").unwrap().generation(), 1);
+        assert_eq!(shared.group("noise").unwrap().params().f64("activity", 0.0), 0.9);
+        shared.apply(&SimCommand::SetParam { group: "late".into(), key: "gamma".into(), value: "0.4".into() }, now);
+        let late = shared.ensure("late", "market-maker", "dma-co", Params::default());
+        assert!(late.is_paused(), "settings sent before the group existed still apply");
+        assert_eq!(late.params().f64("gamma", 0.0), 0.4);
+        assert!(Arc::ptr_eq(&late, &shared.ensure("late", "market-maker", "dma-co", Params::default())));
         let report = shared.report(&BTreeMap::new());
-        assert_eq!(report.len(), 2);
-        assert_eq!(report[0].params, "activity=0.9");
+        assert_eq!(report.len(), 3);
+        assert_eq!(report[1].params, "activity=0.9");
     }
 }

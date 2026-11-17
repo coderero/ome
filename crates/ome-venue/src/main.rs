@@ -5,6 +5,7 @@ use ome_venue::{VenueConfig, start};
 
 const USAGE: &str = "usage: ome-venue --kind wholesaler|ats --member NAME --member-secret SECRET
                  [--listen ADDR] [--exchange ADDR] [--journal PATH] [--ops-name NAME] [--ops-secret SECRET]
+                 [--member-kind broker|lp] [--registry ADDR]
                  wholesaler: [--improvement-bps BPS] [--pfof PER-SHARE (hundredths of a tick)]
                              [--max-order QTY] [--inventory-limit QTY] [--hedge-threshold QTY] [--accept-pct PCT]";
 
@@ -20,6 +21,8 @@ fn parse_args() -> Result<VenueConfig, String> {
         member_name: String::new(),
         member_secret: String::new(),
         wholesaler: WholesalerConfig::default(),
+        member_kind: None,
+        registry: ome_net::registry::RegistryAccess::from_env(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -37,6 +40,14 @@ fn parse_args() -> Result<VenueConfig, String> {
                 }
             }
             "--listen" => config.listen = value()?,
+            "--member-kind" => {
+                config.member_kind = Some(ome_protocol::MemberKind::parse(&value()?).ok_or("member kind must be broker or lp")?)
+            }
+            "--registry" => {
+                let addr = value()?;
+                let secret = config.registry.as_ref().map(|r| r.secret.clone()).unwrap_or_else(|| "cluster".into());
+                config.registry = Some(ome_net::registry::RegistryAccess { addr, secret });
+            }
             "--exchange" => config.exchange_addr = value()?,
             "--journal" => config.journal = Some(value()?.into()),
             "--ops-name" => config.ops_name = value()?,

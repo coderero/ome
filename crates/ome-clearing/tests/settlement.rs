@@ -45,6 +45,7 @@ fn broker(
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        registry: None,
     })
     .unwrap()
     .0
@@ -84,6 +85,8 @@ fn trades_settle_t_plus_one_and_credit_follows_collateral() {
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: None,
     })
     .unwrap()
     .0;
@@ -115,6 +118,7 @@ fn trades_settle_t_plus_one_and_credit_follows_collateral() {
             cycle_ms: 700,
             ..ClearingConfig::default()
         },
+        registry: None,
     })
     .unwrap()
     .0;

@@ -1,14 +1,15 @@
 use crate::journal::Record;
-use crate::links::{Done, IdeaDone, IdeaJob, Job};
-use crate::newsroom::{Fact, Filing, Newsroom};
+use crate::links::{Done, Job};
+use crate::newsroom::{Fact, Newsroom};
 use crate::writer::Writer;
 use ome_core::types::Timestamp;
 use ome_net::auth::{SecretHash, hash_secret, valid_username, verify};
+use ome_net::onboard::Applications;
+use ome_net::registry::Report;
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
-use ome_protocol::{Decoder, MarketPhase, MemberKind, MemberMessage, ServerMessage, template};
-use ome_store::Journal;
-use rand::Rng;
+use ome_protocol::{Decoder, MemberKind, MemberMessage, ServerMessage, WireItem, template};
+use ome_store::FactLog;
 use rand::rngs::StdRng;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -20,10 +21,11 @@ pub struct OpsCredentials {
     pub secret: SecretHash,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Login {
     Ops,
     Subscriber,
+    Source(String),
 }
 
 struct Session {
@@ -33,29 +35,20 @@ struct Session {
 
 pub struct Gateway {
     room: Newsroom,
-    journal: Option<Journal<Record>>,
+    journal: Option<Box<dyn FactLog<Record>>>,
     ops: OpsCredentials,
+    sources: BTreeMap<String, SecretHash>,
     sessions: BTreeMap<SessionId, Session>,
     clock: Timestamp,
     rng: StdRng,
     writer: Box<dyn Writer>,
-    phase: MarketPhase,
-    news_per_day: f64,
-    open_started: Option<Timestamp>,
-    open_ms: Timestamp,
-    last_tick: Option<Timestamp>,
-    filings: Option<Sender<Filing>>,
     rewriter: Option<Sender<Job>>,
     rewrite_wait_ms: Timestamp,
     pending: VecDeque<(u64, Timestamp, bool)>,
     published: u64,
     stats: WriterStats,
-    ideas: VecDeque<(ome_core::symbol::Symbol, crate::llm::Idea)>,
-    idea_jobs: Option<Sender<IdeaJob>>,
-    ideas_pending: usize,
-    ideas_used: u64,
-    ideas_rejected: u64,
-    idea_problem: String,
+    applications: Applications,
+    wires: BTreeMap<u64, String>,
 }
 
 #[derive(Default)]
@@ -68,48 +61,36 @@ struct WriterStats {
     last_error: String,
 }
 
-pub const UNMEASURED_DAY_MS: Timestamp = 23_400_000;
-
 fn encode(message: &ServerMessage) -> Arc<[u8]> {
     frame(&message.encode()).into()
 }
 
 impl Gateway {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         room: Newsroom,
-        journal: Option<Journal<Record>>,
+        journal: Option<Box<dyn FactLog<Record>>>,
         ops: OpsCredentials,
+        sources: BTreeMap<String, SecretHash>,
         writer: Box<dyn Writer>,
         rng: StdRng,
-        news_per_day: f64,
         clock: Timestamp,
     ) -> Self {
         Self {
             room,
             journal,
             ops,
+            sources,
             sessions: BTreeMap::new(),
             clock,
             rng,
             writer,
-            phase: MarketPhase::Closed,
-            news_per_day,
-            open_started: None,
-            open_ms: UNMEASURED_DAY_MS,
-            last_tick: None,
-            filings: None,
             rewriter: None,
             rewrite_wait_ms: 0,
             pending: VecDeque::new(),
             published: 0,
             stats: WriterStats::default(),
-            ideas: VecDeque::new(),
-            idea_jobs: None,
-            ideas_pending: 0,
-            ideas_used: 0,
-            ideas_rejected: 0,
-            idea_problem: String::new(),
+            applications: Applications::default(),
+            wires: BTreeMap::new(),
         }
         .caught_up()
     }
@@ -117,13 +98,6 @@ impl Gateway {
     fn caught_up(mut self) -> Self {
         self.published = self.room.next_seq() - 1;
         self
-    }
-
-    pub fn file_with(&mut self, filings: Sender<Filing>) {
-        for filing in self.room.prospectuses() {
-            let _ = filings.send(filing);
-        }
-        self.filings = Some(filings);
     }
 
     pub fn room(&self) -> &Newsroom {
@@ -185,6 +159,30 @@ impl Gateway {
             .count() as u32
     }
 
+    fn sources_connected(&self) -> u32 {
+        self.sessions
+            .values()
+            .filter(|s| matches!(s.login, Some(Login::Source(_))))
+            .count() as u32
+    }
+
+    pub fn health(&self) -> Report {
+        let mut report = Report::default();
+        for name in self.sources.keys() {
+            let up = self.sessions.values().any(|s| s.login.as_ref() == Some(&Login::Source(name.clone())));
+            report.dep(&format!("source {name}"), up, if up { "" } else { "not connected" });
+        }
+        if !self.stats.model.is_empty() {
+            let offline = !self.stats.last_error.is_empty() && self.stats.written == 0;
+            report.dep("llm writer", !offline, self.stats.last_error.clone());
+        }
+        report.metric("published", self.published as i64);
+        report.metric("subscribers", self.subscribers() as i64);
+        report.metric("pending_rewrites", self.pending.len() as i64);
+        report.metric("applications", self.applications.len() as i64);
+        report.ready_unless(&[])
+    }
+
     fn record(&mut self, fact: Fact, now: Timestamp) -> io::Result<()> {
         if let Some(journal) = &mut self.journal {
             journal.append(&Record {
@@ -193,26 +191,11 @@ impl Gateway {
             })?;
         }
         self.room.apply(&fact);
-        if let Fact::Published { item, .. } = &fact
-            && item.kind == ome_protocol::NewsKind::Prospectus
-            && let Some(sink) = &self.filings
-            && let Some(filing) = self
-                .room
-                .prospectuses()
-                .into_iter()
-                .find(|f| Some(f.symbol) == item.symbol)
-        {
-            let _ = sink.send(filing);
-        }
         if let Fact::Published { item, .. } = &fact {
             let invented = item.data.split_whitespace().any(|w| w == "source=llm");
             match self.rewriter.as_ref().filter(|_| !invented) {
                 Some(rewriter) => {
-                    let company = item
-                        .symbol
-                        .and_then(|s| self.room.spec(s))
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default();
+                    let company = self.company_of(item.seq);
                     let job = Job {
                         item: item.clone(),
                         company,
@@ -248,7 +231,7 @@ impl Gateway {
         let dead: Vec<SessionId> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.login.is_some())
+            .filter(|(_, s)| matches!(s.login, Some(Login::Ops | Login::Subscriber)))
             .filter(|(_, s)| !s.outbox.send(message.clone()))
             .map(|(id, _)| *id)
             .collect();
@@ -320,45 +303,6 @@ impl Gateway {
         self.rewrite_wait_ms = wait_ms;
     }
 
-    pub fn use_ideas(&mut self, jobs: Sender<IdeaJob>) {
-        self.idea_jobs = Some(jobs);
-    }
-
-    pub fn on_idea(&mut self, done: IdeaDone) {
-        self.ideas_pending = self.ideas_pending.saturating_sub(1);
-        match done.result {
-            Ok(idea) => {
-                log(&format!("LLM idea for {} in {} ms: {}", done.symbol, done.elapsed_ms, idea.headline));
-                self.ideas.push_back((done.symbol, idea));
-            }
-            Err(problem) => {
-                self.ideas_rejected += 1;
-                if self.idea_problem != problem {
-                    log(&format!("LLM idea for {} not used: {problem}", done.symbol));
-                }
-                self.idea_problem = problem;
-            }
-        }
-    }
-
-    fn request_ideas(&mut self) {
-        let Some(jobs) = &self.idea_jobs else {
-            return;
-        };
-        let symbols = self.room.symbols();
-        while !symbols.is_empty() && self.ideas.len() + self.ideas_pending < 2 {
-            let symbol = symbols[self.rng.random_range(0..symbols.len())];
-            let Some(context) = self.room.idea_context(symbol) else {
-                return;
-            };
-            if jobs.send(IdeaJob { symbol, context, seed: self.rng.random() }).is_err() {
-                self.idea_jobs = None;
-                return;
-            }
-            self.ideas_pending += 1;
-        }
-    }
-
     fn writer_status(&self) -> String {
         if self.stats.model.is_empty() {
             return self.writer.name();
@@ -369,10 +313,8 @@ impl Gateway {
             .checked_div(self.stats.written)
             .unwrap_or(0);
         format!(
-            "llm {} ({} invented, {} idea(s) refused, {} written, avg {} ms, {} fallback(s), {} timeout(s){})",
+            "llm {} ({} written, avg {} ms, {} fallback(s), {} timeout(s){})",
             self.stats.model,
-            self.ideas_used,
-            self.ideas_rejected,
             self.stats.written,
             average,
             self.stats.fallbacks,
@@ -385,73 +327,34 @@ impl Gateway {
         )
     }
 
-    fn commit(&mut self, fact: Option<Fact>, now: Timestamp) {
-        if let Some(fact) = fact
-            && let Err(e) = self.record(fact, now)
-        {
-            log(&format!("journal append failed: {e}"));
-        }
-    }
-
-    pub fn start_up(&mut self, now: Timestamp) {
-        let now = self.advance(now);
-        for symbol in self.room.unfiled() {
-            let fact =
-                self.room
-                    .decide_prospectus(symbol, now, &mut self.rng, self.writer.as_mut());
-            self.commit(fact, now);
-        }
-    }
-
-    pub fn on_market(&mut self, phase: MarketPhase, day: u64, now: Timestamp) {
-        let now = self.advance(now);
-        if phase == MarketPhase::Open {
-            self.open_started.get_or_insert(now);
-        } else if let Some(start) = self.open_started.take() {
-            self.open_ms = now.saturating_sub(start).max(5_000);
-        }
-        self.phase = phase;
-        let Some(started) = self.room.decide_day(day, &mut self.rng) else {
-            return;
-        };
-        self.commit(Some(started), now);
-        log(&format!("trading day {day} begins"));
-        for release in self.room.releases_due() {
-            let fact = self
-                .room
-                .decide_release(release, now, &mut self.rng, self.writer.as_mut());
-            self.commit(Some(fact), now);
-        }
-        for symbol in self.room.earnings_due() {
-            let fact = self
-                .room
-                .decide_earnings(symbol, now, &mut self.rng, self.writer.as_mut());
-            self.commit(fact, now);
-        }
-    }
-
     pub fn tick(&mut self, now: Timestamp) {
         let now = self.advance(now);
         self.release(now);
-        let elapsed = now.saturating_sub(self.last_tick.unwrap_or(now));
-        self.last_tick = Some(now);
-        if self.news_per_day > 0.0 {
-            self.request_ideas();
-        }
-        if self.phase != MarketPhase::Open || self.news_per_day <= 0.0 {
-            return;
-        }
-        let companies = self.room.symbols().len().max(1) as f64;
-        let chance = (self.news_per_day * companies * elapsed as f64 / self.open_ms as f64).min(1.0);
-        if self.rng.random_bool(chance) {
-            let fact = match self.ideas.pop_front() {
-                Some((symbol, idea)) => {
-                    self.ideas_used += 1;
-                    self.room.decide_idea(symbol, &idea, now, &mut self.rng, self.writer.as_mut())
+    }
+
+    fn company_of(&self, seq: u64) -> String {
+        self.wires.get(&seq).cloned().unwrap_or_default()
+    }
+
+    fn on_wire(&mut self, id: SessionId, source: &str, wire: WireItem, now: Timestamp) {
+        match self.room.decide_wire(source, &wire, now, &mut self.rng, self.writer.as_mut()) {
+            Ok(Some(fact)) => {
+                if let Fact::Published { item, .. } = &fact {
+                    self.wires.insert(item.seq, wire.company.clone());
+                    if self.wires.len() > 64 {
+                        self.wires.pop_first();
+                    }
                 }
-                None => self.room.decide_random(now, &mut self.rng, self.writer.as_mut()),
-            };
-            self.commit(fact, now);
+                if let Err(e) = self.record(fact, now) {
+                    log(&format!("journal append failed: {e}"));
+                    self.reject(id, template::WIRE, "journal unavailable");
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                log(&format!("wire from {source} refused: {reason}"));
+                self.reject(id, template::WIRE, &reason);
+            }
         }
     }
 
@@ -460,7 +363,7 @@ impl Gateway {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        let login = session.login;
+        let login = session.login.clone();
         let message = match MemberMessage::decode(bytes) {
             Ok(message) => message,
             Err(e) => {
@@ -478,13 +381,36 @@ impl Gateway {
                     last_seq,
                 },
             ) => self.logon(id, &name, &secret, last_seq, now),
+            (
+                None,
+                MemberMessage::Apply {
+                    kind,
+                    name,
+                    secret,
+                    note,
+                },
+            ) => {
+                let result = if self.room.subscriber(&name).is_some() {
+                    Err(format!("{name} already subscribes"))
+                } else {
+                    self.applications.receive(kind, &name, &secret, &note, now)
+                };
+                match result {
+                    Ok(text) => {
+                        log(&format!("subscription {text}"));
+                        self.ack(id, ref_template, text);
+                    }
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
+            (Some(Login::Source(source)), MemberMessage::Wire(wire)) => self.on_wire(id, &source, wire, now),
             (_, MemberMessage::Heartbeat) => {}
             (None, _) => self.reject(id, ref_template, "logon required"),
             (Some(_), MemberMessage::Logon { .. }) => {
                 self.reject(id, ref_template, "already logged on")
             }
             (Some(_), MemberMessage::QueryNewsroom) => {
-                let mut status = self.room.status(self.subscribers(), self.writer_status());
+                let mut status = self.room.status(self.subscribers(), self.sources_connected(), self.writer_status());
                 status.published = self.published;
                 self.reply(id, &ServerMessage::NewsroomStatus(status));
             }
@@ -528,24 +454,27 @@ impl Gateway {
                     Err(reason) => self.reject(id, ref_template, &reason),
                 }
             }
-            (Some(Login::Ops), MemberMessage::InjectNews { symbol, event }) => {
-                match self
-                    .room
-                    .inject(symbol, &event, now, &mut self.rng, self.writer.as_mut())
-                {
-                    Ok(fact) => {
-                        let headline = match &fact {
-                            Fact::Published { item, .. } => format!(
-                                "#{} {} (sentiment {:+}, fair {:+} bps)",
-                                item.seq, item.headline, item.sentiment, item.impact_bps
-                            ),
-                            _ => String::new(),
-                        };
-                        match self.record(fact, now) {
-                            Ok(()) => self.ack(id, ref_template, headline),
-                            Err(_) => self.reject(id, ref_template, "journal unavailable"),
+            (Some(Login::Ops), MemberMessage::QueryApplications) => {
+                self.reply(id, &ServerMessage::Applications(self.applications.list()));
+            }
+            (Some(Login::Ops), MemberMessage::Decide { name, approve, note, .. }) => {
+                let Some(pending) = self.applications.take(&name) else {
+                    return self.reject(id, ref_template, &format!("no pending application from {name}"));
+                };
+                if !approve {
+                    let text = format!("subscription request from {name} refused{}", if note.is_empty() { String::new() } else { format!(": {note}") });
+                    log(&text);
+                    return self.ack(id, ref_template, text);
+                }
+                match self.room.decide_register(&name, pending.secret) {
+                    Ok(fact) => match self.record(fact, now) {
+                        Ok(()) => {
+                            let text = format!("{name} admitted: now subscribes to the news feed");
+                            log(&text);
+                            self.ack(id, ref_template, text);
                         }
-                    }
+                        Err(_) => self.reject(id, ref_template, "journal unavailable"),
+                    },
                     Err(reason) => self.reject(id, ref_template, &reason),
                 }
             }
@@ -556,6 +485,9 @@ impl Gateway {
     fn logon(&mut self, id: SessionId, name: &str, secret: &str, last_seq: u64, now: Timestamp) {
         let login = if name == self.ops.name && verify(&self.ops.secret, name, secret) {
             Login::Ops
+        } else if let Some(hash) = self.sources.get(name).filter(|h| verify(h, name, secret)) {
+            let _ = hash;
+            Login::Source(name.to_string())
         } else {
             match self.room.subscriber(name) {
                 Some(hash) if verify(&hash, name, secret) => Login::Subscriber,
@@ -569,7 +501,7 @@ impl Gateway {
             }
         };
         if let Some(session) = self.sessions.get_mut(&id) {
-            session.login = Some(login);
+            session.login = Some(login.clone());
         }
         log(&format!("session {id}: {name} logged on to the news feed"));
         self.reply(
@@ -600,7 +532,10 @@ impl Gateway {
                 self.reply(id, &ServerMessage::News(item));
             }
         }
-        let next_seq = self.published + 1;
+        let next_seq = match &login {
+            Login::Source(source) => self.room.received(source) + 1,
+            _ => self.published + 1,
+        };
         self.reply(id, &ServerMessage::ReplayComplete { next_seq });
     }
 }

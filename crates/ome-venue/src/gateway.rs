@@ -6,12 +6,13 @@ use ome_client::upstream::{Upstream, UpstreamEvent};
 use ome_core::price::format_price;
 use ome_core::types::Timestamp;
 use ome_net::auth::{SecretHash, hash_secret, valid_username, verify};
+use ome_net::onboard::Applications;
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
 use ome_protocol::{
     Decoder, MarketPhase, MemberId, MemberInfo, MemberKind, MemberMessage, ServerMessage, template,
 };
-use ome_store::Journal;
+use ome_store::FactLog;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ pub struct OpsCredentials {
 pub struct Gateway {
     venue: VenueState,
     quotes: Quotes,
-    journal: Option<Journal<Record>>,
+    journal: Option<Box<dyn FactLog<Record>>>,
     exchange: Upstream,
     ops: OpsCredentials,
     exchange_members: Vec<MemberInfo>,
@@ -45,12 +46,13 @@ pub struct Gateway {
     dropped: BTreeSet<SessionId>,
     clock: Timestamp,
     last_heartbeat: Timestamp,
+    applications: Applications,
 }
 
 impl Gateway {
     pub fn new(
         venue: VenueState,
-        journal: Option<Journal<Record>>,
+        journal: Option<Box<dyn FactLog<Record>>>,
         exchange: Upstream,
         ops: OpsCredentials,
         clock: Timestamp,
@@ -66,11 +68,36 @@ impl Gateway {
             dropped: BTreeSet::new(),
             clock,
             last_heartbeat: clock,
+            applications: Applications::default(),
         }
     }
 
     pub fn venue(&self) -> &VenueState {
         &self.venue
+    }
+
+    pub fn health(&self) -> ome_net::registry::Report {
+        let mut report = ome_net::registry::Report::default();
+        report.dep("exchange", self.exchange.is_ready(), self.exchange.problem());
+        report.metric("sessions", self.sessions_logged_on() as i64);
+        report.metric("applications", self.applications.len() as i64);
+        let mut report = report.ready_unless(&["exchange"]);
+        if self.exchange.awaiting_approval() {
+            report.detail = "exchange membership awaiting approval".into();
+        }
+        report
+    }
+
+    pub fn applications(&self) -> &Applications {
+        &self.applications
+    }
+
+    pub fn exchange_link(&self) -> &Upstream {
+        &self.exchange
+    }
+
+    pub fn sessions_logged_on(&self) -> usize {
+        self.sessions.values().filter(|s| s.login.is_some()).count()
     }
 
     pub fn connect(&mut self, id: SessionId, outbox: Box<dyn Outbox>) {
@@ -234,6 +261,27 @@ impl Gateway {
                     last_seq,
                 },
             ) => self.logon(id, &name, &secret, last_seq, now),
+            (
+                None,
+                MemberMessage::Apply {
+                    kind,
+                    name,
+                    secret,
+                    note,
+                },
+            ) => {
+                let result = match self.venue.find(&name) {
+                    Some(_) => Err(format!("{name} already routes to this venue")),
+                    None => self.applications.receive(kind, &name, &secret, &note, now),
+                };
+                match result {
+                    Ok(text) => {
+                        log(&format!("routing {text}"));
+                        self.reply(id, ServerMessage::Ack { ref_template, text });
+                    }
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
             (_, MemberMessage::Heartbeat) => {}
             (None, _) => self.reject(id, ref_template, "logon required"),
             (Some(_), MemberMessage::Logon { .. }) => {
@@ -306,6 +354,35 @@ impl Gateway {
             }
             (Login::Ops, MemberMessage::QueryMembers) => {
                 self.reply(id, ServerMessage::MemberList(self.exchange_members.clone()))
+            }
+            (Login::Ops, MemberMessage::QueryApplications) => {
+                self.reply(id, ServerMessage::Applications(self.applications.list()))
+            }
+            (Login::Ops, MemberMessage::Decide { name, approve, note, .. }) => {
+                let Some(pending) = self.applications.take(&name) else {
+                    return self.reject(id, ref_template, &format!("no pending application from {name}"));
+                };
+                if !approve {
+                    let text = format!("routing application from {name} refused{}", if note.is_empty() { String::new() } else { format!(": {note}") });
+                    log(&text);
+                    return self.reply(id, ServerMessage::Ack { ref_template, text });
+                }
+                match self.venue.decide_register(&name, pending.secret, &self.exchange_members) {
+                    Ok(fact) => {
+                        let text = format!("{name} admitted: may now route to the {}", self.venue.kind().label());
+                        match self.record(fact, now) {
+                            Ok(()) => {
+                                log(&text);
+                                self.reply(id, ServerMessage::Ack { ref_template, text });
+                            }
+                            Err(_) => self.reject(id, ref_template, "journal unavailable"),
+                        }
+                    }
+                    Err(reason) => {
+                        self.applications.restore(&name, pending);
+                        self.reject(id, ref_template, &reason)
+                    }
+                }
             }
             (Login::Ops, MemberMessage::CreateMember { name, secret, .. }) => {
                 if !valid_username(&name) || secret.is_empty() {

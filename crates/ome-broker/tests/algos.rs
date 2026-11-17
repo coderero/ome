@@ -17,6 +17,8 @@ fn twap_parent_fills_through_child_orders_on_the_real_exchange() {
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: None,
     })
     .unwrap()
     .0;
@@ -44,6 +46,7 @@ fn twap_parent_fills_through_child_orders_on_the_real_exchange() {
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        registry: None,
     })
     .unwrap()
     .0;

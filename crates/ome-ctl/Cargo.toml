@@ -1,0 +1,19 @@
+[package]
+name = "ome-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omectl"
+path = "src/main.rs"
+
+[dependencies]
+ome-protocol.workspace = true
+ome-net.workspace = true
+ome-client.workspace = true
+ome-llm.workspace = true
+ome-core.workspace = true
+
+[lints]
+workspace = true

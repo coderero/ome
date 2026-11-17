@@ -2283,6 +2283,17 @@ name = "ome-core"
 version = "0.5.0"
 
 [[package]]
+name = "ome-ctl"
+version = "0.5.0"
+dependencies = [
+ "ome-client",
+ "ome-core",
+ "ome-llm",
+ "ome-net",
+ "ome-protocol",
+]
+
+[[package]]
 name = "ome-exchange"
 version = "0.5.0"
 dependencies = [
@@ -2290,6 +2301,13 @@ dependencies = [
  "ome-net",
  "ome-protocol",
  "ome-store",
+]
+
+[[package]]
+name = "ome-llm"
+version = "0.5.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -2304,13 +2322,11 @@ dependencies = [
 name = "ome-newsroom"
 version = "0.5.0"
 dependencies = [
- "ome-broker",
  "ome-client",
  "ome-core",
- "ome-exchange",
+ "ome-llm",
  "ome-net",
  "ome-protocol",
- "ome-simctl",
  "ome-store",
  "rand 0.9.5",
  "serde_json",
@@ -2356,12 +2372,17 @@ dependencies = [
 name = "ome-simctl"
 version = "0.5.0"
 dependencies = [
+ "ome-broker",
  "ome-client",
  "ome-core",
  "ome-exchange",
+ "ome-llm",
  "ome-net",
+ "ome-newsroom",
  "ome-protocol",
  "ome-store",
+ "rand 0.9.5",
+ "serde_json",
 ]
 
 [[package]]

@@ -132,26 +132,43 @@ pub struct CompanyInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewsroomStatus {
     pub day: u64,
-    pub quarter: u64,
     pub published: u64,
     pub subscribers: u32,
-    pub economy: MacroInfo,
-    pub companies: Vec<CompanyInfo>,
+    pub sources: u32,
+    pub received: u64,
     pub writer: String,
 }
 
 pub fn put_status(e: &mut Encoder, s: &NewsroomStatus) {
     e.u64(s.day)
-        .u64(s.quarter)
         .u64(s.published)
         .u32(s.subscribers)
-        .i64(s.economy.rate_bps)
-        .i64(s.economy.inflation_bps)
-        .i64(s.economy.growth_bps)
-        .i64(s.economy.risk_appetite)
-        .end_block();
-    let mut g = e.begin_group(s.companies.len());
-    for c in &s.companies {
+        .u32(s.sources)
+        .u64(s.received)
+        .end_block()
+        .var(&s.writer);
+}
+
+pub fn get_status(d: &mut Decoder) -> Result<NewsroomStatus, DecodeError> {
+    let day = d.u64()?;
+    let published = d.u64()?;
+    let subscribers = d.u32()?;
+    let sources = d.u32()?;
+    let received = d.u64()?;
+    d.end_block()?;
+    Ok(NewsroomStatus {
+        day,
+        published,
+        subscribers,
+        sources,
+        received,
+        writer: d.var()?,
+    })
+}
+
+pub fn put_companies(e: &mut Encoder, companies: &[CompanyInfo]) {
+    let mut g = e.begin_group(companies.len());
+    for c in companies {
         e.begin_entry(&mut g);
         e.symbol(c.symbol)
             .i64(c.eps_cents)
@@ -164,21 +181,9 @@ pub fn put_status(e: &mut Encoder, s: &NewsroomStatus) {
         e.end_entry_block(&mut g);
         e.var(&c.name).var(&c.sector);
     }
-    e.var(&s.writer);
 }
 
-pub fn get_status(d: &mut Decoder) -> Result<NewsroomStatus, DecodeError> {
-    let day = d.u64()?;
-    let quarter = d.u64()?;
-    let published = d.u64()?;
-    let subscribers = d.u32()?;
-    let economy = MacroInfo {
-        rate_bps: d.i64()?,
-        inflation_bps: d.i64()?,
-        growth_bps: d.i64()?,
-        risk_appetite: d.i64()?,
-    };
-    d.end_block()?;
+pub fn get_companies(d: &mut Decoder) -> Result<Vec<CompanyInfo>, DecodeError> {
     let g = d.group()?;
     let mut companies = Vec::with_capacity(g.count);
     for _ in 0..g.count {
@@ -205,14 +210,75 @@ pub fn get_status(d: &mut Decoder) -> Result<NewsroomStatus, DecodeError> {
             sector: d.var()?,
         });
     }
-    Ok(NewsroomStatus {
+    Ok(companies)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireItem {
+    pub seq: u64,
+    pub day: u64,
+    pub kind: NewsKind,
+    pub symbol: Option<Symbol>,
+    pub sentiment: i64,
+    pub impact_bps: i64,
+    pub event: String,
+    pub sector: String,
+    pub company: String,
+    pub facts: Vec<(String, String)>,
+    pub data: String,
+    pub headline: String,
+    pub body: String,
+}
+
+pub fn put_wire(e: &mut Encoder, w: &WireItem) {
+    let facts: Vec<String> = w.facts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    e.u64(w.seq)
+        .u64(w.day)
+        .u8(w.kind as u8)
+        .symbol(w.symbol)
+        .i64(w.sentiment)
+        .i64(w.impact_bps)
+        .end_block()
+        .var(&w.event)
+        .var(&w.sector)
+        .var(&w.company)
+        .var(&facts.join("\n"))
+        .var(&w.data)
+        .var(&w.headline)
+        .var(&w.body);
+}
+
+pub fn get_wire(d: &mut Decoder) -> Result<WireItem, DecodeError> {
+    let seq = d.u64()?;
+    let day = d.u64()?;
+    let kind = NewsKind::from_u8(d.u8()?).ok_or(DecodeError::Invalid("news kind"))?;
+    let symbol = d.optional_symbol()?;
+    let sentiment = d.i64()?;
+    let impact_bps = d.i64()?;
+    d.end_block()?;
+    let event = d.var()?;
+    let sector = d.var()?;
+    let company = d.var()?;
+    let facts = d
+        .var()?
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    Ok(WireItem {
+        seq,
         day,
-        quarter,
-        published,
-        subscribers,
-        economy,
-        companies,
-        writer: d.var()?,
+        kind,
+        symbol,
+        sentiment,
+        impact_bps,
+        event,
+        sector,
+        company,
+        facts,
+        data: d.var()?,
+        headline: d.var()?,
+        body: d.var()?,
     })
 }
 

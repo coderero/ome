@@ -270,8 +270,12 @@ impl Writer for TemplateWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::CATALOGUE;
     use rand::SeedableRng;
+
+    const CATALOGUE: &[&str] = &[
+        "contract-win", "product-launch", "lawsuit", "recall", "exec-departure", "buyback", "guidance-raise",
+        "guidance-cut", "upgrade", "downgrade", "merger-rumour", "regulation", "demand-boom", "supply-shock", "subsidy",
+    ];
 
     fn story(event: &str, sentiment: i64, facts: &[(&str, &str)]) -> Story {
         Story {
@@ -308,7 +312,7 @@ mod tests {
             ("change", "0.25%"),
             ("move", "25"),
         ];
-        let mut events: Vec<&str> = CATALOGUE.iter().map(|e| e.name).collect();
+        let mut events: Vec<&str> = CATALOGUE.to_vec();
         events.extend([
             "prospectus",
             "earnings",

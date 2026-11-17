@@ -1,19 +1,69 @@
+use crate::fleet::{Fleet, Move, agent_key};
 use crate::journal::{Fact, Mark, Record};
+use crate::provision::{Outcome, Task};
 use crate::recording::{Replay, Step};
 use crate::state::SimState;
-use ome_client::Client;
+use crate::world::WorldFact;
+use crate::world::company::AccountSpec;
+use crate::world::ideas::Idea;
+use ome_client::upstream::{Upstream, UpstreamEvent};
+use ome_client::{Client, LinkEvent};
+use ome_core::symbol::Symbol;
 use ome_core::types::Timestamp;
 use ome_net::auth::{SecretHash, verify};
+use ome_net::registry::Report;
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
 use ome_protocol::{
-    Decoder, GroupInfo, MemberMessage, Scenario, ServerMessage, SimCommand, SimMessage, SimRole,
+    Assignment, Decoder, GroupInfo, MarketPhase, MemberMessage, Role, Scenario, ServerMessage,
+    SimCommand, SimMessage, SimRole,
 };
-use ome_store::Journal;
-use std::collections::BTreeMap;
+use ome_store::FactLog;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
+
+pub const UNMEASURED_DAY_MS: Timestamp = 23_400_000;
+const PLAN_EVERY_MS: Timestamp = 1_000;
+const RETRY_MS: Timestamp = 3_000;
+
+pub struct IdeaJob {
+    pub symbol: Symbol,
+    pub context: crate::world::ideas::IdeaContext,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdeaDone {
+    pub symbol: Symbol,
+    pub result: Result<Idea, String>,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Default)]
+struct Ideas {
+    model: String,
+    queue: VecDeque<(Symbol, Idea)>,
+    jobs: Option<Sender<IdeaJob>>,
+    pending: usize,
+    used: u64,
+    refused: u64,
+    problem: String,
+}
+
+#[derive(Default)]
+struct Provisioning {
+    tasks: Option<Sender<Task>>,
+    in_flight: BTreeSet<String>,
+    retry_at: BTreeMap<String, Timestamp>,
+    problems: BTreeMap<String, String>,
+    brokers: BTreeMap<String, String>,
+    last_plan: Timestamp,
+}
 
 pub struct Credentials {
     pub operator: (String, SecretHash),
@@ -34,13 +84,25 @@ struct Session {
 
 pub struct Gateway {
     state: SimState,
-    journal: Option<Journal<Record>>,
+    journal: Option<Box<dyn FactLog<Record>>>,
     credentials: Credentials,
     exchange: ExchangeAccess,
     sessions: BTreeMap<SessionId, Session>,
     clock: Timestamp,
     replay: Option<Replay>,
-    newsroom: Option<(String, String)>,
+    rng: StdRng,
+    accounts: Vec<AccountSpec>,
+    news_per_day: f64,
+    phase: MarketPhase,
+    open_started: Option<Timestamp>,
+    open_ms: Timestamp,
+    last_tick: Option<Timestamp>,
+    calendar: Option<Upstream>,
+    wire: Option<Upstream>,
+    ideas: Ideas,
+    provisioning: Provisioning,
+    fleet: Fleet,
+    agent_secret: String,
 }
 
 fn encode(message: &ServerMessage) -> Arc<[u8]> {
@@ -50,7 +112,7 @@ fn encode(message: &ServerMessage) -> Arc<[u8]> {
 impl Gateway {
     pub fn new(
         state: SimState,
-        journal: Option<Journal<Record>>,
+        journal: Option<Box<dyn FactLog<Record>>>,
         credentials: Credentials,
         exchange: ExchangeAccess,
         clock: Timestamp,
@@ -63,33 +125,91 @@ impl Gateway {
             sessions: BTreeMap::new(),
             clock,
             replay: None,
-            newsroom: None,
+            rng: StdRng::from_os_rng(),
+            accounts: Vec::new(),
+            news_per_day: 0.0,
+            phase: MarketPhase::Closed,
+            open_started: None,
+            open_ms: UNMEASURED_DAY_MS,
+            last_tick: None,
+            calendar: None,
+            wire: None,
+            ideas: Ideas::default(),
+            provisioning: Provisioning::default(),
+            fleet: Fleet::default(),
+            agent_secret: String::new(),
         }
     }
 
-    pub fn with_newsroom(mut self, newsroom: Option<(String, String)>) -> Self {
-        self.newsroom = newsroom;
+    pub fn with_world(mut self, accounts: Vec<AccountSpec>, news_per_day: f64, seed: Option<u64>) -> Self {
+        self.accounts = accounts;
+        self.news_per_day = news_per_day;
+        if let Some(seed) = seed {
+            self.rng = StdRng::seed_from_u64(seed);
+        }
         self
     }
 
-    fn forward(&self, command: &SimCommand) -> Option<Result<String, String>> {
-        let SimCommand::Scenario(Scenario::NewsShock {
-            symbol, move_bps, ..
-        }) = command
-        else {
-            return None;
+    pub fn with_calendar(mut self, calendar: Upstream) -> Self {
+        self.calendar = Some(calendar);
+        self
+    }
+
+    pub fn with_wire(mut self, wire: Upstream) -> Self {
+        self.wire = Some(wire);
+        self
+    }
+
+    pub fn with_ideas(mut self, jobs: Sender<IdeaJob>, model: &str) -> Self {
+        self.ideas.jobs = Some(jobs);
+        self.ideas.model = model.to_string();
+        self
+    }
+
+    pub fn with_provisioner(mut self, tasks: Sender<Task>) -> Self {
+        self.provisioning.tasks = Some(tasks);
+        self
+    }
+
+    pub fn with_fleet(mut self, fleet: Fleet, agent_secret: &str) -> Self {
+        self.fleet = fleet;
+        self.agent_secret = agent_secret.to_string();
+        self
+    }
+
+    pub fn start_up(&mut self, now: Timestamp) {
+        self.clock = self.clock.max(now);
+        for symbol in self.state.world().unfiled() {
+            if let Some(fact) = self.state.world().decide_prospectus(symbol) {
+                self.commit_world(fact, self.clock);
+            }
+        }
+    }
+
+    fn commit_world(&mut self, fact: WorldFact, now: Timestamp) -> Option<String> {
+        let wire = match &fact {
+            WorldFact::Happened { wire, .. } => Some(wire.clone()),
+            WorldFact::DayStarted { .. } => None,
         };
-        let (addr, secret) = self.newsroom.as_ref()?;
-        let published = Client::connect_member(addr, "ops", secret)
-            .map_err(|e| format!("newsroom unreachable: {e}"))
-            .and_then(|(mut news, _)| {
-                news.request_member(&MemberMessage::InjectNews {
-                    symbol: Some(*symbol),
-                    event: format!("shock:{move_bps}"),
-                })
-                .map_err(|e| e.to_string())
-            });
-        Some(published)
+        if let Err(reason) = self.commit(Fact::World(fact), now) {
+            log(&format!("world event not recorded: {reason}"));
+            return None;
+        }
+        let wire = wire?;
+        let text = format!(
+            "#{} [{}{}] {} (sentiment {:+}, fair {:+} bps)",
+            wire.seq,
+            wire.kind.label(),
+            wire.symbol.map(|s| format!(" {s}")).unwrap_or_default(),
+            if wire.headline.is_empty() { &wire.event } else { &wire.headline },
+            wire.sentiment,
+            wire.impact_bps
+        );
+        log(&text);
+        if let Some(link) = self.wire.as_ref().filter(|l| l.is_ready()) {
+            link.send(&MemberMessage::Wire(wire));
+        }
+        Some(text)
     }
 
     pub fn connect(&mut self, id: SessionId, outbox: Box<dyn Outbox>) {
@@ -109,7 +229,8 @@ impl Gateway {
             ..
         }) = self.sessions.remove(&id)
         {
-            log(&format!("runner session {id} left"));
+            let freed = self.fleet.runner_left(id);
+            log(&format!("runner session {id} left; {freed} agent(s) to reassign"));
         }
     }
 
@@ -248,6 +369,21 @@ impl Gateway {
                 }
                 None => self.reject(id, ref_template, "no replay is running"),
             },
+            (Some(_), SimMessage::QueryWorld) => {
+                let mut world = self.state.world().status();
+                world.provisioning = self.provisioning_status();
+                world.ideas = self.ideas_status();
+                self.reply(id, &ServerMessage::WorldStatus(world));
+            }
+            (Some(SimRole::Operator), SimMessage::Inject { event, symbol }) => {
+                match self.state.world().inject(symbol, &event, &mut self.rng) {
+                    Ok(fact) => match self.commit_world(fact, now) {
+                        Some(text) => self.ack(id, ref_template, text),
+                        None => self.reject(id, ref_template, "journal unavailable"),
+                    },
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
             (Some(_), SimMessage::QueryRecordings { name }) => {
                 let recordings = self.state.recordings();
                 let list: Vec<_> = if name.is_empty() {
@@ -290,18 +426,19 @@ impl Gateway {
     }
 
     fn issue(&mut self, command: SimCommand, now: Timestamp) -> Result<String, String> {
-        match self.forward(&command) {
-            Some(Ok(story)) => {
-                self.state.check(&Fact::Forwarded(command.clone()))?;
-                self.commit(Fact::Forwarded(command.clone()), now)?;
-                let text = format!("{} -> newsroom story {story}", command.describe());
-                log(&text);
-                return Ok(text);
-            }
-            Some(Err(reason)) => log(&format!("{reason}; applying the shock directly")),
-            None => {}
+        if let SimCommand::Scenario(Scenario::NewsShock { symbol, move_bps, .. }) = &command
+            && let Some(event) = self.state.world().decide_shock(*symbol, *move_bps)
+        {
+            self.state.check(&Fact::Forwarded(command.clone()))?;
+            self.commit(Fact::Forwarded(command.clone()), now)?;
+            let story = self.commit_world(event, now).unwrap_or_default();
+            let text = format!("{} -> world event {story}", command.describe());
+            return Ok(text);
         }
         self.commit(Fact::Command(command.clone()), now)?;
+        if let SimCommand::Fund { group, amount } = &command {
+            self.fund(group, *amount);
+        }
         let runners = self.runners();
         for runner in &runners {
             self.reply(*runner, &ServerMessage::SimEvent(command.clone()));
@@ -403,6 +540,17 @@ impl Gateway {
     pub fn tick(&mut self, now: Timestamp) {
         self.clock = self.clock.max(now);
         let now = self.clock;
+        if let Some(link) = &mut self.calendar {
+            link.tick(now, u64::MAX);
+        }
+        if let Some(link) = &mut self.wire {
+            link.tick(now, 0);
+        }
+        self.intraday(now);
+        if now >= self.provisioning.last_plan + PLAN_EVERY_MS {
+            self.provisioning.last_plan = now;
+            self.plan(now);
+        }
         let Some(replay) = &mut self.replay else {
             return;
         };
@@ -484,5 +632,356 @@ impl Gateway {
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+}
+
+impl Gateway {
+    pub fn on_calendar(&mut self, generation: u64, event: LinkEvent, now: Timestamp) {
+        self.clock = self.clock.max(now);
+        let now = self.clock;
+        let Some(link) = &mut self.calendar else { return };
+        if let Some(UpstreamEvent::Message(ServerMessage::MarketStatus(status))) = link.on_event(generation, event, now) {
+            self.on_market(status.phase, status.day, now);
+        }
+    }
+
+    pub fn on_wire(&mut self, generation: u64, event: LinkEvent, now: Timestamp) {
+        self.clock = self.clock.max(now);
+        let now = self.clock;
+        let Some(link) = &mut self.wire else { return };
+        match link.on_event(generation, event, now) {
+            Some(UpstreamEvent::Ready { next_seq }) => {
+                let backlog = self.state.world().since(next_seq);
+                if !backlog.is_empty() {
+                    log(&format!("newsroom expects event #{next_seq}; sending {} event(s)", backlog.len()));
+                }
+                for wire in backlog {
+                    link.send(&MemberMessage::Wire(wire));
+                }
+            }
+            Some(UpstreamEvent::Message(ServerMessage::Reject { reason, .. })) => {
+                log(&format!("newsroom refused an event: {reason}"));
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_market(&mut self, phase: MarketPhase, day: u64, now: Timestamp) {
+        if phase == MarketPhase::Open {
+            self.open_started.get_or_insert(now);
+        } else if let Some(start) = self.open_started.take() {
+            self.open_ms = now.saturating_sub(start).max(5_000);
+        }
+        self.phase = phase;
+        let Some(started) = self.state.world().decide_day(day, &mut self.rng) else {
+            return;
+        };
+        self.commit_world(started, now);
+        log(&format!("trading day {day} begins in the world"));
+        for release in self.state.world().releases_due() {
+            let fact = self.state.world().decide_release(release, &mut self.rng);
+            self.commit_world(fact, now);
+        }
+        for symbol in self.state.world().earnings_due() {
+            if let Some(fact) = self.state.world().decide_earnings(symbol, &mut self.rng) {
+                self.commit_world(fact, now);
+            }
+        }
+    }
+
+    fn intraday(&mut self, now: Timestamp) {
+        let elapsed = now.saturating_sub(self.last_tick.unwrap_or(now));
+        self.last_tick = Some(now);
+        if self.news_per_day <= 0.0 {
+            return;
+        }
+        self.request_ideas();
+        if self.phase != MarketPhase::Open {
+            return;
+        }
+        let companies = self.state.world().symbols().len();
+        if companies == 0 {
+            return;
+        }
+        let chance = (self.news_per_day * companies as f64 * elapsed as f64 / self.open_ms as f64).min(1.0);
+        if !self.rng.random_bool(chance) {
+            return;
+        }
+        let fact = match self.ideas.queue.pop_front() {
+            Some((symbol, idea)) => {
+                self.ideas.used += 1;
+                self.state.world().decide_idea(symbol, &idea)
+            }
+            None => self.state.world().decide_random(&mut self.rng),
+        };
+        if let Some(fact) = fact {
+            self.commit_world(fact, now);
+        }
+    }
+
+    fn request_ideas(&mut self) {
+        let Some(jobs) = &self.ideas.jobs else { return };
+        let symbols = self.state.world().symbols();
+        while !symbols.is_empty() && self.ideas.queue.len() + self.ideas.pending < 2 {
+            let symbol = symbols[self.rng.random_range(0..symbols.len())];
+            let Some(context) = self.state.world().idea_context(symbol) else { return };
+            if jobs.send(IdeaJob { symbol, context, seed: self.rng.random() }).is_err() {
+                self.ideas.jobs = None;
+                return;
+            }
+            self.ideas.pending += 1;
+        }
+    }
+
+    pub fn on_idea(&mut self, done: IdeaDone) {
+        self.ideas.pending = self.ideas.pending.saturating_sub(1);
+        match done.result {
+            Ok(idea) => {
+                log(&format!("LLM idea for {} in {} ms: {}", done.symbol, done.elapsed_ms, idea.headline));
+                self.ideas.queue.push_back((done.symbol, idea));
+            }
+            Err(problem) => {
+                self.ideas.refused += 1;
+                if self.ideas.problem != problem {
+                    log(&format!("LLM idea for {} not used: {problem}", done.symbol));
+                }
+                self.ideas.problem = problem;
+            }
+        }
+    }
+
+    fn ideas_status(&self) -> String {
+        if self.ideas.model.is_empty() {
+            return "event catalogue (no LLM)".into();
+        }
+        format!(
+            "llm {} ({} invented, {} refused{})",
+            self.ideas.model,
+            self.ideas.used,
+            self.ideas.refused,
+            if self.ideas.problem.is_empty() { String::new() } else { format!(", last problem: {}", self.ideas.problem) }
+        )
+    }
+
+    fn want(&mut self, task: Task, now: Timestamp) {
+        let Some(key) = task.key().map(str::to_string) else { return };
+        if self.state.provisioned(&key)
+            || self.provisioning.in_flight.contains(&key)
+            || self.provisioning.retry_at.get(&key).is_some_and(|t| *t > now)
+        {
+            return;
+        }
+        let Some(tasks) = &self.provisioning.tasks else { return };
+        if tasks.send(task).is_ok() {
+            self.provisioning.in_flight.insert(key);
+        }
+    }
+
+    fn listings_done(&self) -> bool {
+        self.state
+            .world()
+            .specs()
+            .iter()
+            .filter(|s| !s.underwriter.is_empty())
+            .all(|s| self.state.provisioned(&format!("ipo:{}", s.symbol)))
+    }
+
+    fn plan(&mut self, now: Timestamp) {
+        if self.provisioning.tasks.is_none() {
+            return;
+        }
+        let filings = self.state.world().prospectuses();
+        for spec in self.state.world().specs().to_vec() {
+            if spec.underwriter.is_empty() {
+                continue;
+            }
+            let symbol = spec.symbol;
+            let lower = symbol.to_string().to_lowercase();
+            if let Some(filing) = filings.iter().find(|f| f.symbol == symbol) {
+                self.want(
+                    Task::FileProspectus {
+                        key: format!("prospectus:{symbol}"),
+                        symbol,
+                        reference: filing.reference,
+                        name: filing.name.clone(),
+                    },
+                    now,
+                );
+            }
+            self.want(
+                Task::OpenAccount {
+                    key: format!("issuer:{symbol}"),
+                    broker: spec.underwriter.clone(),
+                    username: format!("{lower}_ir"),
+                    secret: format!("{lower}-ir-pw"),
+                    role: Role::Issuer,
+                    cash: 0,
+                },
+                now,
+            );
+            if self.state.provisioned(&format!("prospectus:{symbol}")) && self.state.provisioned(&format!("issuer:{symbol}")) {
+                self.want(
+                    Task::ListIpo {
+                        key: format!("ipo:{symbol}"),
+                        symbol,
+                        price: spec.price,
+                        shares: spec.shares,
+                        underwriter: spec.underwriter.clone(),
+                        issuer: format!("{lower}_ir"),
+                        name: spec.name.clone(),
+                    },
+                    now,
+                );
+            }
+            if !spec.dmm.is_empty() && self.state.provisioned(&format!("ipo:{symbol}")) {
+                self.want(Task::SetDmm { key: format!("dmm:{symbol}"), symbol, member: spec.dmm.clone() }, now);
+            }
+        }
+        for account in self.accounts.clone() {
+            self.want(
+                Task::OpenAccount {
+                    key: format!("account:{}:{}", account.broker, account.username),
+                    broker: account.broker,
+                    username: account.username,
+                    secret: account.secret,
+                    role: account.role,
+                    cash: account.cash,
+                },
+                now,
+            );
+        }
+        if !self.listings_done() {
+            return;
+        }
+        let runners = self.runners();
+        let state = &self.state;
+        let moves = self.fleet.plan(
+            |g| state.group_count(&g.name).unwrap_or(g.count),
+            |g, name| state.provisioned(&agent_key(&g.broker, name)),
+            &runners,
+        );
+        for mv in moves {
+            match &mv {
+                Move::Open { group, name } => {
+                    let g = self.fleet.groups[*group].clone();
+                    self.want(
+                        Task::OpenAccount {
+                            key: agent_key(&g.broker, name),
+                            broker: g.broker,
+                            username: name.clone(),
+                            secret: self.agent_secret.clone(),
+                            role: g.role,
+                            cash: g.cash,
+                        },
+                        now,
+                    );
+                }
+                Move::Assign { group, name, runner } => {
+                    let g = &self.fleet.groups[*group];
+                    let Some(addr) = self.provisioning.brokers.get(&g.broker).cloned() else { continue };
+                    let assignment = Assignment {
+                        name: name.clone(),
+                        group: g.name.clone(),
+                        broker: g.broker.clone(),
+                        addr,
+                        secret: self.agent_secret.clone(),
+                        spec: g.line.clone(),
+                    };
+                    self.reply(*runner, &ServerMessage::SimAssign(assignment));
+                    self.fleet.confirm(&mv);
+                }
+                Move::Retire { name, runner } => {
+                    self.reply(*runner, &ServerMessage::SimRetire { name: name.clone() });
+                    log(&format!("retiring {name}"));
+                    self.fleet.confirm(&mv);
+                }
+            }
+        }
+    }
+
+    fn fund(&mut self, group: &str, amount: u64) {
+        let Some(tasks) = &self.provisioning.tasks else { return };
+        let mut by_broker: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for name in self.fleet.members(group) {
+            let Some((g, _)) = name.rsplit_once('-') else { continue };
+            if let Some(spec) = self.fleet.group(g) {
+                by_broker.entry(spec.broker.clone()).or_default().push(name.clone());
+            }
+        }
+        for (broker, usernames) in by_broker {
+            let _ = tasks.send(Task::Fund { broker, usernames, amount });
+        }
+    }
+
+    pub fn on_outcome(&mut self, outcome: Outcome, now: Timestamp) {
+        self.clock = self.clock.max(now);
+        let now = self.clock;
+        match outcome {
+            Outcome::Done { key, text } => {
+                self.provisioning.in_flight.remove(&key);
+                self.provisioning.problems.remove(&key);
+                if !key.starts_with("agent:") {
+                    log(&format!("provisioned {key}: {text}"));
+                }
+                if let Err(reason) = self.commit(Fact::Provisioned { key }, now) {
+                    log(&format!("provisioning not recorded: {reason}"));
+                }
+            }
+            Outcome::Failed { key, reason } => {
+                self.provisioning.in_flight.remove(&key);
+                self.provisioning.retry_at.insert(key.clone(), now + RETRY_MS);
+                if self.provisioning.problems.get(&key) != Some(&reason) {
+                    log(&format!("{key} not done yet: {reason}"));
+                    self.provisioning.problems.insert(key, reason);
+                }
+            }
+            Outcome::Funded { text } => log(&text),
+            Outcome::Brokers(brokers) => {
+                log(&format!("brokers known: {}", brokers.keys().cloned().collect::<Vec<_>>().join(", ")));
+                self.provisioning.brokers = brokers;
+            }
+        }
+    }
+
+    fn provisioning_status(&self) -> String {
+        let companies = self.state.world().specs().iter().filter(|s| !s.underwriter.is_empty()).count();
+        let wanted: u32 = self
+            .fleet
+            .groups
+            .iter()
+            .map(|g| self.state.group_count(&g.name).unwrap_or(g.count))
+            .sum();
+        format!(
+            "listings {}/{companies}, accounts {}/{}, agents {}/{wanted} assigned to {} runner(s), brokers known {}",
+            self.state.provisioned_count("ipo:"),
+            self.state.provisioned_count("account:"),
+            self.accounts.len(),
+            self.fleet.assigned(),
+            self.runners().len(),
+            self.provisioning.brokers.len()
+        )
+    }
+
+    pub fn health(&self) -> Report {
+        let mut report = Report::default();
+        if let Some(link) = &self.calendar {
+            report.dep("exchange", link.is_ready(), link.problem());
+        }
+        if let Some(link) = &self.wire {
+            report.dep("newsroom", link.is_ready(), link.problem());
+        }
+        report.metric("events", self.state.world().next_seq() as i64 - 1);
+        report.metric("day", self.state.world().day() as i64);
+        report.metric("runners", self.runners().len() as i64);
+        report.metric("agents", self.fleet.assigned() as i64);
+        report.metric("listings", self.state.provisioned_count("ipo:") as i64);
+        let mut report = report.ready_unless(&["exchange"]);
+        if self.provisioning.tasks.is_some() && !self.listings_done() {
+            report.health = Some(ome_protocol::Health::Starting);
+            report.detail = format!("seeding: {}", self.provisioning_status());
+        } else if report.detail.is_empty() {
+            report.detail = self.provisioning_status();
+        }
+        report
     }
 }

@@ -4,7 +4,7 @@ use ome_client::DEFAULT_EXCHANGE_ADDR;
 
 const USAGE: &str =
     "usage: ome-clearing --member NAME --member-secret SECRET [--listen ADDR] [--exchange ADDR]
-                    [--journal PATH] [--ops-name NAME] [--ops-secret SECRET]
+                    [--journal PATH] [--ops-name NAME] [--ops-secret SECRET] [--registry ADDR]
                     [--cycle-ms MS (0 = one cycle per exchange trading day)] [--settlement-lag CYCLES] [--margin-bps BPS]";
 
 fn parse_args() -> Result<ServiceConfig, String> {
@@ -18,6 +18,7 @@ fn parse_args() -> Result<ServiceConfig, String> {
         member_name: String::new(),
         member_secret: String::new(),
         clearing: ClearingConfig::default(),
+        registry: ome_net::registry::RegistryAccess::from_env(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -28,6 +29,11 @@ fn parse_args() -> Result<ServiceConfig, String> {
         };
         match flag.as_str() {
             "--listen" => config.listen = value()?,
+            "--registry" => {
+                let addr = value()?;
+                let secret = config.registry.as_ref().map(|r| r.secret.clone()).unwrap_or_else(|| "cluster".into());
+                config.registry = Some(ome_net::registry::RegistryAccess { addr, secret });
+            }
             "--exchange" => config.exchange_addr = value()?,
             "--journal" => config.journal = Some(value()?.into()),
             "--ops-name" => config.ops_name = value()?,

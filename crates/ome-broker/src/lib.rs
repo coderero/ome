@@ -42,6 +42,7 @@ pub struct BrokerConfig {
     pub ats_addr: Option<String>,
     pub news_addr: Option<String>,
     pub postgres: Option<String>,
+    pub registry: Option<ome_net::registry::RegistryAccess>,
 }
 
 pub enum BrokerInbound {
@@ -102,7 +103,7 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
                 path.display(),
                 started.elapsed()
             ));
-            Some(journal)
+            Some(ome_store::boxed(journal))
         }
         None => None,
     };
@@ -112,6 +113,17 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
         name: config.member_name.clone(),
         secret: config.member_secret.clone(),
     };
+    let directory: Option<std::sync::Arc<dyn ome_net::registry::Directory>> = config.registry.clone().map(|access| {
+        std::sync::Arc::new(ome_net::registry::RegistryDirectory {
+            access,
+            fallback: ome_net::registry::StaticDirectory::default(),
+        }) as std::sync::Arc<dyn ome_net::registry::Directory>
+    });
+    let kind = match config.profile {
+        ProfileKind::Lp => ome_protocol::MemberKind::LiquidityProvider,
+        _ => ome_protocol::MemberKind::Broker,
+    };
+    let note = format!("{} '{}'", config.profile.label(), config.member_name);
     let exchange = Upstream::new(
         "exchange",
         Box::new(TcpConnector::new(
@@ -120,13 +132,15 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
             exchange_event,
         )),
         credentials(),
-    );
+    )
+    .applying_as(kind, &note);
     let clearing = config.clearing_addr.clone().map(|addr| {
         Upstream::new(
             "clearing",
             Box::new(TcpConnector::new(addr, tx.clone(), clearing_event)),
             credentials(),
         )
+        .applying_as(kind, &note)
     });
     let mut venues = std::collections::BTreeMap::new();
     if let Some(addr) = config.wholesaler_addr.clone() {
@@ -134,9 +148,10 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
             ome_protocol::Venue::Wholesaler,
             Upstream::new(
                 "wholesaler",
-                Box::new(TcpConnector::new(addr, tx.clone(), wholesaler_event)),
+                Box::new(TcpConnector::new(addr, tx.clone(), wholesaler_event).resolving(directory.clone())),
                 credentials(),
-            ),
+            )
+            .applying_as(kind, &note),
         );
     }
     if let Some(addr) = config.ats_addr.clone() {
@@ -144,17 +159,19 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
             ome_protocol::Venue::Ats,
             Upstream::new(
                 "dark pool",
-                Box::new(TcpConnector::new(addr, tx.clone(), ats_event)),
+                Box::new(TcpConnector::new(addr, tx.clone(), ats_event).resolving(directory.clone())),
                 credentials(),
-            ),
+            )
+            .applying_as(kind, &note),
         );
     }
     let news = config.news_addr.clone().map(|addr| {
         Upstream::new(
             "news feed",
-            Box::new(TcpConnector::new(addr, tx.clone(), news_event)),
+            Box::new(TcpConnector::new(addr, tx.clone(), news_event).resolving(directory.clone())),
             credentials(),
         )
+        .applying_as(kind, &note)
     });
     let history = config
         .postgres
@@ -176,11 +193,24 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
         config.exchange_addr,
         gateway.broker().ledger().accounts().count()
     ));
+    let mut info = ome_protocol::ServiceInfo::new(&config.member_name, "broker", &addr.to_string());
+    info.capabilities = format!(
+        "profile={} regime={:?} member={}",
+        config.profile.label(),
+        config.regime,
+        kind.label()
+    );
+    let reporter = ome_net::registry::Reporter::start(config.registry.clone(), info);
     listen(listener, tx);
 
     let handle = thread::spawn(move || {
         let mut next_tick = Instant::now();
+        let mut next_report = Instant::now();
         loop {
+            if Instant::now() >= next_report {
+                next_report = Instant::now() + Duration::from_secs(1);
+                reporter.report(gateway.health());
+            }
             match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
                 Ok(first) => {
                     handle(&mut gateway, first);

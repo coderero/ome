@@ -34,6 +34,8 @@ pub struct VenueConfig {
     pub member_name: String,
     pub member_secret: String,
     pub wholesaler: WholesalerConfig,
+    pub member_kind: Option<ome_protocol::MemberKind>,
+    pub registry: Option<ome_net::registry::RegistryAccess>,
 }
 
 pub enum VenueInbound {
@@ -69,7 +71,7 @@ pub fn start(config: VenueConfig) -> Result<(SocketAddr, JoinHandle<Result<(), S
                 path.display(),
                 started.elapsed()
             ));
-            Some(journal)
+            Some(ome_store::boxed(journal))
         }
         None => None,
     };
@@ -80,7 +82,12 @@ pub fn start(config: VenueConfig) -> Result<(SocketAddr, JoinHandle<Result<(), S
         name: config.member_name.clone(),
         secret: config.member_secret.clone(),
     };
-    let upstream = Upstream::new("exchange", Box::new(connector), credentials);
+    let member_kind = config.member_kind.unwrap_or(match config.kind {
+        Venue::Wholesaler => ome_protocol::MemberKind::LiquidityProvider,
+        _ => ome_protocol::MemberKind::Broker,
+    });
+    let upstream = Upstream::new("exchange", Box::new(connector), credentials)
+        .applying_as(member_kind, config.kind.label());
     let ops = OpsCredentials {
         secret: hash_secret(&config.ops_name, &config.ops_secret),
         name: config.ops_name.clone(),
@@ -96,11 +103,19 @@ pub fn start(config: VenueConfig) -> Result<(SocketAddr, JoinHandle<Result<(), S
         config.member_name,
         config.exchange_addr
     ));
+    let mut info = ome_protocol::ServiceInfo::new(&config.member_name, "venue", &addr.to_string());
+    info.capabilities = format!("venue={}", config.kind.label());
+    let reporter = ome_net::registry::Reporter::start(config.registry.clone(), info);
     listen(listener, tx);
 
     let handle = thread::spawn(move || {
         let mut next_tick = Instant::now();
+        let mut next_report = Instant::now();
         loop {
+            if Instant::now() >= next_report {
+                next_report = Instant::now() + Duration::from_secs(1);
+                reporter.report(gateway.health());
+            }
             match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
                 Ok(first) => {
                     handle(&mut gateway, first);

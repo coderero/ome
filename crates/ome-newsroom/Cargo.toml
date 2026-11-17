@@ -9,14 +9,12 @@ ome-core.workspace = true
 ome-protocol.workspace = true
 ome-store.workspace = true
 ome-net.workspace = true
-ome-client.workspace = true
+ome-llm.workspace = true
 rand.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-ome-exchange.workspace = true
-ome-broker.workspace = true
-ome-simctl = { path = "../ome-simctl" }
+ome-client.workspace = true
 
 [lints]
 workspace = true

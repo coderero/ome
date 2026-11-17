@@ -4,7 +4,8 @@ use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_core::types::Timestamp;
 use ome_protocol::{GroupInfo, Scenario, SimCommand, SimStatus};
-use std::collections::BTreeMap;
+use crate::world::World;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const ALL: &str = "*";
 
@@ -30,13 +31,20 @@ impl Fair {
     }
 }
 
-#[derive(Debug, Default)]
 pub struct SimState {
     groups: BTreeMap<String, GroupSettings>,
     fair: BTreeMap<Symbol, Fair>,
     scenarios: Vec<(Scenario, Timestamp)>,
     recordings: BTreeMap<String, Recording>,
     recording: Option<String>,
+    world: World,
+    provisioned: BTreeSet<String>,
+}
+
+impl Default for SimState {
+    fn default() -> Self {
+        Self::new(World::new(Vec::new(), 20))
+    }
 }
 
 pub fn validate(command: &SimCommand) -> Result<(), String> {
@@ -91,8 +99,37 @@ pub fn validate(command: &SimCommand) -> Result<(), String> {
 }
 
 impl SimState {
+    pub fn new(world: World) -> Self {
+        Self {
+            groups: BTreeMap::new(),
+            fair: BTreeMap::new(),
+            scenarios: Vec::new(),
+            recordings: BTreeMap::new(),
+            recording: None,
+            world,
+            provisioned: BTreeSet::new(),
+        }
+    }
+
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    pub fn provisioned(&self, key: &str) -> bool {
+        self.provisioned.contains(key)
+    }
+
+    pub fn provisioned_count(&self, prefix: &str) -> usize {
+        self.provisioned.iter().filter(|k| k.starts_with(prefix)).count()
+    }
+
+    pub fn group_count(&self, group: &str) -> Option<u32> {
+        self.groups.get(group).and_then(|g| g.count)
+    }
+
     pub fn check(&self, fact: &Fact) -> Result<(), String> {
         match fact {
+            Fact::World(_) | Fact::Provisioned { .. } => Ok(()),
             Fact::Command(command) | Fact::Forwarded(command) => validate(command),
             Fact::Accelerated(_) => Ok(()),
             Fact::RecordingStarted { name, .. } => {
@@ -132,6 +169,14 @@ impl SimState {
                 };
                 self.recordings.insert(name.clone(), recording);
                 self.recording = Some(name.clone());
+                None
+            }
+            Fact::World(fact) => {
+                self.world.apply(fact);
+                None
+            }
+            Fact::Provisioned { key } => {
+                self.provisioned.insert(key.clone());
                 None
             }
             Fact::RecordingStopped { marks } => {

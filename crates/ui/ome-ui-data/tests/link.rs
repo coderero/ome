@@ -41,6 +41,8 @@ fn a_ui_link_streams_the_market_and_trades_through_a_real_broker() {
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: None,
     })
     .unwrap()
     .0;
@@ -68,6 +70,7 @@ fn a_ui_link_streams_the_market_and_trades_through_a_real_broker() {
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        registry: None,
     })
     .unwrap()
     .0;

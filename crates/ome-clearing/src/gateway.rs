@@ -5,12 +5,13 @@ use ome_client::upstream::{Upstream, UpstreamEvent};
 use ome_core::price::format_price;
 use ome_core::types::Timestamp;
 use ome_net::auth::{SecretHash, hash_secret, valid_username, verify};
+use ome_net::onboard::Applications;
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
 use ome_protocol::{
     Decoder, MarketPhase, MemberId, MemberInfo, MemberKind, MemberMessage, ServerMessage, template,
 };
-use ome_store::Journal;
+use ome_store::FactLog;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -35,7 +36,7 @@ pub struct OpsCredentials {
 
 pub struct Gateway {
     clearing: Clearing,
-    journal: Option<Journal<Record>>,
+    journal: Option<Box<dyn FactLog<Record>>>,
     exchange: Upstream,
     ops: OpsCredentials,
     exchange_members: Vec<MemberInfo>,
@@ -44,12 +45,13 @@ pub struct Gateway {
     next_cycle_at: Option<Timestamp>,
     clock: Timestamp,
     last_heartbeat: Timestamp,
+    applications: Applications,
 }
 
 impl Gateway {
     pub fn new(
         clearing: Clearing,
-        journal: Option<Journal<Record>>,
+        journal: Option<Box<dyn FactLog<Record>>>,
         exchange: Upstream,
         ops: OpsCredentials,
         clock: Timestamp,
@@ -65,7 +67,32 @@ impl Gateway {
             next_cycle_at: None,
             clock,
             last_heartbeat: clock,
+            applications: Applications::default(),
         }
+    }
+
+    pub fn health(&self) -> ome_net::registry::Report {
+        let mut report = ome_net::registry::Report::default();
+        report.dep("exchange", self.exchange.is_ready(), self.exchange.problem());
+        report.metric("sessions", self.sessions_logged_on() as i64);
+        report.metric("applications", self.applications.len() as i64);
+        let mut report = report.ready_unless(&["exchange"]);
+        if self.exchange.awaiting_approval() {
+            report.detail = "clearing membership at the exchange awaiting approval".into();
+        }
+        report
+    }
+
+    pub fn applications(&self) -> &Applications {
+        &self.applications
+    }
+
+    pub fn exchange_link(&self) -> &Upstream {
+        &self.exchange
+    }
+
+    pub fn sessions_logged_on(&self) -> usize {
+        self.sessions.values().filter(|s| s.login.is_some()).count()
     }
 
     pub fn clearing(&self) -> &Clearing {
@@ -224,6 +251,27 @@ impl Gateway {
                     last_seq,
                 },
             ) => self.logon(id, &name, &secret, last_seq, now),
+            (
+                None,
+                MemberMessage::Apply {
+                    kind,
+                    name,
+                    secret,
+                    note,
+                },
+            ) => {
+                let result = match self.clearing.find(&name) {
+                    Some((_, Some(_))) => Err(format!("{name} is already a clearing member")),
+                    _ => self.applications.receive(kind, &name, &secret, &note, now),
+                };
+                match result {
+                    Ok(text) => {
+                        log(&format!("clearing membership {text}"));
+                        self.reply(id, ServerMessage::Ack { ref_template, text });
+                    }
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
             (_, MemberMessage::Heartbeat) => {}
             (None, _) => self.reject(id, ref_template, "logon required"),
             (Some(_), MemberMessage::Logon { .. }) => {
@@ -340,6 +388,53 @@ impl Gateway {
                     }
                     Err(reason) => self.reject(id, ref_template, &reason),
                 }
+            }
+            (Login::Ops, MemberMessage::QueryApplications) => {
+                self.reply(id, ServerMessage::Applications(self.applications.list()))
+            }
+            (
+                Login::Ops,
+                MemberMessage::Decide {
+                    name,
+                    approve,
+                    amount,
+                    note,
+                },
+            ) => {
+                let Some(pending) = self.applications.take(&name) else {
+                    return self.reject(id, ref_template, &format!("no pending application from {name}"));
+                };
+                if !approve {
+                    let text = format!("clearing application from {name} refused{}", if note.is_empty() { String::new() } else { format!(": {note}") });
+                    log(&text);
+                    return self.reply(id, ServerMessage::Ack { ref_template, text });
+                }
+                let fact = match self.clearing.decide_register(&name, pending.secret, &self.exchange_members) {
+                    Ok(fact) => fact,
+                    Err(reason) => {
+                        self.applications.restore(&name, pending);
+                        return self.reject(id, ref_template, &reason);
+                    }
+                };
+                let member = match &fact {
+                    Fact::MemberRegistered { member, .. } => *member,
+                    _ => 0,
+                };
+                if self.record(fact, now).is_err() {
+                    return self.reject(id, ref_template, "journal unavailable");
+                }
+                let mut text = format!("clearing member {member} admitted: {name}");
+                if amount > 0 {
+                    match self.clearing.decide_deposit(member, amount as i64) {
+                        Ok(deposit) => match self.record(deposit, now) {
+                            Ok(()) => text.push_str(&format!(", collateral {}", format_price(amount))),
+                            Err(_) => text.push_str(", collateral not recorded"),
+                        },
+                        Err(_) => text.push_str(", collateral not recorded"),
+                    }
+                }
+                log(&text);
+                self.reply(id, ServerMessage::Ack { ref_template, text });
             }
             (Login::Ops, MemberMessage::QueryMembers) => {
                 self.reply(id, ServerMessage::MemberList(self.exchange_members.clone()))

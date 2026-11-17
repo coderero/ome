@@ -13,6 +13,7 @@ const USAGE: &str = "usage:
   ome exchange [--addr HOST:PORT] [--member NAME] [--secret SECRET] <command>
       members                                             list exchange members
       add-member <name> <secret> <broker|lp>              admit a broker or liquidity provider
+      applications | approve <name> | refuse <name> [why..]   membership applications from firms
       ipo <SYMBOL> <price> <shares> <underwriter> <issuer-account> <name..>
                                                           list a company; underwriter is a member name
       halt <SYMBOL> [reason..]  |  resume <SYMBOL>
@@ -67,9 +68,12 @@ const USAGE: &str = "usage:
   ome venue [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>   (wholesaler 7301, dark pool 7302)
       status                                              fills, routing members, inventory and PFOF
       register <member-name> <secret>                     let an exchange member route to this venue
+      applications | approve <name> | refuse <name> [why..]   routing applications from members
 
   ome sim [--addr HOST:PORT] [--secret SECRET] <command>        simulation control plane (artificial participants only)
       status                                              agent groups, fair values, active scenarios
+      world                                               the simulated economy, companies and seeding progress
+      event <event> [SYMBOL]                              make something happen: earnings, cpi, rates, gdp, contract-win, lawsuit, ...
       pause <group|*>  |  resume <group|*>                stop or restart a group's trading (open orders are cancelled)
       count <group> <n>                                   scale a group up or down
       param <group|*> <key>=<value>                       change a strategy parameter live
@@ -83,14 +87,16 @@ const USAGE: &str = "usage:
       recordings  |  recording <name>                     saved recordings, or one recording's timeline
 
   ome news [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>   (newsroom 7500)
-      status                                              economy, companies, fundamentals and fair values
+      status                                              stories, contributors, subscribers and the writer
       list [n] [SYMBOL]  |  read <seq>  |  watch          recent stories (a symbol includes its sector and macro news)
-      inject <event> [SYMBOL]                             earnings, cpi, rates, gdp, contract-win, lawsuit, recall, upgrade, ...
       register <member-name> <secret>                     let a broker subscribe to the news feed
+      applications | approve <name> | refuse <name> [why..]   subscription requests
 
   ome clearing [--addr HOST:PORT] [--user NAME] [--secret SECRET] <command>
       status                                              cycles, collateral, margin, credit, fails
       register <member-name> <secret>                     make an exchange member a clearing member
+      applications | approve <name> [collateral] | refuse <name> [why..]
+                                                          clearing membership applications (approval can record collateral)
       deposit <member> <amount>  |  withdraw <member> <amount>
 
 defaults: OME_EXCHANGE / OME_MEMBER / OME_MEMBER_SECRET and OME_BROKER / OME_USER / OME_SECRET
@@ -240,12 +246,71 @@ fn number(text: &str) -> std::result::Result<u64, String> {
     text.parse().map_err(|_| format!("invalid number '{text}'"))
 }
 
+fn onboarding(client: &mut Client, args: &[&str]) -> Option<Result<()>> {
+    let run = |client: &mut Client| -> Result<()> {
+        match args {
+            ["applications"] => {
+                client.send_member(&MemberMessage::QueryApplications)?;
+                let ServerMessage::Applications(list) = client.wait_for(Duration::from_secs(5), |m| {
+                    matches!(m, ServerMessage::Applications(_) | ServerMessage::Reject { .. })
+                })?
+                else {
+                    return Err("applications are reviewed by the operations login".into());
+                };
+                if list.is_empty() {
+                    println!("no pending applications");
+                }
+                let now = ome_net_now();
+                for a in list {
+                    println!(
+                        "{:<20} {:<20} waiting {:>5}s  {}",
+                        a.name,
+                        a.kind.label(),
+                        now.saturating_sub(a.received_at) / 1_000,
+                        a.note
+                    );
+                }
+            }
+            ["approve", name, rest @ ..] if rest.len() <= 1 => {
+                let amount = rest.first().map(|a| amount(a)).transpose()?.unwrap_or(0);
+                println!(
+                    "{}",
+                    client.request_member(&MemberMessage::Decide {
+                        name: name.to_string(),
+                        approve: true,
+                        amount,
+                        note: String::new(),
+                    })?
+                );
+            }
+            ["refuse", name, note @ ..] => println!(
+                "{}",
+                client.request_member(&MemberMessage::Decide {
+                    name: name.to_string(),
+                    approve: false,
+                    amount: 0,
+                    note: note.join(" "),
+                })?
+            ),
+            _ => unreachable!(),
+        }
+        Ok(())
+    };
+    match args {
+        ["applications"] | ["approve", _] | ["approve", _, _] | ["refuse", _, ..] => Some(run(client)),
+        _ => None,
+    }
+}
+
 fn usage() -> Result<()> {
     eprintln!("{USAGE}");
     std::process::exit(2);
 }
 
 fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
+    if let Some(result) = onboarding(client, args) {
+        return result;
+    }
     match args {
         ["dmm", sym, member] => {
             let member = if *member == "none" {
@@ -1266,6 +1331,9 @@ fn print_note(note: &ome_protocol::ContractNote) {
 }
 
 fn clearing(client: &mut Client, args: &[&str]) -> Result<()> {
+    if let Some(result) = onboarding(client, args) {
+        return result;
+    }
     match args {
         ["status"] => {
             let s = clearing_status(client)?;
@@ -1349,6 +1417,9 @@ fn bps(value: i64) -> String {
 }
 
 fn news(client: &mut Client, args: &[&str]) -> Result<()> {
+    if let Some(result) = onboarding(client, args) {
+        return result;
+    }
     match args {
         ["status"] => {
             client.send_member(&MemberMessage::QueryNewsroom)?;
@@ -1360,31 +1431,9 @@ fn news(client: &mut Client, args: &[&str]) -> Result<()> {
                 unreachable!()
             };
             println!(
-                "day {} · quarter {} · {} stories · {} subscriber(s) · writer {}",
-                s.day, s.quarter, s.published, s.subscribers, s.writer
+                "day {} · {} stories from {} wire event(s) · {} subscriber(s) · {} contributor(s) connected · writer {}",
+                s.day, s.published, s.received, s.subscribers, s.sources, s.writer
             );
-            println!(
-                "economy: policy rate {} · inflation {} · growth {} · risk appetite {:+}",
-                bps(s.economy.rate_bps),
-                bps(s.economy.inflation_bps),
-                bps(s.economy.growth_bps),
-                s.economy.risk_appetite
-            );
-            for c in &s.companies {
-                println!(
-                    "  {:<6} {:<18} {:<10} fair {:>9}  EPS q {:>6} (next est {:>6})  revenue q ${:<10} margin {:>7} growth {:>7}  reports day {}",
-                    c.symbol.map(|s| s.to_string()).unwrap_or_default(),
-                    c.name,
-                    c.sector,
-                    format_price(c.fair),
-                    format_signed(c.eps_cents),
-                    format_signed(c.consensus_cents),
-                    c.revenue,
-                    bps(c.margin_bps),
-                    bps(c.growth_bps),
-                    c.next_report_day
-                );
-            }
         }
         ["list", rest @ ..] if rest.len() <= 2 => {
             let mut limit = 20;
@@ -1442,16 +1491,6 @@ fn news(client: &mut Client, args: &[&str]) -> Result<()> {
                 print_news(&item);
             }
         },
-        ["inject", event, rest @ ..] if rest.len() <= 1 => {
-            let target = rest.first().map(|s| symbol(s)).transpose()?;
-            println!(
-                "{}",
-                client.request_member(&MemberMessage::InjectNews {
-                    symbol: target,
-                    event: event.to_string(),
-                })?
-            );
-        }
         ["register", name, secret] => println!(
             "{}",
             client.request_member(&MemberMessage::CreateMember {
@@ -1466,6 +1505,9 @@ fn news(client: &mut Client, args: &[&str]) -> Result<()> {
 }
 
 fn venue(client: &mut Client, args: &[&str]) -> Result<()> {
+    if let Some(result) = onboarding(client, args) {
+        return result;
+    }
     match args {
         ["status"] => {
             client.send_member(&MemberMessage::QueryVenue)?;
@@ -1521,6 +1563,48 @@ fn sim(client: &mut Client, args: &[&str]) -> Result<()> {
         rest.first().map_or(Ok(default), |s| number(s))
     };
     let command = match args {
+        ["world"] => {
+            client.send_sim(&SimMessage::QueryWorld)?;
+            let ServerMessage::WorldStatus(w) = client.wait_for(Duration::from_secs(5), |m| {
+                matches!(m, ServerMessage::WorldStatus(_))
+            })?
+            else {
+                unreachable!()
+            };
+            println!("world day {} · quarter {} · {} event(s) · ideas: {}", w.day, w.quarter, w.events, w.ideas);
+            println!("provisioning: {}", w.provisioning);
+            println!(
+                "economy: policy rate {} · inflation {} · growth {} · risk appetite {:+}",
+                bps(w.economy.rate_bps),
+                bps(w.economy.inflation_bps),
+                bps(w.economy.growth_bps),
+                w.economy.risk_appetite
+            );
+            for c in &w.companies {
+                println!(
+                    "  {:<6} {:<18} {:<10} value {:>9}  EPS q {:>6} (next est {:>6})  revenue q ${:<10} margin {:>7} growth {:>7}  reports day {}",
+                    c.symbol.map(|s| s.to_string()).unwrap_or_default(),
+                    c.name,
+                    c.sector,
+                    format_price(c.fair),
+                    format_signed(c.eps_cents),
+                    format_signed(c.consensus_cents),
+                    c.revenue,
+                    bps(c.margin_bps),
+                    bps(c.growth_bps),
+                    c.next_report_day
+                );
+            }
+            return Ok(());
+        }
+        ["event", event, rest @ ..] if rest.len() <= 1 => {
+            let target = rest.first().map(|s| symbol(s)).transpose()?;
+            println!(
+                "{}",
+                client.request_sim(&SimMessage::Inject { event: event.to_string(), symbol: target })?
+            );
+            return Ok(());
+        }
         ["status"] => {
             client.send_sim(&SimMessage::QueryStatus)?;
             let ServerMessage::SimStatus(s) = client.wait_for(Duration::from_secs(5), |m| {

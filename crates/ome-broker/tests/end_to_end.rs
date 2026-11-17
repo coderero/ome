@@ -17,6 +17,8 @@ fn exchange() -> SocketAddr {
         admin_name: "ops".into(),
         admin_secret: "ops".into(),
         exchange: ExchangeConfig::default(),
+        schedule: None,
+        registry: None,
     })
     .unwrap()
     .0
@@ -38,6 +40,7 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str) -> SocketAdd
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        registry: None,
     })
     .unwrap()
     .0
@@ -236,4 +239,67 @@ fn hft_accounts_only_exist_at_dma_providers_and_orders_need_funds() {
     });
     assert_eq!(report.status, OrderStatus::Rejected);
     assert!(report.reason.contains("insufficient cash"));
+}
+
+#[test]
+fn a_broker_applies_for_membership_and_comes_online_once_exchange_operations_approve() {
+    let exchange = exchange();
+    let (mut ops, _) = Client::connect_member(&exchange.to_string(), "ops", "ops").unwrap();
+    let _lp = broker(exchange, ProfileKind::Lp, "lp-co");
+    let applications = |ops: &mut Client| {
+        ops.send_member(&MemberMessage::QueryApplications).unwrap();
+        match ops
+            .wait_for(Duration::from_secs(3), |m| matches!(m, ServerMessage::Applications(_)))
+            .unwrap()
+        {
+            ServerMessage::Applications(list) => list,
+            _ => unreachable!(),
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let pending = loop {
+        let list = applications(&mut ops);
+        if !list.is_empty() {
+            break list;
+        }
+        assert!(Instant::now() < deadline, "the broker never applied");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!((pending[0].name.as_str(), pending[0].kind), ("lp-co", MemberKind::LiquidityProvider));
+    assert!(pending[0].note.contains("lp-co"), "{}", pending[0].note);
+    let member = |ops: &mut Client| {
+        ops.send_member(&MemberMessage::QueryMembers).unwrap();
+        match ops.wait_for(Duration::from_secs(3), |m| matches!(m, ServerMessage::MemberList(_))).unwrap() {
+            ServerMessage::MemberList(list) => list.into_iter().find(|m| m.name == "lp-co"),
+            _ => unreachable!(),
+        }
+    };
+    assert!(member(&mut ops).is_none(), "nobody is a member before approval");
+    let text = ops
+        .request_member(&MemberMessage::Decide { name: "lp-co".into(), approve: true, amount: 0, note: String::new() })
+        .unwrap();
+    assert!(text.contains("lp-co"), "{text}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !member(&mut ops).is_some_and(|m| m.connected) {
+        assert!(Instant::now() < deadline, "the approved broker never logged on");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mut stranger = Client::connect(&exchange.to_string()).unwrap();
+    stranger
+        .request_member(&MemberMessage::Apply { kind: MemberKind::Broker, name: "shady-co".into(), secret: "x".into(), note: String::new() })
+        .unwrap();
+    assert!(stranger
+        .request_member(&MemberMessage::Apply { kind: MemberKind::Admin, name: "root".into(), secret: "x".into(), note: String::new() })
+        .is_err());
+    assert!(stranger
+        .request_member(&MemberMessage::Apply { kind: MemberKind::Broker, name: "lp-co".into(), secret: "x".into(), note: String::new() })
+        .unwrap_err()
+        .to_string()
+        .contains("already a member"));
+    let refused = ops
+        .request_member(&MemberMessage::Decide { name: "shady-co".into(), approve: false, amount: 0, note: "no licence".into() })
+        .unwrap();
+    assert!(refused.contains("refused: no licence"), "{refused}");
+    assert!(applications(&mut ops).is_empty());
+    assert!(Client::connect_member(&exchange.to_string(), "shady-co", "x").is_err());
 }

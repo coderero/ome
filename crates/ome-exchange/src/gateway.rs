@@ -5,6 +5,7 @@ use ome_core::price::format_price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{Side, Timestamp};
 use ome_net::auth::{hash_secret, valid_username, verify};
+use ome_net::onboard::Applications;
 use ome_net::throttle::TokenBucket;
 use ome_net::{Outbox, SessionId, log};
 use ome_protocol::framing::frame;
@@ -12,7 +13,7 @@ use ome_protocol::{
     BookSnapshot, CandleSnapshot, Decoder, MemberId, MemberKind, MemberMessage, ServerMessage,
     TradeEvent, template,
 };
-use ome_store::Journal;
+use ome_store::FactLog;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -34,7 +35,7 @@ struct Session {
 
 pub struct Gateway {
     exchange: Exchange,
-    journal: Option<Journal<Record>>,
+    journal: Option<Box<dyn FactLog<Record>>>,
     sessions: BTreeMap<SessionId, Session>,
     dirty_books: BTreeSet<Symbol>,
     dirty_stats: BTreeSet<Symbol>,
@@ -43,10 +44,11 @@ pub struct Gateway {
     dropped: BTreeSet<SessionId>,
     clock: Timestamp,
     last_heartbeat: Timestamp,
+    applications: Applications,
 }
 
 impl Gateway {
-    pub fn new(exchange: Exchange, journal: Option<Journal<Record>>, clock: Timestamp) -> Self {
+    pub fn new(exchange: Exchange, journal: Option<Box<dyn FactLog<Record>>>, clock: Timestamp) -> Self {
         Self {
             exchange,
             journal,
@@ -58,7 +60,39 @@ impl Gateway {
             dropped: BTreeSet::new(),
             clock,
             last_heartbeat: clock,
+            applications: Applications::default(),
         }
+    }
+
+    pub fn start_schedule(&mut self, schedule: Schedule, now: Timestamp) -> Result<(), String> {
+        let command = Command::SetSchedule { schedule: Some(schedule) };
+        let now = self.advance(now);
+        self.journal_write(now, &command).map_err(|e| e.to_string())?;
+        self.exchange.execute(&command, now).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    pub fn health(&self) -> ome_net::registry::Report {
+        let mut report = ome_net::registry::Report::default();
+        let status = self.exchange.market_status();
+        report.metric("members", self.exchange.members().iter().count() as i64);
+        report.metric("sessions", self.sessions_logged_on() as i64);
+        report.metric("instruments", self.exchange.instrument_list().len() as i64);
+        report.metric("day", status.day as i64);
+        report.metric("applications", self.applications.len() as i64);
+        let mut report = report.ready_unless(&[]);
+        report.detail = format!("{} · trading day {}", status.phase.label(), status.day);
+        if !self.applications.is_empty() {
+            report.detail.push_str(&format!(" · {} application(s) pending", self.applications.len()));
+        }
+        report
+    }
+
+    pub fn applications(&self) -> &Applications {
+        &self.applications
+    }
+
+    pub fn sessions_logged_on(&self) -> usize {
+        self.sessions.values().filter(|s| s.login.is_some()).count()
     }
 
     pub fn exchange(&self) -> &Exchange {
@@ -171,6 +205,30 @@ impl Gateway {
                     last_seq,
                 },
             ) => self.logon(id, &name, &secret, last_seq, now),
+            (
+                None,
+                MemberMessage::Apply {
+                    kind,
+                    name,
+                    secret,
+                    note,
+                },
+            ) => {
+                let result = if kind == MemberKind::Admin {
+                    Err("exchange operations members are not admitted by application".to_string())
+                } else if self.exchange.members().iter().any(|m| m.name == name) {
+                    Err(format!("{name} is already a member"))
+                } else {
+                    self.applications.receive(kind, &name, &secret, &note, now)
+                };
+                match result {
+                    Ok(text) => {
+                        log(&format!("membership {text} ({} applicant)", kind.label()));
+                        self.reply(id, ServerMessage::Ack { ref_template, text });
+                    }
+                    Err(reason) => self.reject(id, ref_template, &reason),
+                }
+            }
             (_, MemberMessage::Heartbeat) => {}
             (None, _) => self.reject(id, ref_template, "logon required"),
             (Some(_), MemberMessage::Logon { .. }) => {
@@ -359,6 +417,29 @@ impl Gateway {
                     })
                     .collect();
                 return self.reply(id, ServerMessage::Obligations(list));
+            }
+            MemberMessage::QueryApplications if admin => {
+                return self.reply(id, ServerMessage::Applications(self.applications.list()));
+            }
+            MemberMessage::Decide {
+                name,
+                approve,
+                note,
+                ..
+            } if admin => {
+                let Some(pending) = self.applications.take(&name) else {
+                    return self.reject(id, ref_template, &format!("no pending application from {name}"));
+                };
+                if !approve {
+                    let text = format!("membership application from {name} refused{}", if note.is_empty() { String::new() } else { format!(": {note}") });
+                    log(&text);
+                    return self.reply(id, ServerMessage::Ack { ref_template, text });
+                }
+                Command::CreateMember {
+                    kind: pending.kind,
+                    name,
+                    secret: pending.secret,
+                }
             }
             MemberMessage::QueryMembers if admin || clearing => {
                 return self.reply(id, ServerMessage::MemberList(self.member_list()));
@@ -796,6 +877,9 @@ fn describe_admin_action(command: &Command, events: &[Event]) -> Option<String> 
         Command::SetDmm { symbol, member: 0 } => format!("{symbol} has no designated market maker"),
         Command::SetDmm { symbol, member } => {
             format!("member {member} is the designated market maker for {symbol}")
+        }
+        Command::FileProspectus { symbol, reference, name } => {
+            format!("prospectus for {symbol} ({name}) on file, reference {reference}")
         }
         Command::SetCreditLimit { member, limit } => {
             if *limit == u64::MAX {
