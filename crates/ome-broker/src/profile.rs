@@ -63,7 +63,10 @@ pub struct Profile {
     pub kind: ProfileKind,
     pub allowed: Vec<Role>,
     pub internalize: bool,
+    pub collar_bps: u64,
 }
+
+pub const DEFAULT_COLLAR_BPS: u64 = 200;
 
 impl Profile {
     pub fn new(kind: ProfileKind) -> Self {
@@ -77,6 +80,7 @@ impl Profile {
             kind,
             allowed,
             internalize: false,
+            collar_bps: DEFAULT_COLLAR_BPS,
         }
     }
 

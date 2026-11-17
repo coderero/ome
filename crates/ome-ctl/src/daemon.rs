@@ -34,6 +34,9 @@ pub struct Daemon {
     started_next_at: Instant,
     seen: BTreeMap<String, (ServiceInfo, Instant)>,
     sessions: BTreeMap<SessionId, Box<dyn Outbox>>,
+    backing: std::sync::Arc<std::sync::Mutex<Vec<(crate::backing::Backing, bool)>>>,
+    record: bool,
+    llm: bool,
 }
 
 fn encode(message: &ServerMessage) -> Arc<[u8]> {
@@ -64,6 +67,9 @@ impl Daemon {
             started_next_at: Instant::now(),
             seen: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            backing: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            record: settings.record,
+            llm: settings.llm.is_some(),
         }
     }
 
@@ -163,6 +169,13 @@ impl Daemon {
             info.capabilities = format!("{} (not in the topology)", info.capabilities);
             list.push(info);
         }
+        for (b, up) in self.backing.lock().expect("backing lock").iter() {
+            let mut info = ServiceInfo::new(&b.name, b.kind.label(), &b.addr);
+            info.pid = 0;
+            info.health = if *up { Health::Ready } else { Health::Down };
+            info.detail = if *up { String::new() } else { "not reachable".into() };
+            list.push(info);
+        }
         list.retain(|s| kind.is_empty() || s.kind == kind);
         list
     }
@@ -239,6 +252,19 @@ impl Daemon {
         log(&format!("omectl supervising {} service(s); registry on {addr}", self.procs.len()));
         let (tx, rx) = mpsc::channel::<Inbound>();
         listen_quietly(listener, tx);
+        let used: Vec<crate::backing::Backing> = crate::backing::declared(&self.topology)
+            .into_iter()
+            .filter(|b| match b.kind {
+                crate::topology::Kind::Ollama => self.llm,
+                _ => self.record,
+            })
+            .collect();
+        let (wanted, probes) = (used, self.backing.clone());
+        thread::spawn(move || loop {
+            let states = wanted.iter().map(|b| (b.clone(), crate::doctor::reachable(&b.addr))).collect();
+            *probes.lock().expect("backing lock") = states;
+            thread::sleep(Duration::from_secs(3));
+        });
         let (topology, secrets) = (self.topology.clone(), self.secrets.clone());
         thread::spawn(move || {
             let mut admissions = Admissions::new();

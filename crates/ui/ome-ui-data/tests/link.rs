@@ -70,6 +70,8 @@ fn a_ui_link_streams_the_market_and_trades_through_a_real_broker() {
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        collar_bps: ome_broker::profile::DEFAULT_COLLAR_BPS,
+        exchange_rate: 4_500,
         registry: None,
     })
     .unwrap()

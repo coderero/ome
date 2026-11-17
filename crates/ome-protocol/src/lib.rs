@@ -1,3 +1,4 @@
+pub mod calendar;
 pub mod client;
 pub mod codec;
 pub mod framing;
@@ -10,6 +11,7 @@ pub mod sim;
 pub mod template;
 pub mod types;
 
+pub use calendar::{PRESETS, SimClock, preset, sim_clock};
 pub use client::ClientMessage;
 pub use codec::{DecodeError, Decoder, Encoder};
 pub use framing::{read_frame, write_frame};

@@ -23,6 +23,7 @@ const BOOTSTRAP_MS: Timestamp = 90_000;
 pub struct Bootstrap {
     seed: u64,
     deadline: Option<Timestamp>,
+    cap_weighted: bool,
 }
 
 impl Bootstrap {
@@ -30,7 +31,13 @@ impl Bootstrap {
         Self {
             seed,
             deadline: None,
+            cap_weighted: false,
         }
+    }
+
+    pub fn cap_weighted(mut self, on: bool) -> Self {
+        self.cap_weighted = on;
+        self
     }
 
     pub fn on_tick(&mut self, state: &AgentState, symbols: &[Symbol]) -> Option<Vec<Action>> {
@@ -43,7 +50,13 @@ impl Bootstrap {
         }
         let mut actions = cancel_stale(state, None, 3_000);
         let mut remaining = false;
+        let weights: std::collections::BTreeMap<Symbol, f64> = if self.cap_weighted {
+            strategies::cap_weights(state, symbols).into_iter().collect()
+        } else {
+            symbols.iter().map(|s| (*s, 1.0)).collect()
+        };
         for symbol in symbols {
+            let seed = (self.seed as f64 * weights.get(symbol).copied().unwrap_or(0.0)) as u64;
             let Some(market) = state.market(*symbol) else {
                 continue;
             };
@@ -51,18 +64,15 @@ impl Bootstrap {
                 continue;
             };
             let have = state.holding(*symbol).total() * price;
-            if have * 10 >= self.seed * 8 {
+            if have * 10 >= seed * 8 {
                 continue;
             }
             remaining = true;
             if state.busy() || !state.trading(*symbol) || state.open_in(*symbol) > 0 {
                 continue;
             }
-            let limit = market
-                .ask
-                .unwrap_or(price)
-                .min(scale(market.reference.max(price), 200.0));
-            let qty = affordable(state.cash, limit, (self.seed - have) / limit.max(1));
+            let limit = market.ask.unwrap_or(price).min(scale(market.reference, 200.0));
+            let qty = affordable(state.cash, limit, (seed - have) / limit.max(1));
             if qty > 0 {
                 actions.push(Action::Place {
                     symbol: *symbol,
@@ -154,7 +164,7 @@ fn run(
     for symbol in &symbols {
         client.send(&ClientMessage::Subscribe { symbol: *symbol })?;
     }
-    client.send(&ClientMessage::SubscribeNews { recent: 20 })?;
+    client.send(&ClientMessage::SubscribeNews { recent: 200 })?;
     let mut generation = ctx.group.generation();
     let Some(mut strategy) = strategies::create(&spec.strategy, &symbols, &ctx.group.params())
     else {
@@ -171,7 +181,7 @@ fn run(
         symbols.len(),
         session.account_id
     );
-    let mut bootstrap = Bootstrap::new(spec.seed);
+    let mut bootstrap = Bootstrap::new(spec.seed).cap_weighted(spec.params.text("seed_by", "") == "cap");
     let mut bootstrapping = spec.seed > 0;
     let mut next_tick = Instant::now() + strategy.interval();
     let mut next_status = Instant::now() + STATUS_EVERY;

@@ -10,6 +10,7 @@ const HALF_LIFE_MS: f64 = 45_000.0;
 pub struct NewsDesk {
     pub valuations: crate::valuation::Valuations,
     sectors: BTreeMap<Symbol, String>,
+    shares: BTreeMap<Symbol, u64>,
     items: VecDeque<NewsItem>,
     last_seq: u64,
 }
@@ -20,6 +21,11 @@ impl NewsDesk {
             && !item.sector.is_empty()
         {
             self.sectors.insert(symbol, item.sector.clone());
+        }
+        if item.kind == NewsKind::Prospectus
+            && let (Some(symbol), Some(shares)) = (item.symbol, item.value("float").or(item.value("shares")).and_then(|v| v.parse().ok()))
+        {
+            self.shares.insert(symbol, shares);
         }
         if item.seq <= self.last_seq {
             return false;
@@ -35,6 +41,19 @@ impl NewsDesk {
 
     pub fn sector(&self, symbol: Symbol) -> &str {
         self.sectors.get(&symbol).map_or("", String::as_str)
+    }
+
+    pub fn shares(&self, symbol: Symbol) -> Option<u64> {
+        self.shares.get(&symbol).copied()
+    }
+
+    pub fn macro_mood(&self, now: Timestamp, half_life_ms: f64) -> f64 {
+        self.items
+            .iter()
+            .filter(|i| i.kind == NewsKind::Macro)
+            .map(|i| i.sentiment as f64 / 100.0 * 0.5_f64.powf(now.saturating_sub(i.time) as f64 / half_life_ms))
+            .sum::<f64>()
+            .clamp(-1.0, 1.0)
     }
 
     pub fn last_seq(&self) -> u64 {

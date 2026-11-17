@@ -10,6 +10,9 @@ pub enum Kind {
     Simctl,
     Agents,
     Recorder,
+    Postgres,
+    Redis,
+    Ollama,
 }
 
 impl Kind {
@@ -23,6 +26,9 @@ impl Kind {
             "simctl" => Kind::Simctl,
             "agents" => Kind::Agents,
             "recorder" => Kind::Recorder,
+            "postgres" => Kind::Postgres,
+            "redis" => Kind::Redis,
+            "ollama" => Kind::Ollama,
             _ => return None,
         })
     }
@@ -37,7 +43,14 @@ impl Kind {
             Kind::Simctl => "simctl",
             Kind::Agents => "agents",
             Kind::Recorder => "recorder",
+            Kind::Postgres => "postgres",
+            Kind::Redis => "redis",
+            Kind::Ollama => "ollama",
         }
+    }
+
+    pub fn is_backing(self) -> bool {
+        matches!(self, Kind::Postgres | Kind::Redis | Kind::Ollama)
     }
 
     pub fn binary(self) -> &'static str {
@@ -50,6 +63,7 @@ impl Kind {
             Kind::Simctl => "ome-simctl",
             Kind::Agents => "ome-agents",
             Kind::Recorder => "ome-recorder",
+            Kind::Postgres | Kind::Redis | Kind::Ollama => "",
         }
     }
 }
@@ -155,6 +169,7 @@ impl Topology {
         let mut services: Vec<&Service> = self
             .services
             .iter()
+            .filter(|s| !s.kind.is_backing())
             .filter(|s| s.get("when") != Some("record") || record)
             .collect();
         services.sort_by_key(|s| s.kind);

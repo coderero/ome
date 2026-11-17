@@ -546,6 +546,7 @@ pub struct MarketStats {
     pub internal_volume: Qty,
     pub wholesaler_volume: Qty,
     pub ats_volume: Qty,
+    pub pauses: u32,
 }
 
 impl MarketStats {

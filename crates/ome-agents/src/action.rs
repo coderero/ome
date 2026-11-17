@@ -60,6 +60,12 @@ pub enum Action {
         limit: Option<Price>,
         min_qty: Qty,
     },
+    Auction {
+        symbol: Symbol,
+        side: Side,
+        qty: Qty,
+        limit: Price,
+    },
 }
 
 impl Action {
@@ -170,6 +176,19 @@ impl Action {
                 qty,
                 limit,
                 min_qty,
+            },
+            Action::Auction {
+                symbol,
+                side,
+                qty,
+                limit,
+            } => ClientMessage::NewOrder {
+                client_order_id,
+                symbol,
+                side,
+                kind: OrderKind::Limit(limit),
+                options: OrderOptions::tif(TimeInForce::Auction),
+                qty,
             },
         }
     }

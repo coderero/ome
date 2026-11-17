@@ -481,11 +481,17 @@ impl Broker {
                 )));
             }
             (OrderKind::Limit(p), _) => (p, tif),
-            (OrderKind::Market, _) if tif == TimeInForce::Fok => {
-                (if side == Side::Buy { high } else { low }, tif)
+            (OrderKind::Market, _) => {
+                let tif = if tif == TimeInForce::Fok { tif } else { TimeInForce::Ioc };
+                let continuous = market.phase() == MarketPhase::Open && market.is_trading(symbol);
+                let price = match (side, continuous) {
+                    (Side::Buy, false) => high,
+                    (Side::Sell, false) => low,
+                    (Side::Buy, true) => collar(market.best(symbol).map(|(_, ask)| ask), reference_price, self.profile.collar_bps, true).min(high),
+                    (Side::Sell, true) => collar(market.best(symbol).map(|(bid, _)| bid), reference_price, self.profile.collar_bps, false).max(low),
+                };
+                (price, tif)
             }
-            (OrderKind::Market, Side::Buy) => (high, TimeInForce::Ioc),
-            (OrderKind::Market, Side::Sell) => (low, TimeInForce::Ioc),
         };
         let options = OrderOptions { tif, ..options };
         let fee_reserve = self.fees.reserve(holder.role, side, price, qty);
@@ -2291,6 +2297,12 @@ fn client_report(
     }
 }
 
+pub fn collar(touch: Option<Price>, reference: Price, bps: u64, buy: bool) -> Price {
+    let base = touch.unwrap_or(reference).max(1) as u128;
+    let offset = (base * bps as u128).div_ceil(10_000) as Price;
+    if buy { base as Price + offset } else { (base as Price).saturating_sub(offset).max(1) }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -2383,6 +2395,14 @@ pub mod tests {
     }
 
     #[test]
+    fn market_orders_are_collared_near_the_touch_in_continuous_trading() {
+        assert_eq!(collar(Some(25_10), 25_00, 200, true), 25_61);
+        assert_eq!(collar(Some(24_90), 25_00, 200, false), 24_40);
+        assert_eq!(collar(None, 25_00, 100, true), 25_25);
+        assert_eq!(collar(Some(1), 1, 200, false), 1);
+    }
+
+    #[test]
     fn accepted_order_reserves_and_routes_a_protected_limit_to_the_exchange() {
         let mut broker = Broker::new(Profile::new(ProfileKind::Retail));
         let alice = open(&mut broker, "alice", Role::Retail, 10_000_00);
@@ -2403,12 +2423,12 @@ pub mod tests {
 
         assert_eq!(
             broker.ledger().get(alice).unwrap().cash.reserved,
-            27_50 * 10 + FeeEngine::default().reserve(Role::Retail, Side::Buy, 27_50, 10)
+            25_50 * 10 + FeeEngine::default().reserve(Role::Retail, Side::Buy, 25_50, 10)
         );
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::ToExchange(MemberMessage::NewOrder {
-                kind: OrderKind::Limit(27_50),
+                kind: OrderKind::Limit(25_50),
                 options: OrderOptions {
                     tif: TimeInForce::Ioc,
                     ..
@@ -3124,7 +3144,7 @@ pub mod tests {
         assert_eq!(statuses(&effects), vec![(1, ConditionalStatus::Triggered)]);
         assert_eq!(
             routed(&effects),
-            vec![(Side::Sell, OrderKind::Limit(22_50), 40)]
+            vec![(Side::Sell, OrderKind::Limit(24_50), 40)]
         );
         assert_eq!(broker.armed_conditionals(), 0);
         assert_eq!(
@@ -3694,7 +3714,7 @@ pub mod tests {
         let effects = broker.apply(&Fact::Released { order_ref: 1 });
         assert_eq!(
             routed(&effects),
-            vec![(Side::Buy, OrderKind::Limit(27_50), 4)]
+            vec![(Side::Buy, OrderKind::Limit(25_61), 4)]
         );
         assert!(broker.held_orders().is_empty());
         let stats = broker.fee_summary();

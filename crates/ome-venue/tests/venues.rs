@@ -67,6 +67,8 @@ fn broker(
         ats_addr: venues.1.map(|a| a.to_string()),
         news_addr: None,
         postgres: None,
+        collar_bps: ome_broker::profile::DEFAULT_COLLAR_BPS,
+        exchange_rate: 4_500,
         registry: None,
     })
     .unwrap()

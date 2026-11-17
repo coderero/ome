@@ -12,9 +12,9 @@ scripts/demo.sh --fresh       # build, then `omectl up --fresh`: preflight check
 target/release/omectl status  # live cluster view: health, dependencies and metrics reported by every service
 scripts/stop.sh               # `omectl down`
 
-scripts/db.sh up              # PostgreSQL + Redis in Docker
-OME_RECORD=1 scripts/demo.sh --fresh   # also record the market into them (omectl refuses to start if they are down)
-scripts/llm.sh up             # Ollama with qwen2.5:7b (GPU when the NVIDIA runtime is installed); the newsroom then writes with it
+# With Docker, omectl starts PostgreSQL and Redis (recording, chart history) and Ollama (the newsroom's writer and
+# the world's invented events, GPU when the NVIDIA runtime is installed) by itself; it asks before downloading
+# the model (qwen2.5:7b). OME_RECORD=0 or OME_WRITER=templates skip them.
 ```
 
 On a Mac, with or without Docker, follow [docs/macos.md](docs/macos.md).
@@ -79,7 +79,7 @@ Every service is either a **worker** or a **master**.
 
 | Command | What it does |
 |---|---|
-| `omectl up [--fresh] [--record] [--no-build] [--writer auto\|llm\|templates]` | builds, runs the preflight checks (refuses on a failure), starts the supervisor in the background and waits until every service reports ready |
+| `omectl up [--fresh] [--record\|--no-record] [--no-build] [--writer auto\|llm\|templates]` | starts PostgreSQL, Redis and Ollama in Docker when they are needed and not running (asking before a model download), builds, runs the preflight checks (refuses on a failure), starts the supervisor in the background and waits until every service reports ready |
 | `omectl status` | the live cluster view from the registry: health, process, address, dependencies that are down, metrics |
 | `omectl logs <service> [-f]` · `omectl restart <service>` | a service's log; stop and start one service |
 | `omectl doctor` | preflight only: binaries, free ports, writable data directory, free disk, world and roster files, Ollama and the model, PostgreSQL and Redis when recording, Docker, default secrets on a non-loopback host |
@@ -89,7 +89,7 @@ Every service is either a **worker** or a **master**.
 - **Start order**: exchange, clearing house, newsroom, venues, brokers, simctl, agent runners, recorder. Each waits until the previous one has registered (at most 20 seconds); services retry their own links anyway.
 - **Supervision**: a service that exits is restarted after 1, 2, 4 ... up to 30 seconds; the delay resets after a minute of uptime. Every service recovers from its journal, so a killed broker comes back with the same balances.
 - **Registry and health**: every service reports once a second to the registry that omectl runs (`OME_REGISTRY`, port 7600): its address, health (starting, ready, degraded, stopping), the state of each dependency (exchange link, clearing link, news feed, venues, LLM writer, databases), lag and metrics, and what it offers. A service that falls silent for five seconds shows as down. Services also find each other by name in the registry: the recorder and simctl discover brokers and venues as they join, and brokers resolve venue names.
-- **Writer**: with `writer=auto` omectl starts Ollama through `scripts/llm.sh up` when it is not running and Docker is available, and falls back to templates otherwise.
+- **Backing services**: PostgreSQL, Redis and Ollama are topology entries too. `record=auto` (the default) records whenever the databases run or Docker can start them; `writer=auto` uses the local model when Ollama runs or Docker can start it and the model is downloaded (omectl asks before pulling it; without a terminal it uses templates). They show in `omectl status`, and `omectl down` stops the containers omectl started, nothing else.
 - **Backends**: processes on this machine today, behind a `Backend` trait; Docker, SSH hosts and Kubernetes are planned (phase 10).
 
 ## Membership Applications
@@ -125,7 +125,8 @@ crates/
 ├── ome-net        TCP session server, outbound back-pressure, auth hashing, logging, membership applications,
 │                  registry reporter and name directory
 ├── ome-llm        Ollama client behind the Model trait (the newsroom writes with it, simctl invents events with it)
-├── ome-ctl        omectl: topology, preflight, supervisor, service registry, admissions
+├── ome-ctl        omectl: topology, preflight, supervisor, service registry, admissions, backing services
+├── ome-bench      ome-load: capacity load test of the exchange and a broker (orders/s, latency, fan-out)
 ├── ome-exchange   exchange service (lib + `ome-exchange` binary)
 ├── ome-clearing   clearing house (lib + `ome-clearing` binary)
 ├── ome-broker     provider service with retail / prime / dma / lp profiles (lib + `ome-broker`)
@@ -139,6 +140,7 @@ crates/
 ├── ui/apps/ome-retail   OME Trader, the retail client's desktop platform
 └── ome-agents     agent runner: runs the strategies simctl assigns (HFT, DMM, quant, pension, prop, retail personas)
 config/   topology.conf (services for omectl) · world.conf (companies, demo accounts) · roster.conf (agent groups)
+          profiles.example.conf (copy to profiles.conf, yours, not in git: liquidity profiles per symbol)
 scripts/  demo.sh (build + omectl up) · stop.sh (omectl down) · db.sh · llm.sh
 docker-compose.yml   PostgreSQL 16 + Redis 7 for the recorder, Ollama (profile llm) for the newsroom
 docker-compose.gpu.yml   GPU reservation for Ollama
@@ -163,7 +165,7 @@ Exchange members are `broker`, `liquidity-provider` or `admin` (exchange operati
 ## Order Lifecycle
 
 1. An agent sends `NewOrder` to its provider.
-2. The provider checks the role's limits, the instrument status and the price band, and confirms buying power. It then records an `OrderAccepted` fact, reserves the cash or shares, and forwards the order to the exchange. Market orders are sent as **IOC limits at the band edge**, so a fill can never exceed what was reserved.
+2. The provider checks the role's limits, the instrument status and the price band, and confirms buying power. It then records an `OrderAccepted` fact, reserves the cash or shares, and forwards the order to the exchange. During continuous trading, market orders are sent as **IOC limits a collar past the touch** (2% beyond the best ask for a buy, below the best bid for a sell; `--collar-bps`), so one order cannot sweep a thin book to the price-band edge, and a fill can never exceed what was reserved. In auctions they join at the band edge, as before. The broker paces what it sends to the exchange below the exchange's per-session message rate (`--exchange-rate`, default 4,500/s against the exchange's 5,000/s, `--session-rate`): a burst waits in the broker's queue instead of being refused and lost.
 3. The exchange matches and sends **sequenced** execution reports to every member involved.
 4. Each provider settles its own client's side (refunding price improvement, releasing reservations on cancel or expiry) and forwards a client-facing report.
 
@@ -373,11 +375,14 @@ The exchange runs a trading day in four phases, either manually or on a repeatin
 - Orders carry a time in force: `gtc` (default for limits), `day`, or `ioc` (default for market orders).
 - The clearing house can follow the exchange calendar (`--cycle-ms 0`): each pre-open starts a new clearing cycle, so T+1 means the next trading day.
 - No schedule means the market is always open.
-- The exchange runs its own calendar from `--schedule PRE,OPEN,CLOSING,CLOSED` (seconds) when its journal has none yet; omectl passes `trading-day` from the topology. Changing it later is an operator request (`ome exchange schedule`, or `ome sim speed` from the simulation master), journaled like any command.
+- The exchange runs its own calendar from `--schedule PRE,OPEN,CLOSING,CLOSED` (seconds, or a preset name) when its journal has none yet; omectl passes `trading-day` from the topology (default `compressed`).
+- **Presets**: `real` is a full exchange day (pre-open 15 min, open 6 h 15 min, closing auction 10 min, closed overnight, 24 h in all), `compressed` is a trading day in 10 minutes, `fast` a day a minute. `ome exchange preset <name>` switches at the next pre-open, so the current day keeps its length; `ome sim speed <name>` switches at once.
+- **Simulated clock**: the session maps onto exchange hours (pre-open 09:00, open 09:15-15:30, closing auction to 15:40, then the night), with Monday to Friday by trading day. `ome exchange status` and the trading app's status strip show it, e.g. `Wed 12:01 · day 3`. Changing it later is an operator request (`ome exchange schedule`, or `ome sim speed` from the simulation master), journaled like any command.
 
 ```bash
 ome exchange status                         # market open · trading day 2 · next change in 8s
-ome exchange schedule 5 45 5 5              # pre-open 5s, open 45s, closing auction 5s, closed 5s
+ome exchange schedule 5 45 5 5              # pre-open 5s, open 45s, closing auction 5s, closed 5s, from now
+ome exchange preset compressed              # switch the day length at the next pre-open; `preset` lists them, `... now` applies at once
 ome exchange session close                  # manual control; `schedule off` to stop the schedule
 ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw buy ACME 23.00 3 day
 ```
@@ -409,10 +414,11 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw balance
 
 | Tier | Strategies |
 |---|---|
-| HFT (DMA) | Avellaneda-Stoikov market making: spread widens with volatility, quotes skew away from inventory, two-sided quotes with market maker protection |
-| Liquidity providers | designated market maker quoting round lots within the 2% obligation; quote size grows with capital and leans against inventory |
+| Institutions (prime) | index funds holding free-float market-cap weights and rebalancing with limit orders in the closing auction; domestic mutual funds that receive savers' money every trading day, buy below their own valuation and trim far above it; foreign funds whose equity exposure follows global risk appetite read from macro news; a sovereign fund that buys only deep discounts. They execute with percentage-of-volume parents (5-8% of what others trade), so their flow follows the market's activity |
+| HFT (DMA) | Avellaneda-Stoikov market making: spread widens with volatility, quotes skew away from inventory, two-sided quotes with market maker protection, plus resting levels behind the quote (`levels=3`) with growing size |
+| Liquidity providers | designated market maker quoting round lots within the 2% obligation, four levels deep; quote size grows with capital and leans against inventory |
 | Quant funds (prime) | pairs stat-arb executed with POV algos or in the dark pool; factor model (momentum, reversal, volatility) rebalanced with VWAP parents; value investing from their own valuation of the published fundamentals; news-driven funds trading fresh stories by tone and fair value impact, unwound after a minute |
-| Slow money (prime) | pension funds rebalancing to target weights with slow VWAP parents |
+| Slow money (prime) | pension funds rebalancing to equal weights with participation-capped parents |
 | Prop desks (prime) | momentum, breakout and mean reversion entries, each position protected by an OCO take-profit/stop |
 | Retail | day traders (protective stops, flat before the close), swing traders (brackets on dips), investors (GTT dip buys, after-market orders, trailing stops), ML personas, value-minded retail, noise traders |
 
@@ -502,6 +508,31 @@ ome broker --addr 127.0.0.1:7101 --user alice --secret alice-pw news 5
 
 In a live run under omectl, `ome sim event lawsuit ACME` became world event #4 (-32 bps), `ome sim news NOVA -8` became #5 ("Unexpected setback for Nova Energy", -800 bps), and both reached alice's broker feed within a second. After `kill -9` of the retail broker, omectl restarted it within a second; it replayed its journal and its 56 agent sessions reconnected.
 
+## Calibration, Measurement and Capacity
+
+**Liquidity profiles.** `config/profiles.conf` is yours and stays out of git (`config/profiles.example.conf` shows the format). One line per symbol: shares outstanding, starting price, free float, average daily volume, typical spread, typical daily move and depth within 1% of mid. simctl sizes each company from the first three (the IPO offers the free float; EPS follows the price so the company keeps its valuation multiple). The rest are only compared with what the market did, never fed back.
+
+**Measurement.** `ome exchange vol [SYMBOL]` reports, per symbol: typical and largest 1-minute move and the recent range; the median wick share of 1-minute candles (how much of the range is wicks); the quoted spread; resting depth within 1% and 2% of mid; today's volume, trades, range and limit up-limit down pauses (now part of the exchange's market statistics). With a profile it prints the profile's numbers underneath.
+
+**The starting market** (`config/world.conf`, `config/roster.conf`) is about ten times the earlier demo: each company's free float is worth about 18.6M (ACME 742,500 of 1.35M shares, NOVA 1.49M of 3.3M, ZEN 234,000 of 390,000), held by 86 firms with about 96M of capital. Institutions hold most of it: two index funds (about 27% of the float), three domestic mutual funds with daily inflows, two foreign funds, a sovereign fund and two pensions. The prime broker posts 30M of collateral, because it clears the institutions and underwrites the IPOs.
+
+**Measured** (fresh market, `compressed` days, templates, middle of trading day 1, after the IPO day): prices within 3% of the world's values (ACME 23.86 vs 24.51, NOVA 12.50 vs 12.32, ZEN 79.28 vs 78.30); typical 1-minute move 2.3-2.6% and 5-minute range 5.5-7%; spreads 1-8 bps; depth within 1% of mid 0.6-1.5M; no limit up-limit down pauses (phase 5c: ACME 7.5% a minute, 14 pauses in 6 minutes). Still above a real stock at this time scale (a 1-minute bar here is about 40 real minutes), and turnover is far higher than real (NOVA traded about half its float in a day), because most agents act on wall-clock time, not per trading day.
+
+**Capacity** (`ome-load`, Intel Core Ultra 9 275HX, release build, journal on):
+
+| Path | Throughput | Latency to first report |
+|---|---|---|
+| members straight to the exchange (8 sessions) | about 24,000-25,000 orders/s, the same with the journal off | 1.2 ms p50, 3.9 ms p99 at low queue depth |
+| clients through one DMA broker (8 accounts) | about 4,500-6,000 orders/s, paced to the broker's one exchange session | 2 ms p50 unloaded |
+| market data from one broker while it trades | about 180,000 messages/s to 200 subscribers (900 each) | |
+
+The matching thread is the limit, not the disk. One broker is capped by its exchange session (5,000 messages/s by default, `--session-rate`), which the broker now respects by pacing instead of losing orders. The full demo generates about 130 orders/s, so one machine has room for a market about 100 times busier before the exchange saturates; the next limits are per-broker sessions, then the single matching thread (symbol sharding, planned).
+
+```bash
+cargo run --release -p ome-bench --bin ome-load -- exchange --sessions 8 --seconds 10
+cargo run --release -p ome-bench --bin ome-load -- broker --sessions 8 --window 16 --subscribers 200
+```
+
 ## Desktop Apps
 
 The desktop apps are written in pure Rust with [egui](https://github.com/emilk/egui) (eframe, egui_extras tables and egui_dock workspaces). There is one app per party. They share `ome-ui`, which handles the look: theme, bundled font, tables, collapsible sections, widgets, toasts and the candle chart. They also share `ome-ui-data`, which handles connections and state and draws nothing. Open Sans (regular and bold, Apache-2.0, licence file in `ome-ui/fonts`) is compiled into every app, so nothing depends on installed fonts.
@@ -515,7 +546,7 @@ The look follows professional broker platforms such as thinkorswim:
 A light theme is available too. A unit test checks text contrast (at least 4.5:1) in both themes.
 
 ```bash
-OME_RECORD=1 scripts/demo.sh --fresh       # with the recorder, brokers serve chart history from PostgreSQL
+scripts/demo.sh --fresh                    # with the recorder (on when Docker runs), brokers serve chart history from PostgreSQL
 cargo run --release -p ome-retail          # log in as alice / alice-pw at 127.0.0.1:7101
 cargo run --release -p ome-retail -- --user alice --secret alice-pw --interval 60   # scripted start, 1m candles
 ```
@@ -605,7 +636,7 @@ The exchange sends the underwriter (`prime-co`) an `Allocation` for account 3, t
 ## Testing
 
 ```bash
-cargo test --workspace     # 290 tests
+cargo test --workspace     # 300 tests
 ```
 
 Includes protocol round-trips and fuzzing, exchange matching, sequencing, gap detection and journal replay, provider risk and settlement, fact-journal replay, and **end-to-end tests** in which a real exchange and real brokers talk over TCP: an investor buys IPO shares through a retail broker while the issuer sits at a prime broker, and an HFT account can only be opened at a DMA provider, a retail stop-loss fires on a real exchange trade and sells into the bid, and a fund's TWAP fills through three child orders. A clearing end-to-end test runs exchange, clearing house and two brokers: an IPO fill shows as unsettled, settles one cycle later, collateral pays for it, and withdrawing collateral makes the exchange reject orders on the credit limit. A world end-to-end test runs exchange, newsroom, three brokers and simctl: simctl files the prospectuses, lists both IPOs, names the DMM, opens the demo and agent accounts, assigns the agents to a runner, and its events (prospectuses, calendar news, an injected lawsuit, a shock) reach a retail client through the broker's feed; after a restart nothing is seeded twice. An onboarding test starts a broker that is not a member: it applies, exchange operations approve it, and it comes online.
@@ -620,9 +651,9 @@ Done:
 - **5a** egui platform in the thinkorswim style: docked gadget workspaces, detachable windows, link colours, customisable sidebar and columns, draggable chart axes, setup, square off, headless GUI tests
 - **5b** market realism: economics-sized news, agents valuing companies themselves (no injected fair value), capital- and inventory-aware market makers, a balanced starting market, limit up-limit down pauses, a volatility report, day separators on charts
 - **5c** architecture realignment: workers and masters (the world model, seeding and the agent roster move to simctl; the newsroom becomes a news vendor fed by a sequenced wire), membership applications instead of scripted registration, a service registry with health, dependencies and metrics from every service, discovery by name, and omectl (topology, preflight, start order, supervision, admissions) replacing the bash scripts
+- **5d** deep calibrated market: a 10x larger market held mostly by institutions (index, domestic and foreign funds, a sovereign fund, pensions), multi-level market makers, market order collars and broker pacing, liquidity profiles, a measurement report, session presets with a simulated clock, backing services under omectl, a capacity load test
 
 Planned (open decisions first: IPO allotment rules, admin identity, warm-up history, short selling):
-- **5d** deep calibrated market: institutions and multi-level market makers, market order collars, calibration from local liquidity profiles, session presets, a capacity load test
 - **5e** strategy lab: a strategy SDK, backtests with the same interface, cost, impact and capacity reports
 - **5f** information model and operator event desk: consensus and surprises, gradual information diffusion, scheduled macro and corporate calendars, institutional flow commands
 - **5g** index, ETF and HFT strategies, latency classes and co-location; then a durable fast journal with an event bus

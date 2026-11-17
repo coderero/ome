@@ -435,7 +435,10 @@ impl RetailApp {
             let left = (status.next_change_at - self.core.store.now) / 1_000;
             ui.label(RichText::new(format!("{next} in {left}s")).color(t.text));
         }
-        ui.label(RichText::new(format!("day {}", status.day)).color(t.muted));
+        match ome_protocol::sim_clock(&status, self.core.store.now) {
+            Some(clock) => ui.label(RichText::new(clock.label()).color(t.muted)),
+            None => ui.label(RichText::new(format!("day {}", status.day)).color(t.muted)),
+        };
     }
 
     fn balances(&mut self, ui: &mut Ui) {

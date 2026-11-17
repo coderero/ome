@@ -45,6 +45,8 @@ pub struct Gateway {
     news_seq: u64,
     news_cache: VecDeque<ome_protocol::NewsItem>,
     history: Option<std::sync::mpsc::Sender<crate::history::HistoryJob>>,
+    outbound: VecDeque<MemberMessage>,
+    pace: ome_net::throttle::TokenBucket,
 }
 
 impl Gateway {
@@ -73,6 +75,26 @@ impl Gateway {
             news_seq: 0,
             news_cache: VecDeque::new(),
             history: None,
+            outbound: VecDeque::new(),
+            pace: ome_net::throttle::TokenBucket::new(4_500.0, 9_000.0, clock),
+        }
+    }
+
+    pub fn pacing(mut self, per_second: u64) -> Self {
+        let rate = per_second.max(1) as f64;
+        self.pace = ome_net::throttle::TokenBucket::new(rate, rate * 2.0, self.clock);
+        self
+    }
+
+    pub fn queued(&self) -> usize {
+        self.outbound.len()
+    }
+
+    fn drain_outbound(&mut self) {
+        while !self.outbound.is_empty() && self.exchange.is_ready() && self.pace.allow(self.clock) {
+            if let Some(message) = self.outbound.pop_front() {
+                self.exchange.send(&message);
+            }
         }
     }
 
@@ -151,6 +173,7 @@ impl Gateway {
             link(venue.label(), up);
         }
         report.metric("accounts", self.broker.ledger().accounts().count() as i64);
+        report.metric("queued_to_exchange", self.outbound.len() as i64);
         report.metric("sessions", self.sessions.values().filter(|s| s.login.is_some()).count() as i64);
         let mut report = report.ready_unless(&["exchange"]);
         if self.exchange.awaiting_approval() {
@@ -218,6 +241,7 @@ impl Gateway {
     pub fn tick(&mut self, now: Timestamp) {
         let now = self.advance(now);
         self.exchange.tick(now, self.broker.last_seq());
+        self.drain_outbound();
         if let Some(clearing) = &mut self.clearing {
             clearing.tick(now, self.broker.last_settlement_seq());
         }
@@ -313,7 +337,14 @@ impl Gateway {
     }
 
     fn send_exchange(&mut self, message: &MemberMessage) -> bool {
-        self.exchange.send(message)
+        if !self.exchange.is_ready() {
+            return self.exchange.send(message);
+        }
+        if self.outbound.is_empty() && self.pace.allow(self.clock) {
+            return self.exchange.send(message);
+        }
+        self.outbound.push_back(message.clone());
+        true
     }
 
     pub fn on_clearing(&mut self, generation: u64, event: LinkEvent, now: Timestamp) {

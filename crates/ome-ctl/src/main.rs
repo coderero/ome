@@ -1,4 +1,5 @@
 mod admit;
+mod backing;
 mod daemon;
 mod doctor;
 mod launch;
@@ -11,12 +12,13 @@ use ome_protocol::{Health, ServiceInfo};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use topology::Topology;
+use topology::{Kind, Topology};
 
 const USAGE: &str = "usage: omectl [--topology FILE] <command>
-  up [--fresh] [--record] [--no-build] [--writer auto|llm|templates]
-                    preflight checks, build, start the market under supervision and wait until it is ready
-  down              stop every service in reverse start order
+  up [--fresh] [--record|--no-record] [--no-build] [--writer auto|llm|templates]
+                    start PostgreSQL, Redis and Ollama in Docker when needed (asking before a model download),
+                    run the preflight checks, build, start the market under supervision, wait until it is ready
+  down              stop every service in reverse start order, and the containers omectl started
   status            live cluster view: health, dependencies and metrics reported by each service
   logs <service> [-f]
   restart <service>
@@ -51,18 +53,15 @@ fn env(name: &str) -> Option<String> {
 }
 
 fn settings(topology: &Topology, record: bool, llm: bool) -> Settings {
+    let postgres = backing::find(topology, Kind::Postgres).map(|b| format!("postgres://ome:ome@{}/ome", b.addr));
+    let redis = backing::find(topology, Kind::Redis).map(|b| format!("redis://{}/", b.addr));
     Settings {
         bin: env("OME_BIN").unwrap_or_else(|| topology.setting("bin", "target/release")).into(),
         data: env("OME_DATA").unwrap_or_else(|| topology.setting("data", "data")).into(),
         record,
-        llm: llm.then(|| {
-            (
-                env("OME_LLM").unwrap_or_else(|| "http://127.0.0.1:11434".into()),
-                env("OME_LLM_MODEL").unwrap_or_else(|| "qwen2.5:7b".into()),
-            )
-        }),
-        postgres: env("OME_POSTGRES").unwrap_or_else(|| "postgres://ome:ome@127.0.0.1/ome".into()),
-        redis: env("OME_REDIS").unwrap_or_else(|| "redis://127.0.0.1/".into()),
+        llm: llm.then(llm_target),
+        postgres: env("OME_POSTGRES").or(postgres).unwrap_or_else(|| "postgres://ome:ome@127.0.0.1/ome".into()),
+        redis: env("OME_REDIS").or(redis).unwrap_or_else(|| "redis://127.0.0.1/".into()),
     }
 }
 
@@ -118,25 +117,76 @@ fn print_status(list: &[ServiceInfo]) {
     }
 }
 
-fn resolve_writer(requested: &str, docker_start: bool) -> bool {
-    let url = env("OME_LLM").unwrap_or_else(|| "http://127.0.0.1:11434".into());
-    let model = env("OME_LLM_MODEL").unwrap_or_else(|| "qwen2.5:7b".into());
-    match requested {
-        "templates" => false,
-        "llm" => true,
-        _ => {
-            if ome_llm::probe(&url, &model).unwrap_or(false) {
-                return true;
+fn llm_target() -> (String, String) {
+    (
+        env("OME_LLM").unwrap_or_else(|| "http://127.0.0.1:11434".into()),
+        env("OME_LLM_MODEL").unwrap_or_else(|| "qwen2.5:7b".into()),
+    )
+}
+
+fn resolve_writer(topology: &Topology, requested: &str, data: &std::path::Path, start: bool) -> Result<bool, String> {
+    let (url, model) = llm_target();
+    if requested == "templates" {
+        return Ok(false);
+    }
+    if !start {
+        return Ok(ome_llm::probe(&url, &model).unwrap_or(false));
+    }
+    let in_docker = match backing::find(topology, Kind::Ollama) {
+        Some(ollama) => match backing::ensure(&ollama, data) {
+            Ok(started) => started || docker_holds_ollama(),
+            Err(e) if requested == "llm" => return Err(e),
+            Err(e) => {
+                println!("{e}; stories and events use templates");
+                return Ok(false);
             }
-            let docker = Command::new("docker").arg("info").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-            if docker_start && docker && std::path::Path::new("scripts/llm.sh").exists() {
-                println!("starting Ollama for the newsroom and the world's event ideas (writer=templates skips this)");
-                let _ = Command::new("scripts/llm.sh").arg("up").status();
-                return ome_llm::probe(&url, &model).unwrap_or(false);
+        },
+        None => false,
+    };
+    let ready = backing::pull_model(&url, &model, in_docker);
+    if !ready && requested == "llm" {
+        return Err(format!("writer=llm but {model} is not available"));
+    }
+    Ok(ready)
+}
+
+fn docker_holds_ollama() -> bool {
+    Command::new("docker")
+        .args(["ps", "--filter", "name=ollama", "--format", "{{.Names}}"])
+        .output()
+        .is_ok_and(|o| !o.stdout.is_empty())
+}
+
+fn resolve_record(topology: &Topology, flags: &[String], data: &std::path::Path) -> Result<bool, String> {
+    let has = |f: &str| flags.iter().any(|a| a == f);
+    let requested = if has("--record") {
+        "on".to_string()
+    } else if has("--no-record") {
+        "off".to_string()
+    } else {
+        env("OME_RECORD")
+            .map(|v| if v == "1" { "on".to_string() } else if v == "0" { "off".to_string() } else { v })
+            .unwrap_or_else(|| topology.setting("record", "auto"))
+    };
+    if matches!(requested.as_str(), "off" | "0" | "no") || topology.services.iter().all(|s| s.kind != Kind::Recorder) {
+        return Ok(false);
+    }
+    for kind in [Kind::Postgres, Kind::Redis] {
+        let Some(service) = backing::find(topology, kind) else {
+            if requested == "on" {
+                return Err(format!("recording needs a {} entry in the topology", kind.label()));
             }
-            false
+            return Ok(false);
+        };
+        if let Err(e) = backing::ensure(&service, data) {
+            if requested == "on" {
+                return Err(e);
+            }
+            println!("{e}; running without recording (charts keep only live history)");
+            return Ok(false);
         }
     }
+    Ok(true)
 }
 
 fn stop_from_pid_files(data: &std::path::Path) -> usize {
@@ -171,18 +221,18 @@ fn down(topology: &Topology, secrets: &Secrets, data: &std::path::Path) {
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = std::fs::remove_file(data.join("omectl.pid"));
+    backing::stop_started(data);
 }
 
 fn up(cli: &Cli, topology: &Topology, secrets: &Secrets, flags: &[String]) -> Result<(), String> {
     let has = |f: &str| flags.iter().any(|a| a == f);
-    let record = has("--record") || topology.setting("record", "0") == "1" || env("OME_RECORD").as_deref() == Some("1");
     let requested = flags
         .iter()
         .position(|a| a == "--writer")
         .and_then(|i| flags.get(i + 1).cloned())
         .or_else(|| env("OME_WRITER"))
         .unwrap_or_else(|| topology.setting("writer", "auto"));
-    let base = settings(topology, record, false);
+    let base = settings(topology, false, false);
     if has("--fresh") {
         if running(topology, secrets) {
             down(topology, secrets, &base.data);
@@ -210,10 +260,12 @@ fn up(cli: &Cli, topology: &Topology, secrets: &Secrets, flags: &[String]) -> Re
             return Err("build failed".into());
         }
     }
-    let llm = resolve_writer(&requested, true);
+    std::fs::create_dir_all(&base.data).map_err(|e| e.to_string())?;
+    let record = resolve_record(topology, flags, &base.data)?;
+    let llm = resolve_writer(topology, &requested, &base.data, true)?;
     let settings = settings(topology, record, llm);
     println!("preflight:");
-    let checks = doctor::run(topology, &settings, secrets, &requested, false);
+    let checks = doctor::run(topology, &settings, secrets, if llm { "auto" } else { "templates" }, false);
     if !print_checks(&checks) {
         return Err("preflight failed; fix the FAIL lines above (omectl doctor re-checks)".into());
     }
@@ -330,8 +382,9 @@ fn main() {
                 ["restart", name] => control(&access(&topology, &secrets), "restart", name).map(|t| println!("{t}")),
                 ["doctor"] => {
                     let requested = env("OME_WRITER").unwrap_or_else(|| topology.setting("writer", "auto"));
-                    let llm = resolve_writer(&requested, false);
-                    let record = topology.setting("record", "0") == "1" || env("OME_RECORD").as_deref() == Some("1");
+                    let data = settings(&topology, false, false).data;
+                    let llm = resolve_writer(&topology, &requested, &data, false)?;
+                    let record = !matches!(env("OME_RECORD").unwrap_or_else(|| topology.setting("record", "auto")).as_str(), "0" | "off" | "no");
                     let settings = settings(&topology, record, llm);
                     let ok = print_checks(&doctor::run(&topology, &settings, &secrets, &requested, running(&topology, &secrets)));
                     if ok { Ok(()) } else { Err("preflight failed".into()) }

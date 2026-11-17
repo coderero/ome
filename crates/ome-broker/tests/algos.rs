@@ -46,6 +46,8 @@ fn twap_parent_fills_through_child_orders_on_the_real_exchange() {
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        collar_bps: ome_broker::profile::DEFAULT_COLLAR_BPS,
+        exchange_rate: 4_500,
         registry: None,
     })
     .unwrap()

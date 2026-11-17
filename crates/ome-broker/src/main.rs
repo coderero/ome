@@ -3,7 +3,8 @@ use ome_broker::{BrokerConfig, start};
 use ome_client::DEFAULT_EXCHANGE_ADDR;
 
 const USAGE: &str = "usage: ome-broker --profile retail|prime|dma|lp --member NAME --member-secret SECRET
-                  [--regime us|india] [--wholesaler ADDR|NAME] [--ats ADDR|NAME] [--news ADDR|NAME] [--registry ADDR] [--postgres URL] [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
+                  [--regime us|india] [--wholesaler ADDR|NAME] [--ats ADDR|NAME] [--news ADDR|NAME] [--registry ADDR] [--collar-bps BPS (market orders: limit this far past the touch, default 200)]
+                  [--exchange-rate MSGS_PER_S (pace orders to the exchange below its session limit, default 4500)] [--postgres URL] [--listen ADDR] [--exchange ADDR] [--clearing ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET]";
 
 fn parse_args() -> Result<BrokerConfig, String> {
     let mut config = BrokerConfig {
@@ -22,6 +23,8 @@ fn parse_args() -> Result<BrokerConfig, String> {
         ats_addr: None,
         news_addr: None,
         postgres: None,
+        collar_bps: ome_broker::profile::DEFAULT_COLLAR_BPS,
+        exchange_rate: 4_500,
         registry: ome_net::registry::RegistryAccess::from_env(),
     };
     let mut iter = std::env::args().skip(1);
@@ -39,6 +42,8 @@ fn parse_args() -> Result<BrokerConfig, String> {
             "--ats" => config.ats_addr = Some(value()?),
             "--news" => config.news_addr = Some(value()?),
             "--postgres" => config.postgres = Some(value()?),
+            "--exchange-rate" => config.exchange_rate = value()?.parse().map_err(|_| "--exchange-rate needs a number")?,
+            "--collar-bps" => config.collar_bps = value()?.parse().map_err(|_| "--collar-bps needs a number")?,
             "--listen" => config.listen = value()?,
             "--exchange" => config.exchange_addr = value()?,
             "--journal" => config.journal = Some(value()?.into()),

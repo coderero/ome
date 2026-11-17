@@ -78,12 +78,7 @@ OME_LLM_MODEL=qwen2.5:1.5b scripts/demo.sh --fresh
 
 ### C. With Docker (Docker Desktop, OrbStack or Colima)
 
-PostgreSQL and Redis for recording and chart history:
-
-```bash
-scripts/db.sh up
-OME_RECORD=1 scripts/demo.sh --fresh
-```
+PostgreSQL and Redis for recording and chart history start by themselves: with Docker running, `scripts/demo.sh --fresh` starts them and `scripts/stop.sh` stops them again (only the containers omectl started).
 
 If Docker is running and no native Ollama answers, omectl starts Ollama in Docker by itself (`scripts/llm.sh up`). That works, but on a Mac it runs on the CPU and is slow. Start native Ollama first (option B), or set `OME_WRITER=templates` to skip the LLM.
 
@@ -157,9 +152,9 @@ Logs and journals live in `data/` (or `OME_DATA`), one `.log` and one `.journal`
 | `OME_WRITER` | `auto` | `auto` uses Ollama when it answers, `llm` always tries it, `templates` never uses it |
 | `OME_LLM` | `http://127.0.0.1:11434` | Ollama address |
 | `OME_LLM_MODEL` | `qwen2.5:7b` | model for invented events and rewritten stories |
-| `OME_RECORD` | `0` | `1` records the market into PostgreSQL and Redis |
+| `OME_RECORD` | `auto` | `auto` records when PostgreSQL and Redis run or Docker can start them, `1` insists, `0` never records |
 | `OME_POSTGRES` / `OME_REDIS` | local `ome` database / local Redis | recorder and chart history connections |
-| `OME_TRADING_DAY` | `5 45 5 5` | seconds of pre-open, open, closing auction and closed; `off` keeps the market always open |
+| `OME_TRADING_DAY` | `compressed` | `real`, `compressed` (a day in 10 minutes), `fast` (a day a minute), or seconds of pre-open, open, closing auction and closed; `off` keeps the market always open |
 | `OME_REGIME` | `us` | `us` allows internal crosses, the wholesaler and the dark pool; `india` sends every order to the exchange |
 | `OME_NEWS_PER_DAY` | `1` | stories per company per trading day |
 | `OME_QUARTER_DAYS` | `20` | trading days between earnings reports |

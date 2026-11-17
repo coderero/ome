@@ -70,6 +70,7 @@ fn observations_land_in_postgres_and_redis() {
             internal_volume: 0,
             wholesaler_volume: 5,
             ats_volume: 0,
+            pauses: 0,
         }),
         Observation::Market(MarketStatus {
             phase: MarketPhase::Open,

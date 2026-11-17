@@ -1,5 +1,6 @@
 use super::{Params, Strategy, affordable, gaussian, scale};
 use crate::action::Action;
+use ome_core::types::{OrderKind, Side};
 use crate::state::AgentState;
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
@@ -28,6 +29,8 @@ pub struct MarketMaker {
     pub size_pct: f64,
     pub requote_bps: f64,
     pub obligation: bool,
+    pub levels: u64,
+    pub level_gap_bps: f64,
     books: BTreeMap<Symbol, Book>,
     mmp_armed: bool,
     cooldown: u32,
@@ -45,6 +48,8 @@ impl MarketMaker {
             size_pct: params.f64("size_pct", 0.01),
             requote_bps: params.f64("requote_bps", 4.0),
             obligation,
+            levels: params.u64("levels", 3).clamp(1, 8),
+            level_gap_bps: params.f64("level_gap_bps", 0.0),
             books: BTreeMap::new(),
             mmp_armed: false,
             cooldown: 0,
@@ -144,8 +149,15 @@ impl Strategy for MarketMaker {
                 };
                 moved(b, bid) < self.requote_bps && moved(a, ask) < self.requote_bps
             });
-            if open == 2 && close_enough {
+            if open >= 2 && close_enough {
                 continue;
+            }
+            let old = book.quoted;
+            for (id, order) in state.open_orders.iter().filter(|(_, o)| o.symbol == symbol) {
+                let quote_leg = old.is_some_and(|(b, a)| order.price == b || order.price == a);
+                if !quote_leg {
+                    actions.push(Action::Cancel(*id));
+                }
             }
             let capital = (state.equity() as f64 * self.size_pct / fair.max(1) as f64) as Qty;
             let mut size = (self.size.max(capital) as f64 * rng.random_range(0.7..1.3)).round() as Qty;
@@ -165,6 +177,25 @@ impl Strategy for MarketMaker {
                 bid: (bid_qty > 0).then_some((bid, bid_qty)),
                 ask: (ask_qty > 0).then_some((ask, ask_qty)),
             });
+            let gap = if self.level_gap_bps > 0.0 { self.level_gap_bps } else { (half * 1.5).max(15.0) };
+            let (mut cash_left, mut shares_left) = (budget.saturating_sub(bid.saturating_mul(bid_qty)), held.available.saturating_sub(ask_qty));
+            for level in 1..self.levels {
+                let depth = 1.0 + 0.5 * level as f64;
+                let away = gap * level as f64;
+                let bid_level = scale(bid, -away);
+                let ask_level = scale(ask, away);
+                let qty = |base: Qty| ((base as f64 * depth).round() as Qty).max(1);
+                let buy = affordable(cash_left, bid_level, qty(bid_size));
+                if buy > 0 && market.ask.is_none_or(|a| bid_level < a) {
+                    cash_left -= bid_level * buy;
+                    actions.push(Action::Place { symbol, side: Side::Buy, kind: OrderKind::Limit(bid_level), qty: buy });
+                }
+                let sell = qty(ask_size).min(shares_left);
+                if sell > 0 && market.bid.is_none_or(|b| ask_level > b) {
+                    shares_left -= sell;
+                    actions.push(Action::Place { symbol, side: Side::Sell, kind: OrderKind::Limit(ask_level), qty: sell });
+                }
+            }
         }
         actions
     }
@@ -228,6 +259,37 @@ mod tests {
         let (_, bid, ask) = quotes(&skewed.on_tick(&state, &mut rng))[0];
         let mid = (bid.unwrap().0 + ask.unwrap().0) / 2;
         assert!(mid < 10_000, "long inventory lowers both quotes: {mid}");
+    }
+
+    #[test]
+    fn deeper_levels_rest_behind_the_quote_and_are_replaced_on_a_requote() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut state = state_with(&[(acme(), 10_000)], 50_000_000_00);
+        hold(&mut state, acme(), 50_000);
+        let mut mm = MarketMaker::new(vec![acme()], &Params::default(), false);
+        armed(&mut mm, &state, &mut rng);
+        let actions = mm.on_tick(&state, &mut rng);
+        let (_, bid, ask) = quotes(&actions)[0];
+        let ladder: Vec<(Side, Price, Qty)> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Place { side, kind: OrderKind::Limit(p), qty, .. } => Some((*side, *p, *qty)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ladder.len(), 4, "three levels: the quote plus two resting levels a side");
+        let bids: Vec<_> = ladder.iter().filter(|l| l.0 == Side::Buy).collect();
+        assert!(bids[0].1 < bid.unwrap().0 && bids[1].1 < bids[0].1, "deeper bids sit lower");
+        assert!(bids[1].2 > bids[0].2 && bids[0].2 >= bid.unwrap().1, "and carry more size");
+        assert!(ladder.iter().filter(|l| l.0 == Side::Sell).all(|l| l.1 > ask.unwrap().0));
+        state.open_orders.insert(77, crate::state::OpenOrder { symbol: acme(), side: Side::Buy, price: bids[0].1, leaves: 10, placed_at: 0 });
+        state.markets.get_mut(&acme()).unwrap().prices.push_back(10_400);
+        state.markets.get_mut(&acme()).unwrap().bid = Some(10_390);
+        state.markets.get_mut(&acme()).unwrap().ask = Some(10_410);
+        let requote = mm.on_tick(&state, &mut rng);
+        assert!(requote.contains(&Action::Cancel(77)), "the old ladder is pulled when the quote moves");
+        let flat = MarketMaker::new(vec![acme()], &Params([("levels".to_string(), "1".to_string())].into()), false);
+        assert_eq!(flat.levels, 1);
     }
 
     #[test]

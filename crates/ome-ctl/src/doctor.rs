@@ -109,10 +109,13 @@ pub fn run(topology: &Topology, settings: &Settings, secrets: &Secrets, writer: 
     if settings.record {
         for (what, url, port) in [("postgres", &settings.postgres, 5432), ("redis", &settings.redis, 6379)] {
             let addr = host_port(url, port);
+            let docker = Command::new("docker").arg("info").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
             checks.push(if reachable(&addr) {
                 check(Level::Ok, what, addr)
+            } else if docker {
+                check(Level::Ok, what, format!("{addr} not running; omectl up starts it in Docker"))
             } else {
-                check(Level::Fail, what, format!("{addr} unreachable; start it with scripts/db.sh up or run without --record"))
+                check(Level::Warn, what, format!("{addr} unreachable and no Docker; the market runs without recording"))
             });
         }
     }

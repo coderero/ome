@@ -37,6 +37,7 @@ pub struct ExchangeConfig {
     pub luld_bps: u64,
     pub luld_window_ms: Timestamp,
     pub luld_pause_ms: Timestamp,
+    pub session_rate: u64,
 }
 
 impl Default for ExchangeConfig {
@@ -56,6 +57,7 @@ impl Default for ExchangeConfig {
             luld_bps: 500,
             luld_window_ms: 300_000,
             luld_pause_ms: 15_000,
+            session_rate: 5_000,
         }
     }
 }
@@ -132,6 +134,9 @@ pub enum Command {
     },
     SetPhase {
         phase: MarketPhase,
+    },
+    PlanSchedule {
+        schedule: Schedule,
     },
     SetSchedule {
         schedule: Option<Schedule>,
@@ -413,6 +418,10 @@ impl Exchange {
             Command::SetPhase { phase } => Ok(self.set_phase(*phase, now)),
             Command::SetSchedule { schedule } => {
                 self.session.set_schedule(*schedule, now);
+                Ok(vec![Event::SessionChanged])
+            }
+            Command::PlanSchedule { schedule } => {
+                self.session.plan(*schedule, now);
                 Ok(vec![Event::SessionChanged])
             }
             Command::NewOrder {
@@ -885,6 +894,10 @@ impl Exchange {
                 name: m.name.clone(),
             })
             .collect()
+    }
+
+    pub fn orders_entered(&self) -> u64 {
+        self.next_order_id.saturating_sub(1)
     }
 
     pub fn cycle(&self) -> u64 {
@@ -1695,6 +1708,9 @@ impl Exchange {
         );
         if let Ok(halted) = self.halt(symbol, reason, Some(now + pause), HaltKind::Luld) {
             events.extend(halted);
+            if let Some(instrument) = self.instruments.get_mut(&symbol) {
+                instrument.day.pauses += 1;
+            }
         }
     }
 }

@@ -17,6 +17,7 @@ pub struct DayStats {
     pub trades: u64,
     pub turnover: u64,
     pub volume: [u64; 4],
+    pub pauses: u32,
 }
 
 impl DayStats {
@@ -144,6 +145,7 @@ impl Instrument {
             internal_volume: d.volume[Venue::Internal as usize],
             wholesaler_volume: d.volume[Venue::Wholesaler as usize],
             ats_volume: d.volume[Venue::Ats as usize],
+            pauses: d.pauses,
         }
     }
 

@@ -42,6 +42,8 @@ pub struct BrokerConfig {
     pub ats_addr: Option<String>,
     pub news_addr: Option<String>,
     pub postgres: Option<String>,
+    pub collar_bps: u64,
+    pub exchange_rate: u64,
     pub registry: Option<ome_net::registry::RegistryAccess>,
 }
 
@@ -86,7 +88,9 @@ fn news_event(generation: u64, event: LinkEvent) -> BrokerInbound {
 }
 
 pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), String>>), String> {
-    let mut broker = Broker::new(Profile::with_regime(config.profile, config.regime));
+    let mut profile = Profile::with_regime(config.profile, config.regime);
+    profile.collar_bps = config.collar_bps;
+    let mut broker = Broker::new(profile);
     let mut last_ts = 0;
     let journal = match &config.journal {
         Some(path) => {
@@ -179,7 +183,8 @@ pub fn start(config: BrokerConfig) -> Result<(SocketAddr, JoinHandle<Result<(), 
         .map(|url| history::spawn(url, tx.clone(), history_result));
     let mut gateway = Gateway::new(broker, journal, exchange, clearing, venues, last_ts)
         .with_news(news)
-        .with_history(history);
+        .with_history(history)
+        .pacing(config.exchange_rate);
     gateway.ensure_admin(&config.admin_name, &config.admin_secret, now_ms())?;
     gateway.flush().map_err(|e| e.to_string())?;
 

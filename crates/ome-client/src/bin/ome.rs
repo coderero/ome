@@ -21,10 +21,12 @@ const USAGE: &str = "usage:
       suspend <member>  |  reinstate <member>             kill switch: cancel all orders and block trading
       cod <member> on|off                                 cancel-on-disconnect for a member
       session <preopen|open|auction|close>                change the market phase now
-      schedule <preopen> <open> <closing> <closed>        repeating trading day in seconds; `schedule off`
+      schedule <preopen> <open> <closing> <closed>        repeating trading day in seconds, from now; `schedule off`
+      preset [real|compressed|fast] [now]                 switch the day length at the next pre-open (or now); no name lists them
       dmm <SYMBOL> <member|none>                          designate a market maker (better maker rebate, quoting obligation)
       obligations                                         designated market makers: quoting now and compliance
-      vol [SYMBOL]                                        observed price moves: typical and largest 1-minute move, 10-minute range
+      vol [SYMBOL]                                        what the market did: moves, wick share, spread, depth within 1% and 2%,
+                                                          volume and pauses today, next to config/profiles.conf (OME_PROFILES) if present
       stats <SYMBOL>                                      open, high, low, VWAP and volume by venue
       instruments  |  watch <SYMBOL>
 
@@ -81,7 +83,8 @@ const USAGE: &str = "usage:
       fair <SYMBOL> <price> [drift-bps-per-minute]        fundamental value that value investors trade around
       crash <SYMBOL> [seconds]  |  news <SYMBOL> <percent> [seconds]
       drought [seconds]  |  volatility [seconds]          market-wide liquidity or activity scenarios
-      speed <preopen> <open> <closing> <closed>           trading day length in seconds (time acceleration)
+      speed <preopen> <open> <closing> <closed> | speed <real|compressed|fast>
+                                                          trading day length (time acceleration), applied now
       record start|stop <name>                            record operator commands with a tape mark at both ends
       replay <name> [speed]  |  replay stop               re-issue a recording with its original spacing (speed 2 = twice as fast)
       recordings  |  recording <name>                     saved recordings, or one recording's timeline
@@ -479,6 +482,22 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
                     closed_ms: ms(closed)?,
                 })?
             );
+        }
+        ["preset"] => {
+            for (name, seconds, what) in ome_protocol::PRESETS {
+                println!("  {name:<11} {:?} s   {what}", seconds);
+            }
+        }
+        ["preset", name, rest @ ..] if rest.is_empty() || rest == ["now"] => {
+            let [pre, open, closing, closed] = ome_protocol::preset(name)
+                .ok_or_else(|| format!("unknown preset '{name}' (real, compressed or fast)"))?
+                .map(|s| s * 1_000);
+            let message = if rest == ["now"] {
+                MemberMessage::SetSchedule { pre_open_ms: pre, continuous_ms: open, closing_ms: closing, closed_ms: closed }
+            } else {
+                MemberMessage::PlanSchedule { pre_open_ms: pre, continuous_ms: open, closing_ms: closing, closed_ms: closed }
+            };
+            println!("{}", client.request_member(&message)?);
         }
         ["resume", sym] => println!(
             "{}",
@@ -1197,15 +1216,47 @@ pub fn minute_moves(candles: &[ome_core::candles::Candle]) -> Vec<f64> {
         .collect()
 }
 
+pub fn wick_share(candles: &[ome_core::candles::Candle]) -> Option<f64> {
+    let mut shares: Vec<f64> = candles
+        .iter()
+        .filter(|c| c.trades > 0 && c.high > c.low)
+        .map(|c| 1.0 - c.close.abs_diff(c.open) as f64 / (c.high - c.low) as f64)
+        .collect();
+    if shares.is_empty() {
+        return None;
+    }
+    shares.sort_by(|a, b| a.total_cmp(b));
+    Some(shares[shares.len() / 2])
+}
+
+pub fn depth_within(book: &ome_protocol::BookSnapshot, pct: f64) -> Option<(u64, u64)> {
+    let mid = (book.bids.first()?.price + book.asks.first()?.price) as f64 / 2.0;
+    let near = |price: u64| (price as f64 / mid - 1.0).abs() * 100.0 <= pct + 1e-9;
+    let levels = book.bids.iter().chain(book.asks.iter()).filter(|l| near(l.price));
+    Some(levels.fold((0, 0), |(qty, value), l| (qty + l.qty, value + l.qty * l.price)))
+}
+
+fn profiles() -> Vec<ome_core::profile::Profile> {
+    let path = std::env::var("OME_PROFILES").unwrap_or_else(|_| "config/profiles.conf".into());
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| ome_core::profile::parse_profiles(&text).map_err(|e| eprintln!("{path}: {e}")).ok())
+        .unwrap_or_default()
+}
+
 fn print_vol(client: &mut Client, symbol: Symbol) -> Result<()> {
     client.send_member(&MemberMessage::Subscribe { symbol })?;
-    let ServerMessage::Candles(series) = client.wait_for(
-        Duration::from_secs(5),
-        |m| matches!(m, ServerMessage::Candles(c) if c.symbol == symbol),
-    )?
-    else {
-        unreachable!()
-    };
+    let (mut series, mut book, mut stats) = (None, None, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while (series.is_none() || book.is_none() || stats.is_none()) && std::time::Instant::now() < deadline {
+        match client.recv_timeout(Duration::from_millis(200))? {
+            Some(ServerMessage::Candles(c)) if c.symbol == symbol => series = Some(c),
+            Some(ServerMessage::Book(b)) if b.symbol == symbol => book = Some(b),
+            Some(ServerMessage::MarketStats(m)) if m.symbol == symbol => stats = Some(m),
+            _ => {}
+        }
+    }
+    let series = series.ok_or("no candles from the exchange")?;
     let traded: Vec<_> = series.candles.iter().filter(|c| c.trades > 0).collect();
     let moves = minute_moves(&series.candles);
     if traded.is_empty() || moves.is_empty() {
@@ -1222,6 +1273,42 @@ fn print_vol(client: &mut Client, symbol: Symbol) -> Result<()> {
         (high as f64 / low as f64 - 1.0) * 100.0,
         series.candles.len() * series.interval as usize / 1_000
     );
+    let minutes = ome_core::candles::aggregate(&series.candles, 60_000);
+    let wick = wick_share(&minutes).map_or("-".to_string(), |w| format!("{:.0}%", w * 100.0));
+    let spread = book.as_ref().and_then(|b| {
+        let (bid, ask) = (b.bids.first()?.price, b.asks.first()?.price);
+        Some((ask as f64 - bid as f64) / ((ask + bid) as f64 / 2.0) * 10_000.0)
+    });
+    let depth = |pct: f64| {
+        book.as_ref()
+            .and_then(|b| depth_within(b, pct))
+            .map_or("-".to_string(), |(qty, value)| format!("{qty} shares ({})", format_price(value)))
+    };
+    println!(
+        "       wick share {wick} of the 1-minute range · spread {} · depth within 1% {} · within 2% {}",
+        spread.map_or("-".to_string(), |s| format!("{s:.1} bps")),
+        depth(1.0),
+        depth(2.0)
+    );
+    if let Some(m) = &stats {
+        println!(
+            "       today: volume {} in {} trades, range {:.2}%, limit up-limit down pauses {}",
+            m.volume(),
+            m.trades,
+            if m.low > 0 { (m.high as f64 / m.low as f64 - 1.0) * 100.0 } else { 0.0 },
+            m.pauses
+        );
+    }
+    if let Some(p) = profiles().into_iter().find(|p| p.symbol == symbol) {
+        let show = |v: Option<String>| v.unwrap_or_else(|| "-".into());
+        println!(
+            "       profile: volume per day {} · spread {} · depth within 1% {} · daily move {}   (measured above; never fed back)",
+            show(p.adv.map(|a| a.to_string())),
+            show(p.spread_bps.map(|s| format!("{s:.1} bps"))),
+            show(p.depth.map(|d| format!("{d} shares"))),
+            show(p.vol_pct.map(|v| format!("{v:.2}%")))
+        );
+    }
     Ok(())
 }
 
@@ -1640,6 +1727,14 @@ fn sim(client: &mut Client, args: &[&str]) -> Result<()> {
             }
             return Ok(());
         }
+        ["speed", name] => {
+            let [a, b, c, d] = ome_protocol::preset(name).ok_or_else(|| format!("unknown preset '{name}' (real, compressed or fast)"))?;
+            println!(
+                "{}",
+                client.request_sim(&SimMessage::Accelerate { pre_open_s: a, open_s: b, closing_s: c, closed_s: d })?
+            );
+            return Ok(());
+        }
         ["speed", a, b, c, d] => {
             println!(
                 "{}",
@@ -1886,6 +1981,9 @@ fn print_status(client: &mut Client) -> Result<()> {
         m.phase.label(),
         m.day
     );
+    if let Some(clock) = ome_protocol::sim_clock(&m, ome_net_now()) {
+        println!("simulated clock: {}", clock.label());
+    }
     Ok(())
 }
 
@@ -1976,8 +2074,25 @@ fn resolve(client: &mut Client, account: &str) -> Result<AccountId> {
 
 #[cfg(test)]
 mod tests {
-    use super::minute_moves;
+    use super::{depth_within, minute_moves, wick_share};
+    use ome_core::symbol::Symbol;
     use ome_core::candles::Candle;
+
+    #[test]
+    fn wicks_and_depth_are_measured_from_candles_and_the_book() {
+        let candle = |open, high, low, close| Candle { start: 0, open, high, low, close, volume: 1, trades: 1 };
+        assert_eq!(wick_share(&[candle(100, 110, 90, 105)]), Some(0.75));
+        assert_eq!(wick_share(&[candle(100, 100, 100, 100)]), None);
+        let level = |price, qty| ome_core::order_book::Level { price, qty, orders: 1 };
+        let book = ome_protocol::BookSnapshot {
+            symbol: Symbol::parse("ACME").unwrap(),
+            timestamp: 0,
+            bids: vec![level(9_990, 10), level(9_900, 20), level(9_700, 50)],
+            asks: vec![level(10_010, 10), level(10_150, 30)],
+        };
+        assert_eq!(depth_within(&book, 1.0).unwrap().0, 40);
+        assert_eq!(depth_within(&book, 2.0).unwrap().0, 70);
+    }
 
     #[test]
     fn minute_moves_compare_closes_of_consecutive_traded_minutes() {

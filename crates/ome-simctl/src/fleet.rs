@@ -12,6 +12,7 @@ pub struct GroupSpec {
     pub role: Role,
     pub cash: u64,
     pub count: u32,
+    pub inflow_bps: u64,
 }
 
 pub fn parse_roster(text: &str, scale: f64) -> Result<Vec<GroupSpec>, String> {
@@ -30,7 +31,7 @@ pub fn parse_roster(text: &str, scale: f64) -> Result<Vec<GroupSpec>, String> {
         if !valid_username(&format!("{name}-1")) {
             return Err(at(format!("'{name}' cannot name accounts")));
         }
-        let (mut broker, mut role, mut cash, mut count) = (None, None, 0, 1.0);
+        let (mut broker, mut role, mut cash, mut count, mut inflow_bps) = (None, None, 0, 1.0, 0);
         for word in words {
             let Some((key, value)) = word.split_once('=') else {
                 return Err(at(format!("expected key=value, got '{word}'")));
@@ -40,6 +41,7 @@ pub fn parse_roster(text: &str, scale: f64) -> Result<Vec<GroupSpec>, String> {
                 "role" => role = Some(Role::parse(value).ok_or_else(|| at(format!("bad role '{value}'")))?),
                 "cash" => cash = parse_amount(value).ok_or_else(|| at(format!("bad amount '{value}'")))?,
                 "count" => count = value.parse::<f64>().map_err(|_| at(format!("bad count '{value}'")))?,
+                "inflow_bps" => inflow_bps = value.parse().map_err(|_| at(format!("bad inflow_bps '{value}'")))?,
                 _ => {}
             }
         }
@@ -53,6 +55,7 @@ pub fn parse_roster(text: &str, scale: f64) -> Result<Vec<GroupSpec>, String> {
             role: role.ok_or_else(|| at("missing role=".into()))?,
             cash,
             count: (count * scale).round().max(0.0) as u32,
+            inflow_bps,
         });
     }
     Ok(groups)
@@ -161,12 +164,13 @@ mod tests {
     #[test]
     fn rosters_parse_and_the_fleet_opens_assigns_balances_and_retires() {
         let text = "
-            group noise count=2 broker=retail-co role=retail strategy=noise cash=20000 seed=4000
+            group noise count=2 broker=retail-co role=retail strategy=noise cash=20000 seed=4000 inflow_bps=15
             group hft count=1 broker=dma-co role=hft strategy=market-maker cash=600000 # tier 1
         ";
         let groups = parse_roster(text, 1.0).unwrap();
         assert_eq!((groups[0].count, groups[0].cash, groups[1].role), (2, 20_000_00, Role::Hft));
         assert!(groups[0].line.contains("seed=4000"));
+        assert_eq!((groups[0].inflow_bps, groups[1].inflow_bps), (15, 0));
         assert_eq!(parse_roster(text, 2.5).unwrap()[0].count, 5);
         assert!(parse_roster("group x role=retail", 1.0).is_err());
         assert!(parse_roster("agent x", 1.0).is_err());

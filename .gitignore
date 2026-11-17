@@ -6,3 +6,4 @@
 *.new.png
 *.old.png
 *.diff.png
+/config/profiles.conf

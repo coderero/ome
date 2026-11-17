@@ -275,6 +275,7 @@ impl ServerMessage {
                     .u64(m.internal_volume)
                     .u64(m.wholesaler_volume)
                     .u64(m.ats_volume)
+                    .u32(m.pauses)
                     .end_block();
             }
             ServerMessage::SimEvent(command) => crate::sim::put_command(&mut e, command),
@@ -743,6 +744,7 @@ impl ServerMessage {
                     internal_volume: d.u64()?,
                     wholesaler_volume: d.u64()?,
                     ats_volume: d.u64()?,
+                    pauses: d.u32()?,
                 };
                 d.end_block()?;
                 ServerMessage::MarketStats(stats)
@@ -1369,6 +1371,7 @@ mod tests {
                 internal_volume: 100,
                 wholesaler_volume: 150,
                 ats_volume: 30,
+                pauses: 2,
             }),
             ServerMessage::SimEvent(crate::sim::SimCommand::SetParam {
                 group: "noise".into(),

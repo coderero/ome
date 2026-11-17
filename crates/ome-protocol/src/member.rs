@@ -150,6 +150,12 @@ pub enum MemberMessage {
         closing_ms: u64,
         closed_ms: u64,
     },
+    PlanSchedule {
+        pre_open_ms: u64,
+        continuous_ms: u64,
+        closing_ms: u64,
+        closed_ms: u64,
+    },
 }
 
 impl MemberMessage {
@@ -191,6 +197,7 @@ impl MemberMessage {
             MemberMessage::QueryClearing => QUERY_CLEARING,
             MemberMessage::SetSession { .. } => SET_SESSION,
             MemberMessage::SetSchedule { .. } => SET_SCHEDULE,
+            MemberMessage::PlanSchedule { .. } => PLAN_SCHEDULE,
         }
     }
 
@@ -375,6 +382,12 @@ impl MemberMessage {
                 continuous_ms,
                 closing_ms,
                 closed_ms,
+            }
+            | MemberMessage::PlanSchedule {
+                pre_open_ms,
+                continuous_ms,
+                closing_ms,
+                closed_ms,
             } => {
                 e.u64(*pre_open_ms)
                     .u64(*continuous_ms)
@@ -437,6 +450,16 @@ impl MemberMessage {
             }
             SET_SCHEDULE => {
                 let message = MemberMessage::SetSchedule {
+                    pre_open_ms: d.u64()?,
+                    continuous_ms: d.u64()?,
+                    closing_ms: d.u64()?,
+                    closed_ms: d.u64()?,
+                };
+                d.end_block()?;
+                message
+            }
+            PLAN_SCHEDULE => {
+                let message = MemberMessage::PlanSchedule {
                     pre_open_ms: d.u64()?,
                     continuous_ms: d.u64()?,
                     closing_ms: d.u64()?,
@@ -848,6 +871,12 @@ pub mod tests {
                 continuous_ms: 45_000,
                 closing_ms: 5_000,
                 closed_ms: 5_000,
+            },
+            MemberMessage::PlanSchedule {
+                pre_open_ms: 30_000,
+                continuous_ms: 540_000,
+                closing_ms: 20_000,
+                closed_ms: 10_000,
             },
         ]
     }

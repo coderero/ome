@@ -438,6 +438,7 @@ impl World {
             ("eps", dollars_e4(f.eps_e4 * 4)),
             ("growth", pct(f.growth_bps)),
             ("shares", spec.shares.to_string()),
+            ("float", spec.float.to_string()),
             ("price", format_price(spec.price)),
         ]);
         Some(self.happen(story, &[symbol], vec![], None))

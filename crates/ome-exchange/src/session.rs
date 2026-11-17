@@ -46,6 +46,7 @@ pub struct Session {
     pub since: Timestamp,
     pub schedule: Option<Schedule>,
     pub next_change_at: Option<Timestamp>,
+    pub planned: Option<Schedule>,
 }
 
 impl Default for Session {
@@ -56,6 +57,7 @@ impl Default for Session {
             since: 0,
             schedule: None,
             next_change_at: None,
+            planned: None,
         }
     }
 }
@@ -75,6 +77,9 @@ impl Session {
             || (phase == MarketPhase::Open && self.phase == MarketPhase::Closed)
         {
             self.day += 1;
+            if let Some(planned) = self.planned.take() {
+                self.schedule = Some(planned);
+            }
         }
         self.phase = phase;
         self.since = now;
@@ -82,8 +87,19 @@ impl Session {
     }
 
     pub fn set_schedule(&mut self, schedule: Option<Schedule>, now: Timestamp) {
+        if self.since == 0 {
+            self.since = now;
+        }
         self.schedule = schedule;
         self.next_change_at = schedule.map(|s| now + s.duration(self.phase).max(1));
+    }
+
+    pub fn plan(&mut self, schedule: Schedule, now: Timestamp) {
+        if self.schedule.is_none() {
+            self.set_schedule(Some(schedule), now);
+        } else {
+            self.planned = Some(schedule);
+        }
     }
 
     pub fn due(&self, now: Timestamp) -> Option<MarketPhase> {
@@ -115,6 +131,18 @@ mod tests {
         s.enter(MarketPhase::PreOpen, 55);
         assert_eq!(s.day, 1);
         assert_eq!(s.status().next_change_at, 60);
+        let longer = Schedule { continuous_ms: 400, ..DAY };
+        s.plan(longer, 60);
+        s.enter(MarketPhase::Open, 60);
+        assert_eq!(s.status().next_change_at, 100, "today keeps its length");
+        s.enter(MarketPhase::ClosingAuction, 100);
+        s.enter(MarketPhase::Closed, 105);
+        s.enter(MarketPhase::PreOpen, 115);
+        s.enter(MarketPhase::Open, 120);
+        assert_eq!(s.status().next_change_at, 520, "the planned day starts at the next pre-open");
+        let mut manual = Session::default();
+        manual.plan(DAY, 0);
+        assert_eq!(manual.schedule, Some(DAY), "with no calendar yet it applies at once");
     }
 
     #[test]

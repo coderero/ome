@@ -1,4 +1,5 @@
-use super::factor::rebalance;
+use super::factor::rebalance_with;
+use ome_protocol::AlgoStrategy;
 use super::{Params, Strategy};
 use crate::action::Action;
 use crate::state::AgentState;
@@ -13,6 +14,7 @@ pub struct Pension {
     pub drift_pct: f64,
     pub rebalance_ms: Timestamp,
     pub vwap_ms: u64,
+    pub pov_bps: u64,
     last_check: Option<Timestamp>,
 }
 
@@ -24,6 +26,7 @@ impl Pension {
             drift_pct: params.f64("drift_pct", 0.03),
             rebalance_ms: params.u64("rebalance_ms", 120_000),
             vwap_ms: params.u64("vwap_ms", 300_000),
+            pov_bps: params.u64("pov_bps", 500),
             last_check: None,
         }
     }
@@ -51,7 +54,8 @@ impl Strategy for Pension {
             return vec![];
         }
         self.last_check = Some(state.now);
-        rebalance(state, &self.weights(), self.drift_pct, self.vwap_ms)
+        let duration_ms = super::institution::until_close(state, self.vwap_ms);
+        rebalance_with(state, &self.weights(), self.drift_pct, AlgoStrategy::Pov { rate_bps: self.pov_bps, duration_ms })
     }
 }
 
@@ -76,9 +80,7 @@ mod tests {
             [
                 Action::Algo {
                     side: Side::Sell,
-                    strategy: AlgoStrategy::Vwap {
-                        duration_ms: 300_000
-                    },
+                    strategy: AlgoStrategy::Pov { rate_bps: 500, .. },
                     ..
                 },
                 Action::Algo {

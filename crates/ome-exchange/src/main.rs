@@ -1,7 +1,7 @@
 use ome_exchange::exchange::ExchangeConfig;
 use ome_exchange::{ServerConfig, start};
 
-const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET] [--require-prospectus] [--registry ADDR]\n                    [--schedule PRE,OPEN,CLOSING,CLOSED seconds, used when the journal has no calendar yet]\n                    [--luld-bps BPS (0 = off)] [--luld-window-ms MS] [--luld-pause-ms MS]";
+const USAGE: &str = "usage: ome-exchange [--listen ADDR] [--journal PATH] [--admin-name NAME] [--admin-secret SECRET] [--require-prospectus] [--registry ADDR]\n                    [--schedule PRE,OPEN,CLOSING,CLOSED seconds | real | compressed | fast, used when the journal has no calendar yet]\n                    [--session-rate MSGS_PER_S (per member session, default 5000)] [--luld-bps BPS (0 = off)] [--luld-window-ms MS] [--luld-pause-ms MS]";
 
 fn parse_args() -> Result<ServerConfig, String> {
     let mut config = ServerConfig {
@@ -32,6 +32,7 @@ fn parse_args() -> Result<ServerConfig, String> {
             }
             "--schedule" => {
                 let text = value()?;
+                let text = ome_protocol::preset(&text).map(|p| p.map(|s| s.to_string()).join(",")).unwrap_or(text);
                 let parts: Vec<u64> = text
                     .split([',', ' '])
                     .filter(|p| !p.is_empty())
@@ -48,6 +49,7 @@ fn parse_args() -> Result<ServerConfig, String> {
                 });
             }
             "--require-prospectus" => config.exchange.require_prospectus = true,
+            "--session-rate" => config.exchange.session_rate = value()?.parse().map_err(|_| "--session-rate needs a number")?,
             "--luld-bps" => config.exchange.luld_bps = value()?.parse().map_err(|_| "--luld-bps needs a number")?,
             "--luld-window-ms" => config.exchange.luld_window_ms = value()?.parse().map_err(|_| "--luld-window-ms needs a number")?,
             "--luld-pause-ms" => config.exchange.luld_pause_ms = value()?.parse().map_err(|_| "--luld-pause-ms needs a number")?,

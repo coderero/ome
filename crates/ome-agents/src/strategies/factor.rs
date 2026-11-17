@@ -13,6 +13,15 @@ pub(super) fn rebalance(
     min_trade_pct: f64,
     duration_ms: u64,
 ) -> Vec<Action> {
+    rebalance_with(state, weights, min_trade_pct, AlgoStrategy::Vwap { duration_ms })
+}
+
+pub(super) fn rebalance_with(
+    state: &AgentState,
+    weights: &[(Symbol, f64)],
+    min_trade_pct: f64,
+    strategy: AlgoStrategy,
+) -> Vec<Action> {
     let equity = state.equity() as f64;
     let mut actions = Vec::new();
     for (symbol, weight) in weights {
@@ -39,7 +48,7 @@ pub(super) fn rebalance(
                 side,
                 qty,
                 limit: None,
-                strategy: AlgoStrategy::Vwap { duration_ms },
+                strategy,
             });
         }
     }

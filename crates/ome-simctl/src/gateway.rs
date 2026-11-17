@@ -678,6 +678,13 @@ impl Gateway {
         };
         self.commit_world(started, now);
         log(&format!("trading day {day} begins in the world"));
+        for group in self.fleet.groups.clone().into_iter().filter(|g| g.inflow_bps > 0) {
+            let amount = group.cash * group.inflow_bps / 10_000;
+            if amount > 0 {
+                log(&format!("savers put {} into each {} fund", ome_core::price::format_price(amount), group.name));
+                self.fund(&group.name, amount);
+            }
+        }
         for release in self.state.world().releases_due() {
             let fact = self.state.world().decide_release(release, &mut self.rng);
             self.commit_world(fact, now);
@@ -825,7 +832,7 @@ impl Gateway {
                         key: format!("ipo:{symbol}"),
                         symbol,
                         price: spec.price,
-                        shares: spec.shares,
+                        shares: spec.float,
                         underwriter: spec.underwriter.clone(),
                         issuer: format!("{lower}_ir"),
                         name: spec.name.clone(),

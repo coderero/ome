@@ -1,4 +1,5 @@
 mod factor;
+mod institution;
 mod market_maker;
 mod ml_retail;
 mod news_fund;
@@ -21,6 +22,7 @@ use std::f64::consts::TAU;
 use std::time::Duration;
 
 pub use factor::FactorModel;
+pub use institution::{ForeignFund, IndexFund, MutualFund, SovereignFund, cap_weights};
 pub use market_maker::MarketMaker;
 pub use ml_retail::MlRetail;
 pub use news_fund::NewsFund;
@@ -84,6 +86,10 @@ pub const STRATEGIES: &[&str] = &[
     "pension",
     "value",
     "news",
+    "index",
+    "mutual",
+    "fii",
+    "sovereign",
 ];
 
 pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn Strategy>> {
@@ -104,6 +110,10 @@ pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn
         "pension" => Box::new(Pension::new(symbols, params)),
         "value" => Box::new(ValueInvestor::new(symbols, params)),
         "news" => Box::new(NewsFund::new(symbols, params)),
+        "index" => Box::new(IndexFund::new(symbols, params)),
+        "mutual" => Box::new(MutualFund::new(symbols, params)),
+        "fii" => Box::new(ForeignFund::new(symbols, params)),
+        "sovereign" => Box::new(SovereignFund::new(symbols, params)),
         _ => return None,
     })
 }

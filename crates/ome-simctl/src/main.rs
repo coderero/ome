@@ -8,7 +8,7 @@ use std::time::Duration;
 
 const USAGE: &str = "usage: ome-simctl [--listen ADDR] [--journal PATH] [--secret OPERATOR_SECRET] [--runner-secret SECRET]
                   [--exchange ADDR] [--exchange-secret SECRET]
-                  [--world FILE] [--roster FILE] [--scale F] [--agent-secret S] [--broker-secret S] [--no-provision]
+                  [--world FILE] [--profiles FILE (liquidity profiles, used when present)] [--roster FILE] [--scale F] [--agent-secret S] [--broker-secret S] [--no-provision]
                   [--broker NAME=ADDR ...] [--registry ADDR] [--registry-secret S]
                   [--newsroom ADDR|NAME] [--source NAME] [--source-secret S]
                   [--quarter-days N] [--news-per-day N] [--seed N]
@@ -27,6 +27,7 @@ fn parse_args() -> Result<SimConfig, String> {
     config.news_per_day = 1.0;
     let mut world_path: Option<String> = None;
     let mut roster_path: Option<String> = None;
+    let mut profiles_path: Option<String> = None;
     let mut scale = 1.0;
     let mut broker_secret = Some(env("OME_BROKER_SECRET", "admin"));
     let mut brokers = StaticDirectory::default();
@@ -49,6 +50,7 @@ fn parse_args() -> Result<SimConfig, String> {
             "--exchange-secret" => config.exchange_secret = value()?,
             "--world" => world_path = Some(value()?),
             "--roster" => roster_path = Some(value()?),
+            "--profiles" => profiles_path = Some(value()?),
             "--scale" => scale = number(value()?, "--scale")?,
             "--agent-secret" => config.agent_secret = value()?,
             "--broker-secret" => broker_secret = Some(value()?),
@@ -84,6 +86,15 @@ fn parse_args() -> Result<SimConfig, String> {
     if let Some(path) = world_path {
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
         config.world = parse_world(&text).map_err(|e| format!("{path}: {e}"))?;
+    }
+    if let Some(path) = profiles_path.filter(|p| std::path::Path::new(p).exists()) {
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let profiles = ome_core::profile::parse_profiles(&text).map_err(|e| format!("{path}: {e}"))?;
+        for company in config.world.companies.iter_mut() {
+            if let Some(profile) = profiles.iter().find(|p| p.symbol == company.symbol) {
+                company.apply_profile(profile);
+            }
+        }
     }
     if let Some(path) = roster_path {
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;

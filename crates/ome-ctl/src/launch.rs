@@ -175,6 +175,7 @@ pub fn plan(topology: &Topology, service: &Service, settings: &Settings, secrets
                 s("--listen"), addr.clone(), s("--journal"), journal(&service.name), s("--secret"), secrets.sim.clone(),
                 s("--runner-secret"), secrets.runner.clone(), s("--exchange"), exchange.clone(), s("--exchange-secret"), secrets.exchange.clone(),
                 s("--broker-secret"), secrets.broker.clone(), s("--world"), s(service.get("world").unwrap_or("config/world.conf")),
+                s("--profiles"), s(service.get("profiles").unwrap_or("config/profiles.conf")),
                 s("--roster"), s(service.get("roster").unwrap_or("config/roster.conf")),
                 s("--quarter-days"), option(service, "quarter-days", "OME_QUARTER_DAYS", "20"),
                 s("--news-per-day"), option(service, "news-per-day", "OME_NEWS_PER_DAY", "1"),
@@ -204,6 +205,7 @@ pub fn plan(topology: &Topology, service: &Service, settings: &Settings, secrets
                 })
                 .collect();
         }
+        Kind::Postgres | Kind::Redis | Kind::Ollama => return Vec::new(),
         Kind::Recorder => {
             push(&[
                 s("--postgres"), settings.postgres.clone(), s("--redis"), settings.redis.clone(),

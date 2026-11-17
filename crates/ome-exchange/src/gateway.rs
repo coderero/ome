@@ -23,8 +23,6 @@ const CANDLE_BACKFILL: usize = 300;
 const TRADE_BACKFILL: usize = 60;
 const OBLIGATION_SAMPLE_MS: Timestamp = 1_000;
 const DMM_MIN_QTY: u64 = 100;
-const THROTTLE_PER_SECOND: f64 = 5_000.0;
-const THROTTLE_BURST: f64 = 10_000.0;
 
 struct Session {
     outbox: Box<dyn Outbox>,
@@ -79,6 +77,7 @@ impl Gateway {
         report.metric("instruments", self.exchange.instrument_list().len() as i64);
         report.metric("day", status.day as i64);
         report.metric("applications", self.applications.len() as i64);
+        report.metric("orders", self.exchange.orders_entered() as i64);
         let mut report = report.ready_unless(&[]);
         report.detail = format!("{} · trading day {}", status.phase.label(), status.day);
         if !self.applications.is_empty() {
@@ -129,7 +128,10 @@ impl Gateway {
                 outbox,
                 login: None,
                 subscriptions: BTreeSet::new(),
-                throttle: TokenBucket::new(THROTTLE_PER_SECOND, THROTTLE_BURST, self.clock),
+                throttle: {
+                    let rate = self.exchange.config().session_rate.max(1) as f64;
+                    TokenBucket::new(rate, rate * 2.0, self.clock)
+                },
             },
         );
     }
@@ -596,6 +598,19 @@ impl Gateway {
                     schedule: (total > 0).then_some(schedule),
                 }
             }
+            MemberMessage::PlanSchedule {
+                pre_open_ms,
+                continuous_ms,
+                closing_ms,
+                closed_ms,
+            } if admin => {
+                if pre_open_ms + continuous_ms + closing_ms + closed_ms == 0 {
+                    return self.reject(id, ref_template, "a planned trading day needs a length");
+                }
+                Command::PlanSchedule {
+                    schedule: Schedule { pre_open_ms, continuous_ms, closing_ms, closed_ms },
+                }
+            }
             MemberMessage::OpenCycle { cycle } if clearing => Command::OpenCycle { cycle },
             MemberMessage::Settled { cycle } if clearing => Command::Settled { cycle },
             MemberMessage::SetCreditLimit { member, limit } if clearing => {
@@ -878,6 +893,13 @@ fn describe_admin_action(command: &Command, events: &[Event]) -> Option<String> 
         Command::SetDmm { symbol, member } => {
             format!("member {member} is the designated market maker for {symbol}")
         }
+        Command::PlanSchedule { schedule: s } => format!(
+            "from the next pre-open: pre-open {}s, open {}s, closing auction {}s, closed {}s",
+            s.pre_open_ms / 1_000,
+            s.continuous_ms / 1_000,
+            s.closing_ms / 1_000,
+            s.closed_ms / 1_000
+        ),
         Command::FileProspectus { symbol, reference, name } => {
             format!("prospectus for {symbol} ({name}) on file, reference {reference}")
         }
@@ -1179,7 +1201,7 @@ mod tests {
         let mut gw = gateway();
         let admin = session(&mut gw, 1, "ops", "root", 0);
         admin.take();
-        for _ in 0..(THROTTLE_BURST as usize + 50) {
+        for _ in 0..(ExchangeConfig::default().session_rate as usize * 2 + 50) {
             gw.handle(1, &MemberMessage::QueryInstruments.encode(), 1);
         }
         let throttled = admin

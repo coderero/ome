@@ -15,6 +15,24 @@ pub struct CompanySpec {
     pub beta_pct: i64,
     pub underwriter: String,
     pub dmm: String,
+    pub float: u64,
+}
+
+impl CompanySpec {
+    pub fn apply_profile(&mut self, profile: &ome_core::profile::Profile) {
+        let float_pct = self.float as f64 / self.shares.max(1) as f64 * 100.0;
+        if let Some(shares) = profile.shares {
+            self.shares = shares;
+        }
+        if let Some(price) = profile.price {
+            self.eps_cents = ((self.eps_cents * price as i64) as f64 / self.price.max(1) as f64).round().max(1.0) as i64;
+            self.price = price;
+        }
+        self.float = match profile.float_pct {
+            Some(_) => profile.float_shares(self.shares),
+            None => ((self.shares as f64 * float_pct / 100.0).round() as u64).max(1),
+        };
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +150,9 @@ pub fn parse_companies(text: &str) -> Result<Vec<CompanySpec>, String> {
             beta_pct: 100,
             underwriter: String::new(),
             dmm: String::new(),
+            float: 0,
         };
+        let mut float_pct = 100.0;
         for pair in words {
             let (key, value) = pair
                 .split_once('=')
@@ -148,9 +168,11 @@ pub fn parse_companies(text: &str) -> Result<Vec<CompanySpec>, String> {
                 "beta" => spec.beta_pct = percent_bps(value).ok_or_else(bad)?,
                 "underwriter" => spec.underwriter = value.to_string(),
                 "dmm" => spec.dmm = value.to_string(),
+                "free-float" => float_pct = value.parse::<f64>().ok().filter(|v| (1.0..=100.0).contains(v)).ok_or_else(bad)?,
                 _ => return Err(at(&format!("unknown key '{key}'"))),
             }
         }
+        spec.float = ((spec.shares as f64 * float_pct / 100.0).round() as u64).max(1);
         if spec.price == 0 || spec.shares == 0 || spec.eps_cents <= 0 || spec.margin_bps <= 0 {
             return Err(at("price, shares, eps and margin must be positive"));
         }
@@ -227,6 +249,13 @@ mod tests {
         assert_eq!((world.companies[0].underwriter.as_str(), world.companies[0].dmm.as_str()), ("prime-co", "lp-co"));
         assert_eq!((world.accounts[0].username.as_str(), world.accounts[0].cash), ("alice", 25_000_00));
         assert!(parse_world("account alice role=retail").is_err());
+        let floated = parse_companies("company ACME price=25.00 shares=1000 eps=1.25 free-float=40 name=A").unwrap().remove(0);
+        assert_eq!(floated.float, 400);
+        let mut profiled = floated.clone();
+        let p = ome_core::profile::parse_profiles("profile ACME shares=5000 price=50.00 free-float=60").unwrap();
+        profiled.apply_profile(&p[0]);
+        assert_eq!((profiled.shares, profiled.float, profiled.price), (5_000, 3_000, 50_00));
+        assert_eq!(profiled.eps_cents, 250, "EPS follows the profiled price so the valuation multiple stays the company's");
         assert!(parse_world("listing ACME").is_err());
         let twice = "company A price=1 shares=10 eps=0.10 name=A\ncompany A price=1 shares=10 eps=0.10 name=A";
         assert!(parse_companies(twice).is_err());

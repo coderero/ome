@@ -1,0 +1,19 @@
+[package]
+name = "ome-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ome-load"
+path = "src/main.rs"
+
+[dependencies]
+ome-core.workspace = true
+ome-protocol.workspace = true
+ome-client.workspace = true
+ome-exchange.workspace = true
+ome-broker.workspace = true
+
+[lints]
+workspace = true

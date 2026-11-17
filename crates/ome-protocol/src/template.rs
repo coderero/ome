@@ -104,6 +104,7 @@ pub const ACCOUNT_LIST: u16 = 130;
 pub const MEMBER_LIST: u16 = 131;
 pub const FEE_SUMMARY: u16 = 132;
 pub const CLEARING_STATUS: u16 = 133;
+pub const PLAN_SCHEDULE: u16 = 47;
 pub const APPLY: u16 = 96;
 pub const QUERY_APPLICATIONS: u16 = 97;
 pub const DECIDE: u16 = 98;

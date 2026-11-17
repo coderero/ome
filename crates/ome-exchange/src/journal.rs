@@ -29,6 +29,7 @@ mod template {
     pub const TRADE_REPORT: u16 = 217;
     pub const SET_DMM: u16 = 218;
     pub const FILE_PROSPECTUS: u16 = 219;
+    pub const PLAN_SCHEDULE: u16 = 220;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,7 @@ impl Entry for Record {
             Command::SetCreditLimit { .. } => template::SET_CREDIT_LIMIT,
             Command::SetPhase { .. } => template::SET_PHASE,
             Command::SetSchedule { .. } => template::SET_SCHEDULE,
+            Command::PlanSchedule { .. } => template::PLAN_SCHEDULE,
             Command::ExpireGtd { .. } => template::EXPIRE_GTD,
             Command::SetMemberStatus { .. } => template::SET_MEMBER_STATUS,
             Command::SetCancelOnDisconnect { .. } => template::SET_CANCEL_ON_DISCONNECT,
@@ -199,6 +201,14 @@ impl Entry for Record {
             }
             Command::SetPhase { phase } => {
                 e.u8(*phase as u8).end_block();
+            }
+            Command::PlanSchedule { schedule: s } => {
+                e.u8(1)
+                    .u64(s.pre_open_ms)
+                    .u64(s.continuous_ms)
+                    .u64(s.closing_ms)
+                    .u64(s.closed_ms)
+                    .end_block();
             }
             Command::SetSchedule { schedule } => {
                 let s = schedule.unwrap_or(Schedule {
@@ -418,6 +428,17 @@ impl Entry for Record {
                     schedule: enabled.then_some(schedule),
                 }
             }
+            template::PLAN_SCHEDULE => {
+                d.u8()?;
+                let schedule = Schedule {
+                    pre_open_ms: d.u64()?,
+                    continuous_ms: d.u64()?,
+                    closing_ms: d.u64()?,
+                    closed_ms: d.u64()?,
+                };
+                d.end_block()?;
+                Command::PlanSchedule { schedule }
+            }
             other => return Err(DecodeError::UnknownTemplate(other)),
         };
         Ok(Record { timestamp, command })
@@ -523,6 +544,7 @@ mod tests {
             phase: ome_protocol::MarketPhase::Open,
         });
         commands.push(Command::SetSchedule { schedule: None });
+        commands.push(Command::PlanSchedule { schedule: Schedule { pre_open_ms: 30_000, continuous_ms: 540_000, closing_ms: 20_000, closed_ms: 10_000 } });
         commands.push(Command::ExpireGtd { at: 2_000_000 });
         commands.push(Command::SetDmm {
             symbol: sym("ACME"),

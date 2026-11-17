@@ -189,6 +189,7 @@ fn market() -> Vec<ServerMessage> {
             internal_volume: 600,
             wholesaler_volume: 1_700,
             ats_volume: 300,
+            pauses: 0,
         }),
         ServerMessage::Account(AccountSnapshot {
             account_id: 2,

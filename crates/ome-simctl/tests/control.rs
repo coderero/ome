@@ -325,6 +325,8 @@ fn broker(exchange: SocketAddr, profile: ProfileKind, member: &str, news: Option
         ats_addr: None,
         news_addr: news.map(|n| n.to_string()),
         postgres: None,
+        collar_bps: ome_broker::profile::DEFAULT_COLLAR_BPS,
+        exchange_rate: 4_500,
         registry: None,
     })
     .unwrap()

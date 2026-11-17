@@ -2244,6 +2244,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ome-bench"
+version = "0.5.0"
+dependencies = [
+ "ome-broker",
+ "ome-client",
+ "ome-core",
+ "ome-exchange",
+ "ome-protocol",
+]
+
+[[package]]
 name = "ome-broker"
 version = "0.5.0"
 dependencies = [
