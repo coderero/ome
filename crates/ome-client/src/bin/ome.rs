@@ -25,6 +25,7 @@ const USAGE: &str = "usage:
       preset [real|compressed|fast] [now]                 switch the day length at the next pre-open (or now); no name lists them
       dmm <SYMBOL> <member|none>                          designate a market maker (better maker rebate, quoting obligation)
       obligations                                         designated market makers: quoting now and compliance
+      days <SYMBOL>                                       daily bars kept by the exchange: open, high, low, close, VWAP, volume, trades
       vol [SYMBOL]                                        what the market did: moves, wick share, spread, depth within 1% and 2%,
                                                           volume and pauses today, next to config/profiles.conf (OME_PROFILES) if present
       stats <SYMBOL>                                      open, high, low, VWAP and volume by venue
@@ -521,6 +522,29 @@ fn exchange(client: &mut Client, args: &[&str]) -> Result<()> {
             }
         }
         ["vol", sym] => print_vol(client, symbol(sym)?)?,
+        ["days", sym] => {
+            let symbol = symbol(sym)?;
+            client.send_member(&MemberMessage::Subscribe { symbol })?;
+            let ServerMessage::DayHistory(history) =
+                client.wait_for(Duration::from_secs(5), |m| matches!(m, ServerMessage::DayHistory(h) if h.symbol == symbol))?
+            else {
+                unreachable!()
+            };
+            println!("{:>5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7}", "day", "open", "high", "low", "close", "vwap", "volume", "trades");
+            for d in &history.days {
+                println!(
+                    "{:>5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7}",
+                    d.day,
+                    format_price(d.open),
+                    format_price(d.high),
+                    format_price(d.low),
+                    format_price(d.close),
+                    format_price(d.turnover.checked_div(d.volume).unwrap_or(0)),
+                    d.volume,
+                    d.trades
+                );
+            }
+        }
         ["watch", sym] => {
             client.send_member(&MemberMessage::Subscribe {
                 symbol: symbol(sym)?,
@@ -1236,6 +1260,105 @@ pub fn depth_within(book: &ome_protocol::BookSnapshot, pct: f64) -> Option<(u64,
     Some(levels.fold((0, 0), |(qty, value), l| (qty + l.qty, value + l.qty * l.price)))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyMeasure {
+    pub days: usize,
+    pub median_volume: u64,
+    pub typical_move: Option<f64>,
+    pub autocorrelation: Option<f64>,
+    pub efficiency: Option<f64>,
+    pub sideways_now: usize,
+    pub sideways_longest: usize,
+    pub volume_follows_range: Option<f64>,
+}
+
+fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
+    let n = a.len().min(b.len());
+    if n < 4 {
+        return None;
+    }
+    let mean = |v: &[f64]| v[..n].iter().sum::<f64>() / n as f64;
+    let (ma, mb) = (mean(a), mean(b));
+    let cov: f64 = (0..n).map(|i| (a[i] - ma) * (b[i] - mb)).sum();
+    let var = |v: &[f64], m: f64| v[..n].iter().map(|x| (x - m).powi(2)).sum::<f64>();
+    let denom = (var(a, ma) * var(b, mb)).sqrt();
+    (denom > 0.0).then(|| cov / denom)
+}
+
+pub const SIDEWAYS_LOOKBACK: usize = 10;
+
+pub fn measure_days(days: &[ome_protocol::DayBar]) -> Option<DailyMeasure> {
+    if days.is_empty() {
+        return None;
+    }
+    let closes: Vec<f64> = days.iter().map(|d| d.close as f64).collect();
+    let moves: Vec<f64> = closes.windows(2).map(|w| (w[1] / w[0] - 1.0) * 100.0).collect();
+    let mut volumes: Vec<u64> = days.iter().map(|d| d.volume).collect();
+    volumes.sort_unstable();
+    let path: f64 = closes.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    let (mut run, mut longest) = (0, 0);
+    for t in 1..closes.len() {
+        let prior = &closes[t.saturating_sub(SIDEWAYS_LOOKBACK)..t];
+        let high = prior.iter().cloned().fold(f64::MIN, f64::max);
+        let low = prior.iter().cloned().fold(f64::MAX, f64::min);
+        run = if closes[t] > high || closes[t] < low { 0 } else { run + 1 };
+        longest = longest.max(run);
+    }
+    let ranges: Vec<f64> = days.iter().map(|d| (d.high as f64 / d.low.max(1) as f64 - 1.0) * 100.0).collect();
+    let volume: Vec<f64> = days.iter().map(|d| d.volume as f64).collect();
+    Some(DailyMeasure {
+        days: days.len(),
+        median_volume: volumes[volumes.len() / 2],
+        typical_move: (!moves.is_empty()).then(|| (moves.iter().map(|m| m * m).sum::<f64>() / moves.len() as f64).sqrt()),
+        autocorrelation: correlation(&moves[..moves.len().saturating_sub(1)], moves.get(1..).unwrap_or(&[])),
+        efficiency: (path > 0.0 && closes.len() > 2).then(|| (closes[closes.len() - 1] - closes[0]).abs() / path),
+        sideways_now: run,
+        sideways_longest: longest,
+        volume_follows_range: correlation(&volume, &ranges),
+    })
+}
+
+fn free_float(symbol: Symbol) -> Option<u64> {
+    if let Some(p) = profiles().into_iter().find(|p| p.symbol == symbol)
+        && let Some(shares) = p.shares
+    {
+        return Some(p.float_shares(shares));
+    }
+    let path = std::env::var("OME_WORLD").unwrap_or_else(|_| "config/world.conf".into());
+    let text = std::fs::read_to_string(path).ok()?;
+    let line = text.lines().find(|l| {
+        let mut words = l.split_whitespace();
+        words.next() == Some("company") && words.next().and_then(Symbol::parse) == Some(symbol)
+    })?;
+    let field = |key: &str| line.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('=')?.parse::<f64>().ok());
+    Some((field("shares")? * field("free-float").unwrap_or(100.0) / 100.0).round() as u64)
+}
+
+fn print_days(symbol: Symbol, history: &ome_protocol::DayHistory) {
+    let Some(m) = measure_days(&history.days) else {
+        println!("       days: no finished trading day yet");
+        return;
+    };
+    let number = |v: Option<f64>, unit: &str| v.map_or("-".to_string(), |v| format!("{v:.2}{unit}"));
+    let turnover = free_float(symbol)
+        .filter(|f| *f > 0)
+        .map_or(String::new(), |f| format!(" = {:.2}% of the free float", m.median_volume as f64 / f as f64 * 100.0));
+    println!(
+        "       days: {} finished · typical daily move {} · volume per day {}{turnover}",
+        m.days,
+        number(m.typical_move, "%"),
+        m.median_volume
+    );
+    println!(
+        "       trend: day-to-day autocorrelation {} · efficiency {} (0 = back and forth, 1 = one direction) · sideways {} day(s) now, longest {} (no close outside the prior {SIDEWAYS_LOOKBACK}-day range) · volume vs daily range correlation {}",
+        number(m.autocorrelation, ""),
+        number(m.efficiency, ""),
+        m.sideways_now,
+        m.sideways_longest,
+        number(m.volume_follows_range, "")
+    );
+}
+
 fn profiles() -> Vec<ome_core::profile::Profile> {
     let path = std::env::var("OME_PROFILES").unwrap_or_else(|_| "config/profiles.conf".into());
     std::fs::read_to_string(&path)
@@ -1246,10 +1369,11 @@ fn profiles() -> Vec<ome_core::profile::Profile> {
 
 fn print_vol(client: &mut Client, symbol: Symbol) -> Result<()> {
     client.send_member(&MemberMessage::Subscribe { symbol })?;
-    let (mut series, mut book, mut stats) = (None, None, None);
+    let (mut series, mut book, mut stats, mut history) = (None, None, None, None);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while (series.is_none() || book.is_none() || stats.is_none()) && std::time::Instant::now() < deadline {
+    while (series.is_none() || book.is_none() || stats.is_none() || history.is_none()) && std::time::Instant::now() < deadline {
         match client.recv_timeout(Duration::from_millis(200))? {
+            Some(ServerMessage::DayHistory(h)) if h.symbol == symbol => history = Some(h),
             Some(ServerMessage::Candles(c)) if c.symbol == symbol => series = Some(c),
             Some(ServerMessage::Book(b)) if b.symbol == symbol => book = Some(b),
             Some(ServerMessage::MarketStats(m)) if m.symbol == symbol => stats = Some(m),
@@ -1260,7 +1384,10 @@ fn print_vol(client: &mut Client, symbol: Symbol) -> Result<()> {
     let traded: Vec<_> = series.candles.iter().filter(|c| c.trades > 0).collect();
     let moves = minute_moves(&series.candles);
     if traded.is_empty() || moves.is_empty() {
-        println!("{symbol:<6} not enough trading yet");
+        println!("{symbol:<6} not enough trading in the last minutes");
+        if let Some(h) = &history {
+            print_days(symbol, h);
+        }
         return Ok(());
     }
     let typical = (moves.iter().map(|m| m * m).sum::<f64>() / moves.len() as f64).sqrt();
@@ -1298,6 +1425,9 @@ fn print_vol(client: &mut Client, symbol: Symbol) -> Result<()> {
             if m.low > 0 { (m.high as f64 / m.low as f64 - 1.0) * 100.0 } else { 0.0 },
             m.pauses
         );
+    }
+    if let Some(h) = &history {
+        print_days(symbol, h);
     }
     if let Some(p) = profiles().into_iter().find(|p| p.symbol == symbol) {
         let show = |v: Option<String>| v.unwrap_or_else(|| "-".into());
@@ -1703,7 +1833,7 @@ fn sim(client: &mut Client, args: &[&str]) -> Result<()> {
             println!("{} runner(s) connected", s.runners);
             for g in &s.groups {
                 println!(
-                    "  {:<12} {:<13} {:<10} {:>3}/{:<3} {:<7} fills {:>7}  equity {:>14}  {}",
+                    "  {:<12} {:<13} {:<10} {:>3}/{:<3} {:<7} fills {:>7}  equity {:>14}  last day: {:>5} fills, traded {:>12} = {:>5.1}% of equity  {}",
                     g.name,
                     g.strategy,
                     g.broker,
@@ -1712,6 +1842,9 @@ fn sim(client: &mut Client, args: &[&str]) -> Result<()> {
                     if g.paused { "PAUSED" } else { "running" },
                     g.fills,
                     format_price(g.equity),
+                    g.day_fills,
+                    format_price(g.day_traded),
+                    g.day_traded as f64 / g.equity.max(1) as f64 * 100.0,
                     g.params
                 );
             }
@@ -2074,7 +2207,7 @@ fn resolve(client: &mut Client, account: &str) -> Result<AccountId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{depth_within, minute_moves, wick_share};
+    use super::{depth_within, measure_days, minute_moves, wick_share};
     use ome_core::symbol::Symbol;
     use ome_core::candles::Candle;
 
@@ -2092,6 +2225,29 @@ mod tests {
         };
         assert_eq!(depth_within(&book, 1.0).unwrap().0, 40);
         assert_eq!(depth_within(&book, 2.0).unwrap().0, 70);
+    }
+
+    #[test]
+    fn days_are_measured_for_trend_range_and_volume() {
+        let bar = |day: u64, close: u64, volume: u64| ome_protocol::DayBar {
+            day,
+            open: close,
+            high: close + volume / 10,
+            low: close - volume / 10,
+            close,
+            volume,
+            trades: 1,
+            turnover: close * volume,
+        };
+        assert_eq!(measure_days(&[]), None);
+        let trend: Vec<_> = (0..12).map(|d| bar(d, 10_000 + d * 100, 500)).collect();
+        let up = measure_days(&trend).unwrap();
+        assert!((up.efficiency.unwrap() - 1.0).abs() < 1e-9 && up.sideways_longest == 0, "{up:?}");
+        let chop: Vec<_> = (0..12).map(|d| bar(d, if d % 2 == 0 { 10_000 } else { 10_100 }, if d % 2 == 0 { 300 } else { 900 })).collect();
+        let flat = measure_days(&chop).unwrap();
+        assert!(flat.efficiency.unwrap() < 0.1 && flat.autocorrelation.unwrap() < -0.9, "{flat:?}");
+        assert_eq!((flat.sideways_now, flat.sideways_longest, flat.median_volume), (10, 10, 900));
+        assert!(flat.typical_move.unwrap() > 0.9);
     }
 
     #[test]

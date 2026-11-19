@@ -64,6 +64,7 @@ pub enum ServerMessage {
     Book(BookSnapshot),
     Trade(TradeEvent),
     Candles(CandleSnapshot),
+    DayHistory(DayHistory),
     AccountList(Vec<AccountInfo>),
     MemberList(Vec<MemberInfo>),
 }
@@ -108,6 +109,7 @@ impl ServerMessage {
             ServerMessage::Book(_) => BOOK_SNAPSHOT,
             ServerMessage::Trade(_) => TRADE,
             ServerMessage::Candles(_) => CANDLE_SNAPSHOT,
+            ServerMessage::DayHistory(_) => DAY_HISTORY,
             ServerMessage::AccountList(_) => ACCOUNT_LIST,
             ServerMessage::MemberList(_) => MEMBER_LIST,
         }
@@ -446,6 +448,22 @@ impl ServerMessage {
                         .u64(k.close)
                         .u64(k.volume)
                         .u64(k.trades);
+                    e.end_entry_block(&mut g);
+                }
+            }
+            ServerMessage::DayHistory(h) => {
+                e.symbol(Some(h.symbol)).end_block();
+                let mut g = e.begin_group(h.days.len());
+                for b in &h.days {
+                    e.begin_entry(&mut g);
+                    e.u64(b.day)
+                        .u64(b.open)
+                        .u64(b.high)
+                        .u64(b.low)
+                        .u64(b.close)
+                        .u64(b.volume)
+                        .u64(b.trades)
+                        .u64(b.turnover);
                     e.end_entry_block(&mut g);
                 }
             }
@@ -1069,6 +1087,28 @@ impl ServerMessage {
                     candles,
                 })
             }
+            DAY_HISTORY => {
+                let symbol = d.symbol()?;
+                d.end_block()?;
+                let g = d.group()?;
+                let mut days = Vec::with_capacity(g.count);
+                for _ in 0..g.count {
+                    let start = d.entry_start();
+                    let bar = DayBar {
+                        day: d.u64()?,
+                        open: d.u64()?,
+                        high: d.u64()?,
+                        low: d.u64()?,
+                        close: d.u64()?,
+                        volume: d.u64()?,
+                        trades: d.u64()?,
+                        turnover: d.u64()?,
+                    };
+                    d.end_entry_block(start, &g)?;
+                    days.push(bar);
+                }
+                ServerMessage::DayHistory(DayHistory { symbol, days })
+            }
             ACCOUNT_LIST => {
                 d.end_block()?;
                 let g = d.group()?;
@@ -1476,6 +1516,9 @@ mod tests {
                     paused: false,
                     fills: 10,
                     equity: 1_000,
+                    traded: 5_000,
+                    day_fills: 2,
+                    day_traded: 900,
                     params: String::new(),
                 }],
                 fair: vec![(sym("ACME"), 2_500, 4)],
@@ -1553,6 +1596,10 @@ mod tests {
                     volume: 9,
                     trades: 4,
                 }],
+            }),
+            ServerMessage::DayHistory(DayHistory {
+                symbol: sym("ACME"),
+                days: vec![DayBar { day: 3, open: 1, high: 4, low: 1, close: 2, volume: 90, trades: 7, turnover: 180 }],
             }),
             ServerMessage::AccountList(vec![AccountInfo {
                 account_id: 2,

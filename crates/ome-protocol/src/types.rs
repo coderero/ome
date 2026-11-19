@@ -555,6 +555,24 @@ impl MarketStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DayBar {
+    pub day: u64,
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub close: Price,
+    pub volume: Qty,
+    pub trades: u64,
+    pub turnover: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayHistory {
+    pub symbol: Symbol,
+    pub days: Vec<DayBar>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObligationInfo {
     pub symbol: Symbol,

@@ -20,6 +20,9 @@ pub struct GroupInfo {
     pub paused: bool,
     pub fills: u64,
     pub equity: u64,
+    pub traded: u64,
+    pub day_fills: u64,
+    pub day_traded: u64,
     pub params: String,
 }
 
@@ -291,7 +294,10 @@ pub fn put_groups(e: &mut Encoder, groups: &[GroupInfo]) {
             .u32(info.running)
             .u8(info.paused as u8)
             .u64(info.fills)
-            .u64(info.equity);
+            .u64(info.equity)
+            .u64(info.traded)
+            .u64(info.day_fills)
+            .u64(info.day_traded);
         e.end_entry_block(&mut g);
         e.var(&info.name)
             .var(&info.strategy)
@@ -310,6 +316,9 @@ pub fn get_groups(d: &mut Decoder) -> Result<Vec<GroupInfo>, DecodeError> {
         let paused = d.u8()? != 0;
         let fills = d.u64()?;
         let equity = d.u64()?;
+        let traded = d.u64()?;
+        let day_fills = d.u64()?;
+        let day_traded = d.u64()?;
         d.end_entry_block(start, &g)?;
         groups.push(GroupInfo {
             name: d.var()?,
@@ -320,6 +329,9 @@ pub fn get_groups(d: &mut Decoder) -> Result<Vec<GroupInfo>, DecodeError> {
             paused,
             fills,
             equity,
+            traded,
+            day_fills,
+            day_traded,
             params: d.var()?,
         });
     }
@@ -688,6 +700,9 @@ mod tests {
                 paused: true,
                 fills: 900,
                 equity: 30_000_000,
+                traded: 5_000,
+                day_fills: 2,
+                day_traded: 900,
                 params: "activity=0.5".into(),
             }]),
             SimMessage::Accelerate {

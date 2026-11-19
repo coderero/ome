@@ -1,5 +1,6 @@
 pub mod action;
 pub mod control;
+pub mod edge;
 pub mod model;
 pub mod news;
 pub mod roster;
@@ -7,4 +8,5 @@ pub mod runner;
 pub mod state;
 pub mod strategies;
 pub mod valuation;
+pub mod view;
 pub mod world;

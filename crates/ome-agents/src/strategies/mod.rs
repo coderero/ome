@@ -11,7 +11,7 @@ mod statarb;
 mod value;
 
 use crate::action::Action;
-use crate::state::AgentState;
+use crate::state::{AgentState, Wake};
 use ome_core::price::Price;
 use ome_core::symbol::Symbol;
 use ome_core::types::{Qty, Timestamp};
@@ -22,7 +22,7 @@ use std::f64::consts::TAU;
 use std::time::Duration;
 
 pub use factor::FactorModel;
-pub use institution::{ForeignFund, IndexFund, MutualFund, SovereignFund, cap_weights};
+pub use institution::{ForeignFund, IndexFund, MutualFund, SovereignFund, TrendFund, cap_weights};
 pub use market_maker::MarketMaker;
 pub use ml_retail::MlRetail;
 pub use news_fund::NewsFund;
@@ -37,6 +37,14 @@ pub trait Strategy: Send {
     fn name(&self) -> &'static str;
     fn interval(&self) -> Duration;
     fn on_tick(&mut self, state: &AgentState, rng: &mut StdRng) -> Vec<Action>;
+
+    fn alert_bps(&self) -> Option<f64> {
+        None
+    }
+
+    fn wakes(&self, _wake: &Wake) -> bool {
+        false
+    }
 
     fn retune(&mut self, _params: &Params) -> bool {
         false
@@ -90,6 +98,7 @@ pub const STRATEGIES: &[&str] = &[
     "mutual",
     "fii",
     "sovereign",
+    "trend",
 ];
 
 pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn Strategy>> {
@@ -114,6 +123,7 @@ pub fn create(name: &str, symbols: &[Symbol], params: &Params) -> Option<Box<dyn
         "mutual" => Box::new(MutualFund::new(symbols, params)),
         "fii" => Box::new(ForeignFund::new(symbols, params)),
         "sovereign" => Box::new(SovereignFund::new(symbols, params)),
+        "trend" => Box::new(TrendFund::new(symbols, params)),
         _ => return None,
     })
 }

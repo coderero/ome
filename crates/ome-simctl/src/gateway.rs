@@ -96,6 +96,7 @@ pub struct Gateway {
     phase: MarketPhase,
     open_started: Option<Timestamp>,
     open_ms: Timestamp,
+    flows: crate::fleet::Flows,
     last_tick: Option<Timestamp>,
     calendar: Option<Upstream>,
     wire: Option<Upstream>,
@@ -131,6 +132,7 @@ impl Gateway {
             phase: MarketPhase::Closed,
             open_started: None,
             open_ms: UNMEASURED_DAY_MS,
+            flows: Default::default(),
             last_tick: None,
             calendar: None,
             wire: None,
@@ -437,7 +439,7 @@ impl Gateway {
         }
         self.commit(Fact::Command(command.clone()), now)?;
         if let SimCommand::Fund { group, amount } = &command {
-            self.fund(group, *amount);
+            self.fund(group, *amount as i64);
         }
         let runners = self.runners();
         for runner in &runners {
@@ -678,10 +680,26 @@ impl Gateway {
         };
         self.commit_world(started, now);
         log(&format!("trading day {day} begins in the world"));
-        for group in self.fleet.groups.clone().into_iter().filter(|g| g.inflow_bps > 0) {
-            let amount = group.cash * group.inflow_bps / 10_000;
-            if amount > 0 {
-                log(&format!("savers put {} into each {} fund", ome_core::price::format_price(amount), group.name));
+        let economy = self.state.world().economy();
+        let mood = (economy.cycle + economy.risk_appetite) / 2;
+        for group in self.fleet.groups.clone().into_iter().filter(|g| g.investors) {
+            let members = self.fleet.members(&group.name).len();
+            let equity: f64 = self
+                .sessions
+                .values()
+                .flat_map(|s| s.reports.iter())
+                .filter(|r| r.name == group.name)
+                .map(|r| r.equity as f64)
+                .sum();
+            let amount = self.flows.decide(&group, (equity > 0.0).then_some(equity), members, mood);
+            if amount != 0 {
+                log(&format!(
+                    "savers {} {} each {} fund ({:+.1} bps of its capital a day)",
+                    if amount > 0 { "put" } else { "take" },
+                    ome_core::price::format_price(amount.unsigned_abs()),
+                    group.name,
+                    self.flows.pace_bps(&group.name).unwrap_or(0.0)
+                ));
                 self.fund(&group.name, amount);
             }
         }
@@ -691,6 +709,11 @@ impl Gateway {
         }
         for symbol in self.state.world().earnings_due() {
             if let Some(fact) = self.state.world().decide_earnings(symbol, &mut self.rng) {
+                self.commit_world(fact, now);
+            }
+        }
+        for symbol in self.state.world().revisions_due() {
+            if let Some(fact) = self.state.world().decide_revision(symbol, &mut self.rng) {
                 self.commit_world(fact, now);
             }
         }
@@ -906,7 +929,7 @@ impl Gateway {
         }
     }
 
-    fn fund(&mut self, group: &str, amount: u64) {
+    fn fund(&mut self, group: &str, amount: i64) {
         let Some(tasks) = &self.provisioning.tasks else { return };
         let mut by_broker: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for name in self.fleet.members(group) {

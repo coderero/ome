@@ -108,6 +108,7 @@ pub struct Fundamentals {
     pub eps_e4: i64,
     pub consensus_e4: i64,
     pub quarters: u64,
+    pub momentum_bps: i64,
 }
 
 pub fn quarterly_eps_e4(revenue: u64, margin_bps: i64, shares: u64) -> i64 {
@@ -196,6 +197,7 @@ impl CompanySpec {
             eps_e4,
             consensus_e4: eps_e4 + eps_e4 * self.growth_bps / 40_000,
             quarters: 0,
+            momentum_bps: 0,
         }
     }
 

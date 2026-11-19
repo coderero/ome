@@ -10,6 +10,7 @@ use rand::rngs::StdRng;
 use std::collections::{BTreeMap, VecDeque};
 
 const RETAINED: usize = 5_000;
+const REVISION_DAYS: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -452,7 +453,9 @@ impl World {
         let spec = self.spec(symbol)?;
         let f = self.fundamentals(symbol)?;
         let cycle = spec.beta_pct * (self.economy.growth_bps - 200) / 400;
-        let growth_q = f.growth_bps / 4 + cycle + Economy::noisy(rng, 150.0);
+        let growth_q = f.growth_bps / 4 + f.momentum_bps / 4 + cycle + Economy::noisy(rng, 150.0);
+        let momentum_bps =
+            (f.momentum_bps * 7 / 10 + spec.beta_pct * self.economy.cycle / 100 + Economy::noisy(rng, 60.0)).clamp(-600, 600);
         let revenue = ((f.revenue as i128 * (10_000 + growth_q) as i128 / 10_000).max(1)) as u64;
         let margin_bps = (f.margin_bps + (spec.margin_bps - f.margin_bps) / 4 + Economy::noisy(rng, 40.0)).clamp(100, 4_000);
         let eps_e4 = quarterly_eps_e4(revenue, margin_bps, spec.shares);
@@ -468,6 +471,7 @@ impl World {
             eps_e4,
             consensus_e4,
             quarters: f.quarters + 1,
+            momentum_bps,
         };
         let mut story = self.story(
             NewsKind::Earnings,
@@ -575,6 +579,29 @@ impl World {
     ) -> Option<Fact> {
         let draw = event.draw(rng);
         self.apply_draw(event.scope, event.name, symbol, draw, None)
+    }
+
+    pub fn revisions_due(&self) -> Vec<Symbol> {
+        self.specs
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                (self.day + *i as u64).is_multiple_of(REVISION_DAYS)
+                    && !self.reports_on(*i, self.day)
+                    && self.fundamentals(s.symbol).is_some_and(|f| f.momentum_bps.abs() >= 30)
+            })
+            .map(|(_, s)| s.symbol)
+            .collect()
+    }
+
+    pub fn decide_revision(&self, symbol: Symbol, rng: &mut StdRng) -> Option<Fact> {
+        let f = self.fundamentals(symbol)?;
+        let step = f.momentum_bps / 6 + Economy::noisy(rng, 10.0);
+        if step == 0 {
+            return None;
+        }
+        let draw = Draw { sentiment: (step * 2).clamp(-60, 60), growth_bps: step, margin_rel_bps: 0, one_off_bps: 0 };
+        self.apply_draw(Scope::Company, if step > 0 { "upgrade" } else { "downgrade" }, symbol, draw, None)
     }
 
     pub fn decide_idea(&self, symbol: Symbol, idea: &Idea) -> Option<Fact> {
@@ -887,6 +914,42 @@ company BOLT sector=robotics price=40.00 shares=20000 eps=2.00 margin=15 growth=
         assert!(reported.values().all(|n| *n == 8), "{reported:?}");
         assert!((5..20).contains(&beats), "beats {beats}/24");
         assert!(room.next_report_day(acme()) > 40);
+    }
+
+    #[test]
+    fn analysts_revise_in_streaks_while_a_business_has_momentum_and_results_follow() {
+        let mut rng = StdRng::seed_from_u64(21);
+        let mut room = world();
+        assert!(room.revisions_due().is_empty(), "nothing to say about a business on plan");
+        let mut f = room.fundamentals(acme()).unwrap();
+        f.momentum_bps = 360;
+        let filed = run(&mut room, |r| r.decide_prospectus(acme()).unwrap());
+        let wire = WireItem { seq: room.next_seq(), ..filed };
+        room.apply(&Fact::Happened { wire, changes: vec![Change::Company(acme(), f)] });
+        let before = room.fair(acme()).unwrap();
+        let mut ups = 0;
+        for day in 1..=12 {
+            room.apply(&Fact::DayStarted { day, economy: room.economy() });
+            for symbol in room.revisions_due() {
+                let wire = run(&mut room, |r| r.decide_revision(symbol, &mut rng).unwrap());
+                assert_eq!(fact(&wire, "event"), Some("upgrade"));
+                ups += 1;
+            }
+        }
+        assert_eq!(ups, 3, "one note every few days, all in the same direction");
+        assert!(room.fair(acme()).unwrap() > before, "each upgrade lifts expected growth a little");
+        let growth_before = room.fundamentals(acme()).unwrap().revenue;
+        let mut beats = 0;
+        for seed in 0..40 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            if let Some(Fact::Happened { changes, .. }) = room.decide_earnings(acme(), &mut rng)
+                && let Some(Change::Company(_, next)) = changes.first()
+                && next.revenue as f64 > growth_before as f64 * 1.0225
+            {
+                beats += 1;
+            }
+        }
+        assert!(beats > 24, "momentum shows up in the results more often than not: {beats}/40");
     }
 
     #[test]

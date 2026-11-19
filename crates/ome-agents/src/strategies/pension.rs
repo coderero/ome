@@ -2,9 +2,8 @@ use super::factor::rebalance_with;
 use ome_protocol::AlgoStrategy;
 use super::{Params, Strategy};
 use crate::action::Action;
-use crate::state::AgentState;
+use crate::state::{AgentState, Wake};
 use ome_core::symbol::Symbol;
-use ome_core::types::Timestamp;
 use rand::rngs::StdRng;
 use std::time::Duration;
 
@@ -12,10 +11,10 @@ pub struct Pension {
     symbols: Vec<Symbol>,
     pub invest_pct: f64,
     pub drift_pct: f64,
-    pub rebalance_ms: Timestamp,
-    pub vwap_ms: u64,
+    pub review_days: u64,
+    pub work_minutes: u64,
     pub pov_bps: u64,
-    last_check: Option<Timestamp>,
+    last_check: Option<u64>,
 }
 
 impl Pension {
@@ -24,8 +23,8 @@ impl Pension {
             symbols,
             invest_pct: params.f64("invest_pct", 0.8),
             drift_pct: params.f64("drift_pct", 0.03),
-            rebalance_ms: params.u64("rebalance_ms", 120_000),
-            vwap_ms: params.u64("vwap_ms", 300_000),
+            review_days: params.u64("review_days", 20).max(1),
+            work_minutes: params.u64("work_minutes", 300),
             pov_bps: params.u64("pov_bps", 500),
             last_check: None,
         }
@@ -43,18 +42,20 @@ impl Strategy for Pension {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_millis(5_000)
+        Duration::from_millis(10_000)
+    }
+
+    fn wakes(&self, wake: &Wake) -> bool {
+        wake.day || wake.phase
     }
 
     fn on_tick(&mut self, state: &AgentState, _rng: &mut StdRng) -> Vec<Action> {
-        let due = self
-            .last_check
-            .is_none_or(|at| state.now >= at + self.rebalance_ms);
+        let due = self.last_check.is_none_or(|day| state.day >= day + self.review_days);
         if !due || state.busy() || !state.continuous() {
             return vec![];
         }
-        self.last_check = Some(state.now);
-        let duration_ms = super::institution::until_close(state, self.vwap_ms);
+        self.last_check = Some(state.day);
+        let duration_ms = super::institution::until_close(state, self.work_minutes * state.minute_ms());
         rebalance_with(state, &self.weights(), self.drift_pct, AlgoStrategy::Pov { rate_bps: self.pov_bps, duration_ms })
     }
 }
@@ -94,5 +95,10 @@ mod tests {
         hold(&mut balanced, nova(), 800);
         let mut calm = Pension::new(vec![acme(), nova()], &Params::default());
         assert!(calm.on_tick(&balanced, &mut rng).is_empty());
+        state.day += 19;
+        state.algos.clear();
+        assert!(fund.on_tick(&state, &mut rng).is_empty(), "it reviews about once a month of trading days");
+        state.day += 1;
+        assert!(!fund.on_tick(&state, &mut rng).is_empty());
     }
 }

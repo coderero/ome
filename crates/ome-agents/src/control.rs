@@ -57,6 +57,9 @@ impl GroupControl {
 pub struct AgentStats {
     pub fills: AtomicU64,
     pub equity: AtomicU64,
+    pub traded: AtomicU64,
+    pub day_fills: AtomicU64,
+    pub day_traded: AtomicU64,
 }
 
 pub struct Shared {
@@ -162,6 +165,9 @@ impl Shared {
                         .iter()
                         .map(|a| a.equity.load(Ordering::Relaxed))
                         .sum(),
+                    traded: agents.iter().map(|a| a.traded.load(Ordering::Relaxed)).sum(),
+                    day_fills: agents.iter().map(|a| a.day_fills.load(Ordering::Relaxed)).sum(),
+                    day_traded: agents.iter().map(|a| a.day_traded.load(Ordering::Relaxed)).sum(),
                     params: g
                         .params()
                         .0

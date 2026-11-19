@@ -341,6 +341,9 @@ impl SimState {
                     g.running += info.running;
                     g.fills += info.fills;
                     g.equity += info.equity;
+                    g.traded += info.traded;
+                    g.day_fills += info.day_fills;
+                    g.day_traded += info.day_traded;
                     g.paused |= info.paused;
                 })
                 .or_insert_with(|| info.clone());
@@ -557,6 +560,9 @@ mod tests {
             paused: false,
             fills: 10,
             equity: 100,
+            traded: 5_000,
+            day_fills: 2,
+            day_traded: 900,
             params: String::new(),
         };
         let status = SimState::default().status(&[vec![info(5)], vec![info(4)]], 0);

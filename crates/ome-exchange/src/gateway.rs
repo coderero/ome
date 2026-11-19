@@ -676,6 +676,11 @@ impl Gateway {
                         self.broadcast(&ServerMessage::Instrument(info));
                     }
                 }
+                Event::DayArchived(symbol) => {
+                    if let Some(history) = self.exchange.instrument(symbol).map(|i| i.day_history()) {
+                        self.send_to_subscribers(symbol, &ServerMessage::DayHistory(history));
+                    }
+                }
                 Event::MemberCreated(_) => {}
                 Event::SessionChanged => {
                     let status = self.exchange.market_status();
@@ -739,7 +744,9 @@ impl Gateway {
         }
         if let Some(instrument) = self.exchange.instrument(symbol) {
             let stats = instrument.stats();
+            let history = instrument.day_history();
             self.reply(id, ServerMessage::MarketStats(stats));
+            self.reply(id, ServerMessage::DayHistory(history));
         }
     }
 

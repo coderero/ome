@@ -104,6 +104,9 @@ fn operators_steer_runners_and_settings_survive_reconnects_and_restarts() {
             paused: true,
             fills: 3,
             equity: 300_000_00,
+            traded: 5_000,
+            day_fills: 2,
+            day_traded: 900,
             params: String::new(),
         }]))
         .unwrap();

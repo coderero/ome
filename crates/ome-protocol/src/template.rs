@@ -114,6 +114,7 @@ pub const WORLD_STATUS: u16 = 142;
 pub const SIM_ASSIGN: u16 = 143;
 pub const SIM_RETIRE: u16 = 144;
 pub const SERVICES: u16 = 145;
+pub const DAY_HISTORY: u16 = 146;
 pub const SIM_QUERY_WORLD: u16 = 609;
 pub const SIM_INJECT: u16 = 610;
 pub const REGISTRY_ANNOUNCE: u16 = 900;

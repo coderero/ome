@@ -4,7 +4,7 @@ use ome_core::risk::PriceBand;
 use ome_core::symbol::Symbol;
 use ome_core::types::Timestamp;
 use ome_protocol::{
-    BookSnapshot, CandleSnapshot, InstrumentInfo, InstrumentStatus, MarketPhase, MarketStats,
+    BookSnapshot, CandleSnapshot, DayHistory, InstrumentInfo, InstrumentStatus, MarketPhase, MarketStats,
     MarketStatus, ServerMessage, TradeEvent,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -18,6 +18,7 @@ pub struct Quote {
     pub candles: CandleSeries,
     pub tape: VecDeque<TradeEvent>,
     pub stats: Option<MarketStats>,
+    pub days: Option<DayHistory>,
 }
 
 #[derive(Default)]
@@ -43,6 +44,12 @@ impl MarketCache {
             ServerMessage::MarketStats(stats) => {
                 if let Some(quote) = self.quotes.get_mut(&stats.symbol) {
                     quote.stats = Some(*stats);
+                }
+                None
+            }
+            ServerMessage::DayHistory(history) => {
+                if let Some(quote) = self.quotes.get_mut(&history.symbol) {
+                    quote.days = Some(history.clone());
                 }
                 None
             }
@@ -97,6 +104,7 @@ impl MarketCache {
                         candles: CandleSeries::new(1_000, CANDLE_CAPACITY),
                         tape: VecDeque::new(),
                         stats: None,
+                        days: None,
                     },
                 );
                 Some(info.symbol)
@@ -199,6 +207,7 @@ impl MarketCache {
         );
         messages.extend(quote.book.clone().map(ServerMessage::Book));
         messages.extend(quote.stats.map(ServerMessage::MarketStats));
+        messages.extend(quote.days.clone().map(ServerMessage::DayHistory));
         messages
     }
 }

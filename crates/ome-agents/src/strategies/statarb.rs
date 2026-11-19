@@ -1,6 +1,7 @@
 use super::{Params, Strategy, affordable};
 use crate::action::Action;
-use crate::state::{AgentState, mean_sd};
+use crate::edge::half_spread_bps;
+use crate::state::{AgentState, Wake, mean_sd};
 use ome_core::symbol::Symbol;
 use ome_core::types::{Qty, Side};
 use ome_protocol::AlgoStrategy;
@@ -22,7 +23,9 @@ pub struct PairsTrader {
     pub exit_z: f64,
     pub trade_pct: f64,
     pub execution: Execution,
+    pub fee_bps: f64,
     ratios: VecDeque<f64>,
+    sampled: Option<u64>,
     position: i8,
     legs: [(Side, Qty); 2],
 }
@@ -44,13 +47,15 @@ impl PairsTrader {
             } else {
                 Execution::Algo
             },
+            fee_bps: params.f64("fee_bps", 2.0),
             ratios: VecDeque::new(),
+            sampled: None,
             position: 0,
             legs: [(Side::Buy, 0), (Side::Buy, 0)],
         })
     }
 
-    fn order(&self, symbol: Symbol, side: Side, qty: Qty) -> Action {
+    fn order(&self, state: &AgentState, symbol: Symbol, side: Side, qty: Qty) -> Action {
         match self.execution {
             Execution::Algo => Action::Algo {
                 symbol,
@@ -59,7 +64,7 @@ impl PairsTrader {
                 limit: None,
                 strategy: AlgoStrategy::Pov {
                     rate_bps: 1_000,
-                    duration_ms: 60_000,
+                    duration_ms: 40 * state.minute_ms(),
                 },
             },
             Execution::Dark => Action::Dark {
@@ -82,9 +87,17 @@ impl PairsTrader {
         }
         self.legs = [(Side::Buy, buy_qty), (Side::Sell, sell_qty)];
         vec![
-            self.order(sell, Side::Sell, sell_qty),
-            self.order(buy, Side::Buy, buy_qty),
+            self.order(state, sell, Side::Sell, sell_qty),
+            self.order(state, buy, Side::Buy, buy_qty),
         ]
+    }
+
+    pub fn pays(&self, state: &AgentState) -> bool {
+        let values: Vec<f64> = self.ratios.iter().copied().collect();
+        let Some(last) = values.last() else { return false };
+        let gap_bps = (last - mean_sd(&values).0).abs() * 10_000.0;
+        let leg = |s: Symbol| state.market(s).and_then(half_spread_bps).unwrap_or(f64::MAX / 8.0) + self.fee_bps;
+        gap_bps / 2.0 > 2.0 * (leg(self.a) + leg(self.b))
     }
 
     pub fn z(&self) -> Option<f64> {
@@ -106,6 +119,14 @@ impl Strategy for PairsTrader {
         Duration::from_millis(1_000)
     }
 
+    fn alert_bps(&self) -> Option<f64> {
+        Some(30.0)
+    }
+
+    fn wakes(&self, wake: &Wake) -> bool {
+        !wake.moved.is_empty()
+    }
+
     fn on_tick(&mut self, state: &AgentState, _rng: &mut StdRng) -> Vec<Action> {
         let (Some(pa), Some(pb)) = (
             state.market(self.a).and_then(|m| m.last),
@@ -113,10 +134,14 @@ impl Strategy for PairsTrader {
         ) else {
             return vec![];
         };
-        if self.ratios.len() == self.window {
-            self.ratios.pop_front();
+        let clock = state.clock();
+        if self.sampled != Some(clock) {
+            self.sampled = Some(clock);
+            if self.ratios.len() == self.window {
+                self.ratios.pop_front();
+            }
+            self.ratios.push_back((pa as f64 / pb as f64).ln());
         }
-        self.ratios.push_back((pa as f64 / pb as f64).ln());
         let busy = state.busy()
             || state.algo_in(self.a)
             || state.algo_in(self.b)
@@ -128,6 +153,7 @@ impl Strategy for PairsTrader {
             return vec![];
         };
         match self.position {
+            0 if z.abs() > self.entry_z && !self.pays(state) => vec![],
             0 if z > self.entry_z => {
                 let actions = self.trade(state, self.b, self.a);
                 if !actions.is_empty() {
@@ -154,10 +180,10 @@ impl Strategy for PairsTrader {
                 let buy_back = affordable(state.cash, price, self.legs[1].1);
                 let mut actions = Vec::new();
                 if sell_back > 0 {
-                    actions.push(self.order(bought, Side::Sell, sell_back));
+                    actions.push(self.order(state, bought, Side::Sell, sell_back));
                 }
                 if buy_back > 0 {
-                    actions.push(self.order(sold, Side::Buy, buy_back));
+                    actions.push(self.order(state, sold, Side::Buy, buy_back));
                 }
                 actions
             }
@@ -180,9 +206,11 @@ mod tests {
         hold(&mut state, nova(), 500);
         let mut pairs = PairsTrader::new(vec![acme(), nova()], &Params::default()).unwrap();
         for i in 0..80 {
+            state.now += state.minute_ms();
             state.markets.get_mut(&acme()).unwrap().last = Some(10_000 + (i % 3) * 5);
             assert!(pairs.on_tick(&state, &mut rng).is_empty());
         }
+        state.now += state.minute_ms();
         state.markets.get_mut(&acme()).unwrap().last = Some(10_400);
         let trades = pairs.on_tick(&state, &mut rng);
         assert!(matches!(
@@ -203,6 +231,7 @@ mod tests {
             assert_eq!(symbol, acme(), "the rich leg is sold");
         }
         for _ in 0..200 {
+            state.now += state.minute_ms();
             state.markets.get_mut(&acme()).unwrap().last = Some(10_005);
             let unwind = pairs.on_tick(&state, &mut rng);
             if !unwind.is_empty() {
@@ -224,7 +253,7 @@ mod tests {
         let params = Params([("exec".to_string(), "dark".to_string())].into());
         let pairs = PairsTrader::new(vec![acme(), nova()], &params).unwrap();
         assert!(matches!(
-            pairs.order(acme(), Side::Buy, 500),
+            pairs.order(&AgentState::default(), acme(), Side::Buy, 500),
             Action::Dark {
                 min_qty: 100,
                 limit: None,

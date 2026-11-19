@@ -9,6 +9,7 @@ pub struct Economy {
     pub inflation_bps: i64,
     pub growth_bps: i64,
     pub risk_appetite: i64,
+    pub cycle: i64,
 }
 
 impl Default for Economy {
@@ -18,6 +19,7 @@ impl Default for Economy {
             inflation_bps: 280,
             growth_bps: 200,
             risk_appetite: 0,
+            cycle: 0,
         }
     }
 }
@@ -70,16 +72,18 @@ fn normal(rng: &mut StdRng, sd: f64) -> i64 {
 
 impl Economy {
     pub fn drift(&self, rng: &mut StdRng) -> Economy {
+        let cycle = (self.cycle - self.cycle * 3 / 100 + normal(rng, 6.0)).clamp(-100, 100);
         Economy {
             rate_bps: self.rate_bps,
             inflation_bps: (self.inflation_bps
-                + (250 - self.inflation_bps) / 10
+                + (250 + cycle / 2 - self.inflation_bps) / 10
                 + normal(rng, 12.0))
             .clamp(-200, 1_500),
-            growth_bps: (self.growth_bps + (200 - self.growth_bps) / 10 + normal(rng, 15.0))
+            growth_bps: (self.growth_bps + (200 + 3 * cycle - self.growth_bps) / 10 + normal(rng, 15.0))
                 .clamp(-800, 1_000),
-            risk_appetite: (self.risk_appetite - self.risk_appetite / 5 + normal(rng, 8.0))
+            risk_appetite: (self.risk_appetite + (cycle / 2 - self.risk_appetite) / 8 + normal(rng, 8.0))
                 .clamp(-100, 100),
+            cycle,
         }
     }
 
@@ -122,10 +126,29 @@ mod tests {
         for _ in 0..200 {
             economy = economy.drift(&mut rng);
         }
-        assert!((100..450).contains(&economy.inflation_bps), "{economy:?}");
-        assert!((0..400).contains(&economy.growth_bps), "{economy:?}");
-        assert!(economy.risk_appetite.abs() < 60, "{economy:?}");
+        assert!((50..500).contains(&economy.inflation_bps), "{economy:?}");
+        assert!((-200..600).contains(&economy.growth_bps), "{economy:?}");
+        assert!(economy.risk_appetite.abs() < 90, "{economy:?}");
         assert_eq!(economy.rate_bps, 450, "only the central bank moves rates");
+    }
+
+    #[test]
+    fn the_business_cycle_keeps_its_direction_for_weeks() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut economy = Economy::default();
+        let mut path = Vec::new();
+        for _ in 0..600 {
+            economy = economy.drift(&mut rng);
+            path.push((economy.cycle, economy.growth_bps));
+        }
+        let same_sign = path.windows(11).filter(|w| w[0].0 != 0 && w[0].0.signum() == w[10].0.signum()).count();
+        assert!(same_sign * 10 > path.len() * 7, "ten days later the cycle usually points the same way: {same_sign}");
+        let boom: Vec<i64> = path.iter().filter(|(c, _)| *c > 20).map(|(_, g)| *g).collect();
+        let bust: Vec<i64> = path.iter().filter(|(c, _)| *c < -20).map(|(_, g)| *g).collect();
+        if !boom.is_empty() && !bust.is_empty() {
+            let mean = |v: &[i64]| v.iter().sum::<i64>() / v.len() as i64;
+            assert!(mean(&boom) > mean(&bust) + 50, "growth runs higher in the upswing");
+        }
     }
 
     #[test]

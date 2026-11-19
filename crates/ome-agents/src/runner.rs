@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const STATUS_EVERY: Duration = Duration::from_secs(120);
+const WAKE_GAP: Duration = Duration::from_millis(150);
 const BOOTSTRAP_MS: Timestamp = 90_000;
 
 pub struct Bootstrap {
@@ -184,6 +185,7 @@ fn run(
     let mut bootstrap = Bootstrap::new(spec.seed).cap_weighted(spec.params.text("seed_by", "") == "cap");
     let mut bootstrapping = spec.seed > 0;
     let mut next_tick = Instant::now() + strategy.interval();
+    let mut last_tick = Instant::now();
     let mut next_status = Instant::now() + STATUS_EVERY;
     let mut was_paused = false;
     while !ctx.stop.load(Ordering::Relaxed) {
@@ -194,10 +196,15 @@ fn run(
                 state.apply(&message);
             }
         }
-        if Instant::now() < next_tick {
+        if let Some(alert) = strategy.alert_bps() {
+            state.note_moves(alert);
+        }
+        let woken = !bootstrapping && strategy.wakes(&state.wake) && last_tick.elapsed() >= WAKE_GAP;
+        if Instant::now() < next_tick && !woken {
             continue;
         }
-        next_tick = Instant::now() + strategy.interval();
+        last_tick = Instant::now();
+        next_tick = last_tick + strategy.interval();
         state.world = ctx
             .shared
             .world
@@ -206,6 +213,9 @@ fn run(
             .view(Instant::now());
         ctx.stats.fills.store(state.fills, Ordering::Relaxed);
         ctx.stats.equity.store(state.equity(), Ordering::Relaxed);
+        ctx.stats.traded.store(state.traded, Ordering::Relaxed);
+        ctx.stats.day_fills.store(state.yesterday.fills, Ordering::Relaxed);
+        ctx.stats.day_traded.store(state.yesterday.traded, Ordering::Relaxed);
         if ctx.group.is_paused() {
             if !was_paused {
                 was_paused = true;
@@ -244,6 +254,7 @@ fn run(
         } else {
             strategy.on_tick(&state, rng)
         };
+        state.looked();
         for action in &actions {
             execute(&mut client, &mut state, action)?;
         }

@@ -57,13 +57,13 @@ fn put_changes(e: &mut Encoder, changes: &[Change]) {
     let mut g = e.begin_group(changes.len());
     for change in changes {
         e.begin_entry(&mut g);
-        let (code, symbol, x, a, b, c, d, y) = match change {
-            Change::Company(symbol, f) => (1, Some(*symbol), f.revenue, f.margin_bps, f.growth_bps, f.eps_e4, f.consensus_e4, f.quarters),
-            Change::Economy(m) => (2, None, 0, m.rate_bps, m.inflation_bps, m.growth_bps, m.risk_appetite, 0),
-            Change::Reading(release, value) => (3, None, release_code(*release), *value, 0, 0, 0, 0),
-            Change::Cash(symbol, cash) => (4, Some(*symbol), 0, *cash, 0, 0, 0, 0),
+        let (code, symbol, x, a, b, c, d, y, z) = match change {
+            Change::Company(symbol, f) => (1, Some(*symbol), f.revenue, f.margin_bps, f.growth_bps, f.eps_e4, f.consensus_e4, f.quarters, f.momentum_bps),
+            Change::Economy(m) => (2, None, 0, m.rate_bps, m.inflation_bps, m.growth_bps, m.risk_appetite, 0, m.cycle),
+            Change::Reading(release, value) => (3, None, release_code(*release), *value, 0, 0, 0, 0, 0),
+            Change::Cash(symbol, cash) => (4, Some(*symbol), 0, *cash, 0, 0, 0, 0, 0),
         };
-        e.u8(code).symbol(symbol).u64(x).i64(a).i64(b).i64(c).i64(d).u64(y);
+        e.u8(code).symbol(symbol).u64(x).i64(a).i64(b).i64(c).i64(d).u64(y).i64(z);
         e.end_entry_block(&mut g);
     }
 }
@@ -78,12 +78,13 @@ fn get_changes(d: &mut Decoder) -> Result<Vec<Change>, DecodeError> {
         let x = d.u64()?;
         let (a, b, c, e4) = (d.i64()?, d.i64()?, d.i64()?, d.i64()?);
         let y = d.u64()?;
+        let z = d.i64()?;
         let change = match (code, symbol) {
             (1, Some(symbol)) => Change::Company(
                 symbol,
-                Fundamentals { revenue: x, margin_bps: a, growth_bps: b, eps_e4: c, consensus_e4: e4, quarters: y },
+                Fundamentals { revenue: x, margin_bps: a, growth_bps: b, eps_e4: c, consensus_e4: e4, quarters: y, momentum_bps: z },
             ),
-            (2, _) => Change::Economy(Economy { rate_bps: a, inflation_bps: b, growth_bps: c, risk_appetite: e4 }),
+            (2, _) => Change::Economy(Economy { rate_bps: a, inflation_bps: b, growth_bps: c, risk_appetite: e4, cycle: z }),
             (3, _) => Change::Reading(release_of(x)?, a),
             (4, Some(symbol)) => Change::Cash(symbol, a),
             _ => return Err(DecodeError::Invalid("world change")),
@@ -164,6 +165,7 @@ impl Entry for Record {
                     .i64(economy.inflation_bps)
                     .i64(economy.growth_bps)
                     .i64(economy.risk_appetite)
+                    .i64(economy.cycle)
                     .end_block();
             }
             Fact::World(WorldFact::Happened { wire, changes }) => {
@@ -213,6 +215,7 @@ impl Entry for Record {
                     inflation_bps: d.i64()?,
                     growth_bps: d.i64()?,
                     risk_appetite: d.i64()?,
+                    cycle: d.i64()?,
                 };
                 d.end_block()?;
                 Fact::World(WorldFact::DayStarted { day, economy })
@@ -278,9 +281,9 @@ mod tests {
                 changes: vec![
                     Change::Company(
                         Symbol::parse("ACME").unwrap(),
-                        Fundamentals { revenue: 135_000, margin_bps: 1_200, growth_bps: 900, eps_e4: 3_115, consensus_e4: -20, quarters: 3 },
+                        Fundamentals { revenue: 135_000, margin_bps: 1_200, growth_bps: 900, eps_e4: 3_115, consensus_e4: -20, quarters: 3, momentum_bps: -45 },
                     ),
-                    Change::Economy(Economy { risk_appetite: -12, ..Economy::default() }),
+                    Change::Economy(Economy { risk_appetite: -12, cycle: -30, ..Economy::default() }),
                     Change::Reading(Release::Growth, -40),
                     Change::Cash(Symbol::parse("ACME").unwrap(), -35),
                 ],

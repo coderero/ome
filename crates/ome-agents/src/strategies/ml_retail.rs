@@ -19,7 +19,7 @@ struct Sample {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Settings {
-    activity: f64,
+    fee_bps: f64,
     budget_pct: f64,
     enter: f64,
     strong: f64,
@@ -36,13 +36,13 @@ struct Settings {
 
 impl Settings {
     fn from(params: &Params) -> Self {
-        let (activity, budget, enter, strong, exit) = match params.text("style", "balanced") {
-            "cautious" => (0.10, 0.15, 0.12, 0.20, 0.04),
-            "bold" => (0.35, 0.30, 0.05, 0.10, 0.12),
-            _ => (0.20, 0.20, 0.08, 0.15, 0.08),
+        let (budget, enter, strong, exit) = match params.text("style", "balanced") {
+            "cautious" => (0.15, 0.12, 0.20, 0.04),
+            "bold" => (0.30, 0.05, 0.10, 0.12),
+            _ => (0.20, 0.08, 0.15, 0.08),
         };
         Self {
-            activity: params.f64("activity", activity),
+            fee_bps: params.f64("fee_bps", 5.0),
             budget_pct: params.f64("budget_pct", budget),
             enter: params.f64("enter", enter),
             strong: params.f64("strong", strong),
@@ -223,7 +223,8 @@ impl MlRetail {
         if edge >= self.settings.strong {
             let entry = market.ask.unwrap_or(last);
             let qty = affordable(state.cash, entry, (budget / entry as f64) as u64);
-            if qty == 0 {
+            let cost = crate::edge::taking_cost_bps(state, symbol, Side::Buy, qty.max(1), self.settings.fee_bps).unwrap_or(f64::MAX);
+            if qty == 0 || edge * risk_bps * 1.5 <= 2.0 * cost {
                 return vec![];
             }
             return vec![Action::Bracket {
@@ -302,9 +303,6 @@ impl Strategy for MlRetail {
                 }
             }
         }
-        if !rng.random_bool((self.settings.activity * state.world.activity).min(1.0)) {
-            return vec![];
-        }
         let best = edges
             .iter()
             .filter(|(s, _)| state.holding(**s).total() == 0)
@@ -328,7 +326,6 @@ mod tests {
     fn params() -> Params {
         Params(
             [
-                ("activity", "1"),
                 ("warmup", "40"),
                 ("horizon", "5"),
                 ("lr", "0.05"),
@@ -346,6 +343,8 @@ mod tests {
         m.record(price);
         m.bid = Some(price - 5);
         m.ask = Some(price + 5);
+        m.bids = vec![ome_core::order_book::Level { price: price - 5, qty: 1_000_000, orders: 1 }];
+        m.asks = vec![ome_core::order_book::Level { price: price + 5, qty: 1_000_000, orders: 1 }];
         state.now += 1_500;
     }
 

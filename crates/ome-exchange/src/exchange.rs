@@ -186,6 +186,7 @@ pub enum Event {
     Trade(TradeEvent),
     BookChanged(Symbol),
     InstrumentChanged(Symbol),
+    DayArchived(Symbol),
     SessionChanged,
 }
 
@@ -567,11 +568,21 @@ impl Exchange {
         }
         if phase == MarketPhase::Closed && previous != MarketPhase::Closed {
             self.expire_day_orders(now, &mut events);
+            let day = self.session.day;
+            for instrument in self.instruments.values_mut() {
+                if instrument.archive_day(day) {
+                    events.push(Event::DayArchived(instrument.symbol));
+                }
+            }
         }
         if phase == MarketPhase::PreOpen
             || (phase == MarketPhase::Open && previous == MarketPhase::Closed)
         {
+            let finished = self.session.day;
             for instrument in self.instruments.values_mut() {
+                if instrument.archive_day(finished) {
+                    events.push(Event::DayArchived(instrument.symbol));
+                }
                 instrument.reference_price =
                     instrument.last_price.unwrap_or(instrument.reference_price);
                 instrument.day = Default::default();

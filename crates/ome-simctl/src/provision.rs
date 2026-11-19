@@ -46,7 +46,7 @@ pub enum Task {
     Fund {
         broker: String,
         usernames: Vec<String>,
-        amount: u64,
+        amount: i64,
     },
 }
 
@@ -224,12 +224,12 @@ fn run(access: &Access, known: &BTreeMap<String, String>, task: &Task) -> Result
                     .request(&ClientMessage::SetBalance {
                         account_id: account.account_id,
                         asset: Asset::Cash,
-                        amount: account.cash.available + amount,
+                        amount: account.cash.available.saturating_add_signed(*amount),
                     })
                     .map_err(|e| format!("cannot fund {}: {e}", account.username))?;
                 funded += 1;
             }
-            let text = format!("funded {funded} account(s) at {broker}");
+            let text = format!("{} {funded} account(s) at {broker}", if *amount < 0 { "paid redemptions from" } else { "funded" });
             log(&text);
             Ok(text)
         }

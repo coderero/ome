@@ -6,7 +6,7 @@ use ome_core::symbol::Symbol;
 use ome_core::tape::TradeTape;
 use ome_core::types::{Timestamp, Trade};
 use std::collections::VecDeque;
-use ome_protocol::{InstrumentInfo, InstrumentStatus, MarketStats, Venue};
+use ome_protocol::{DayBar, DayHistory, InstrumentInfo, InstrumentStatus, MarketStats, Venue};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DayStats {
@@ -37,6 +37,7 @@ impl DayStats {
 }
 
 pub const LULD_MIN_TRADES: usize = 5;
+pub const DAY_HISTORY: usize = 260;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HaltKind {
@@ -62,6 +63,7 @@ pub struct Instrument {
     pub volume: u64,
     pub halt: Option<Halt>,
     pub day: DayStats,
+    pub history: VecDeque<DayBar>,
     pub recent: VecDeque<(Timestamp, Price)>,
     pub luld_anchor: Option<Price>,
 }
@@ -86,6 +88,7 @@ impl Instrument {
             volume: 0,
             halt: None,
             day: DayStats::default(),
+            history: VecDeque::new(),
             recent: VecDeque::new(),
             luld_anchor: None,
         }
@@ -127,6 +130,30 @@ impl Instrument {
 
     pub fn paused(&self) -> bool {
         self.halt.as_ref().is_some_and(|h| h.kind == HaltKind::Luld)
+    }
+
+    pub fn archive_day(&mut self, day: u64) -> bool {
+        if self.day.trades == 0 || self.history.back().is_some_and(|b| b.day >= day) {
+            return false;
+        }
+        if self.history.len() == DAY_HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(DayBar {
+            day,
+            open: self.day.open,
+            high: self.day.high,
+            low: self.day.low,
+            close: self.day.last,
+            volume: self.day.volume.iter().sum(),
+            trades: self.day.trades,
+            turnover: self.day.turnover,
+        });
+        true
+    }
+
+    pub fn day_history(&self) -> DayHistory {
+        DayHistory { symbol: self.symbol, days: self.history.iter().copied().collect() }
     }
 
     pub fn stats(&self) -> MarketStats {

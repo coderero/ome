@@ -510,6 +510,11 @@ impl Gateway {
                 self.market.apply(&message);
                 self.send_to_subscribers(stats.symbol, &message);
             }
+            ServerMessage::DayHistory(ref history) => {
+                let symbol = history.symbol;
+                self.market.apply(&message);
+                self.send_to_subscribers(symbol, &message);
+            }
             _ => {}
         }
         self.drop_slow_sessions();
